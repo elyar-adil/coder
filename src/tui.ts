@@ -37,14 +37,18 @@ const ICONS = {
 };
 
 const TOOL_LABELS: Record<string, string> = {
-  read_file:  'Reading',
-  write_file: 'Writing',
-  list_dir:   'Listing',
-  bash:       'Running',
+  read_file:        'Reading',
+  write_file:       'Writing',
+  list_dir:         'Listing',
+  bash:             'Running',
+  load_skill:       'Loading skill',
+  spawn_subagent:   'Spawning agent',
+  collect_subagent: 'Collecting agent',
 };
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
   plan:         'Planning',
+  design:       'Designing',
   inspect_code: 'Inspecting',
   write_code:   'Writing',
   verify:       'Verifying',

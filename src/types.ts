@@ -1,6 +1,6 @@
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'completed' | 'failed';
 export type TaskMode = 'execute' | 'plan' | 'react';
-export type TaskPhase = 'plan' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
+export type TaskPhase = 'plan' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
 
 export interface PlanStep {
   title: string;
@@ -12,6 +12,16 @@ export interface PhaseEvent {
   status: 'pending' | 'in_progress' | 'done' | 'failed';
   note?: string;
   ts: string;
+}
+
+export interface SubAgentTask {
+  taskId: string;
+  parentTaskId: string;
+  prompt: string;
+  status: TaskStatus;
+  result?: string;
+  createdAt: string;
+  completedAt?: string;
 }
 
 export interface PromptTask {
