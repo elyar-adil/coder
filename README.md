@@ -1,58 +1,84 @@
-# Top-tier Coding Agent CLI/TUI（TypeScript Only）
+# Top-tier Coding Agent CLI/TUI
 
-你提的点都补上了：
+A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that connects to Ollama for AI-powered code generation, planning, and verification.
 
-- 解释了 `user_id` 含义。
-- 增加了 **TUI 交互界面**。
-- 增加了 **REACT 模式**（plan → 看代码 → 写代码 → 验证 → 总结）。
+## Features
 
-## user_id 是什么
+- **Execute mode** — agentic tool-use loop (read/write files, run bash)
+- **Plan mode** — generate step-by-step execution plans for manual approval
+- **ReAct mode** — automated plan → inspect → implement → verify pipeline
+- **TUI** — interactive terminal UI with streaming output, conversation history, and task management
 
-`user_id` 是任务归属标识（owner label），用于区分不同用户/会话提交的任务，便于 master 统一追踪与隔离统计。
-
-## 安装
+## Install
 
 ```bash
 npm install
 ```
 
-## CLI 使用
+## CLI Usage
 
 ```bash
-npm run dev -- submit --user alice --prompt "fix bug in parser" --mode execute
-npm run dev -- submit --user alice --prompt "给我方案" --mode plan
-npm run dev -- submit --user alice --prompt "实现完整功能" --mode react
+# Submit a task
+npm run dev -- submit --user alice --prompt "add error handling" --mode execute
+npm run dev -- submit --user alice --prompt "plan the refactor" --mode plan
+npm run dev -- submit --user alice --prompt "implement login" --mode react
+
+# Get task status
 npm run dev -- get --task <task_id>
+
+# Execute an approved plan
 npm run dev -- execute-plan --task <task_id>
 ```
 
-## TUI 使用
+## TUI Usage
 
 ```bash
 npm run dev -- tui
 ```
 
-进入后可用命令：
+TUI commands:
 
-- `new`：创建任务（execute/plan/react）
-- `list`：查看任务列表
-- `view`：查看任务详情（含 phaseEvents）
-- `approve`：批准并执行 plan 任务
-- `help` / `exit`
+| Command | Description |
+|---------|-------------|
+| `/mode <execute\|plan\|react>` | Switch agent mode |
+| `/clear` | Clear conversation history |
+| `/history` | Show conversation history |
+| `/tasks` | List all background tasks |
+| `/view <taskId>` | Inspect a task in detail |
+| `/approve <taskId>` | Execute an approved plan task |
+| `/model` | Show current model |
+| `/help` | Show help |
+| `/exit` or Ctrl+C | Quit |
 
-## REACT 模式流程
+## Testing
 
-在 `react` 模式下，系统会自动按阶段推进并记录 `phaseEvents`：
+```bash
+# Run all TypeScript tests
+npm test
 
-1. `plan`
-2. `inspect_code`
-3. `write_code`
-4. `verify`
-5. `finalize`
+# Run Tetris Python tests
+npm run test:tetris
 
-## 模型配置
+# Run all tests
+npm run test:all
 
-- `OLLAMA_BASE_URL`（默认 `http://localhost:11434`）
-- `AGENT_MODEL`（默认 `deepseek-v4-pro:cloud`）
+# Type check without emitting
+npm run typecheck
+```
 
-通过 HTTP 调用 Ollama：`POST /api/chat`。
+## REACT Mode Pipeline
+
+1. `plan` — generate structured plan
+2. `inspect_code` — explore codebase using tools
+3. `write_code` — implement changes using tools
+4. `verify` — run build/test commands using bash tool
+5. `finalize` — collect results
+
+## Configuration
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `OLLAMA_BASE_URL` | `http://localhost:11434` | Ollama server URL |
+| `AGENT_MODEL` | `gemma4:31b-cloud` | Model name |
+
+Uses Ollama HTTP API: `POST /api/chat`

@@ -7,7 +7,7 @@ const program = new Command();
 program.name('coding-agent').description('Top-tier coding agent CLI/TUI (TypeScript)').version('0.2.0');
 
 const ollamaBaseUrl = process.env.OLLAMA_BASE_URL ?? 'http://localhost:11434';
-const model = process.env.AGENT_MODEL ?? 'deepseek-v4-pro:cloud';
+const model = process.env.AGENT_MODEL ?? 'gemma4:31b-cloud';
 const master = new MasterCoordinator(ollamaBaseUrl, model);
 
 program
@@ -38,9 +38,14 @@ program
 
 program
   .command('tui')
-  .description('Interactive terminal UI')
+  .description('Interactive terminal UI — Claude Code-class experience')
   .action(async () => {
-    await runTui(master);
+    await runTui(master, model);
   });
+
+// Default to TUI when no subcommand given
+if (process.argv.length === 2) {
+  process.argv.push('tui');
+}
 
 program.parseAsync(process.argv);

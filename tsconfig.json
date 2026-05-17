@@ -5,9 +5,9 @@
     "moduleResolution": "NodeNext",
     "strict": true,
     "outDir": "dist",
-    "rootDir": "src-ts",
+    "rootDir": "src",
     "esModuleInterop": true,
     "skipLibCheck": true
   },
-  "include": ["src-ts/**/*.ts"]
+  "include": ["src/**/*.ts"]
 }
