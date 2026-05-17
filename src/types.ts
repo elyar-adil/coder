@@ -24,6 +24,14 @@ export interface SubAgentTask {
   completedAt?: string;
 }
 
+export interface OllamaMsg {
+  role: string;
+  content: string | null;
+  tool_calls?: Array<{
+    function: { name: string; arguments: Record<string, string> };
+  }>;
+}
+
 export interface PromptTask {
   taskId: string;
   userId: string;
@@ -33,4 +41,12 @@ export interface PromptTask {
   result?: string;
   plan: PlanStep[];
   phaseEvents: PhaseEvent[];
+  messages?: OllamaMsg[];
+  designDoc?: string;
+}
+
+export interface ToolContext {
+  spawnSubagent: (p: string) => Promise<string>;
+  collectSubagent: (id: string) => Promise<string>;
+  askUser?: (question: string) => Promise<string>;
 }

@@ -44,6 +44,7 @@ const TOOL_LABELS: Record<string, string> = {
   load_skill:       'Loading skill',
   spawn_subagent:   'Spawning agent',
   collect_subagent: 'Collecting agent',
+  ask_user:         'Asking you',
 };
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
@@ -115,9 +116,11 @@ ${chalk.bold('Commands')}
   ${chalk.cyan('/clear')}                       Clear conversation history
   ${chalk.cyan('/history')}                     Show conversation history
   ${chalk.cyan('/tasks')}                       List all background tasks
+  ${chalk.cyan('/subagents')}                   List sub-agents
   ${chalk.cyan('/view <taskId>')}               Inspect a task
   ${chalk.cyan('/approve <taskId>')}            Execute an approved plan task
   ${chalk.cyan('/model')}                       Show current model
+  ${chalk.cyan('/resume <taskId>')}             Resume a queued/running task
   ${chalk.cyan('/help')}                        Show this help
   ${chalk.cyan('/exit')}  or  ${chalk.cyan('Ctrl+C')}            Quit
 
@@ -253,7 +256,23 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
                      : t.status === 'failed'    ? chalk.red
                      : t.status === 'running'   ? chalk.yellow
                      : chalk.dim;
-            console.log(`  ${chalk.dim(t.taskId.slice(0, 8))}  ${chalk.white(t.mode.padEnd(8))}  ${sc(t.status.padEnd(10))}  ${chalk.dim(t.prompt.slice(0, 50))}`);
+            const phase = t.phaseEvents.length > 0 ? chalk.dim('[' + t.phaseEvents[t.phaseEvents.length - 1]!.phase + ']') : '';
+            console.log(`  ${chalk.dim(t.taskId.slice(0, 8))}  ${chalk.white(t.mode.padEnd(8))}  ${sc(t.status.padEnd(10))}  ${phase}  ${chalk.dim(t.prompt.slice(0, 40))}`);
+          }
+          console.log(hr());
+        }
+        continue;
+      }
+
+      if (cmd === 'subagents') {
+        const subs = master.listSubagents();
+        if (subs.length === 0) {
+          console.log(chalk.dim('  (no sub-agents)'));
+        } else {
+          console.log(hr());
+          for (const s of subs) {
+            const sc = s.status === 'completed' ? chalk.green : s.status === 'failed' ? chalk.red : chalk.yellow;
+            console.log(`  ${chalk.dim(s.taskId.slice(0, 8))}  ${sc(s.status.padEnd(10))}  ${chalk.dim(s.prompt.slice(0, 60))}`);
           }
           console.log(hr());
         }
@@ -298,6 +317,20 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
         continue;
       }
 
+      if (cmd === 'resume') {
+        const id = args[0];
+        if (!id) { console.log(`${ICONS.warn} Usage: /resume <taskId>`); continue; }
+        const t = master.getTask(id);
+        if (!t) { console.log(`${ICONS.fail} Task not found: ${id}`); continue; }
+        if (t.status === 'completed' || t.status === 'failed') {
+          console.log(`${ICONS.info} Task already ${t.status}. Use /view ${id} to see result.`);
+          continue;
+        }
+        const ok = await master.resolveTask(id);
+        console.log(ok ? `${ICONS.ok} Resuming task ${chalk.white(id)}` : `${ICONS.fail} Cannot resume task`);
+        continue;
+      }
+
       console.log(`${ICONS.warn} Unknown command: ${chalk.white('/' + cmd)}. Type ${chalk.cyan('/help')}.`);
       continue;
     }
@@ -334,11 +367,17 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       }
     }
 
+    let currentTaskId = '';
+
     try {
       const stream = master.streamPrompt('tui-user', userInput, mode, history.slice(0, -1));
 
       for await (const chunk of stream) {
         switch (chunk.type) {
+          case 'task_id':
+            currentTaskId = chunk.taskId;
+            break;
+
           case 'phase':
             stopSpinner();
             flushBuffer(true);
@@ -361,6 +400,20 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
           case 'tool_result':
             showToolResult(chunk.tool, chunk.output);
             break;
+
+          case 'ask_user': {
+            stopSpinner();
+            flushBuffer(true);
+            process.stdout.write(`\n${ICONS.warn} ${chalk.yellow('Agent asks:')} ${chunk.question}\n`);
+            process.stdout.write(chalk.cyan('  Your answer') + ' > ');
+            const answer = await new Promise<string>((resolve) => {
+              rl.once('line', (line) => resolve(line.trim()));
+              rl.prompt();
+            });
+            master.answerUser(currentTaskId, answer);
+            process.stdout.write(`${ICONS.ok} ${chalk.dim('Answer sent to agent')}\n`);
+            break;
+          }
 
           case 'error':
             stopSpinner();

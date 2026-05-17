@@ -2,6 +2,7 @@ import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname } from 'node:path';
+import type { ToolContext } from './types.js';
 
 const execAsync = promisify(exec);
 
@@ -23,8 +24,7 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'read_file',
-      description:
-        'Read the full content of a file from disk. Always call this before writing to an existing file.',
+      description: 'Read the full content of a file from disk. Always call this before writing to an existing file.',
       parameters: {
         type: 'object',
         properties: {
@@ -38,8 +38,7 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'write_file',
-      description:
-        'Create or overwrite a file with complete content. Always provide the full file — never a partial diff.',
+      description: 'Create or overwrite a file with complete content. Always provide the full file — never a partial diff.',
       parameters: {
         type: 'object',
         properties: {
@@ -68,8 +67,7 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'bash',
-      description:
-        'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
+      description: 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
       parameters: {
         type: 'object',
         properties: {
@@ -83,19 +81,11 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'load_skill',
-      description:
-        'Load a reusable skill definition by name. Skills provide domain-specific '
-        + 'instructions, conventions, and project structure guidelines. '
-        + 'Available skills: ' + [
-          'python-flask', 'react-component', 'testing',
-        ].join(', '),
+      description: 'Load a reusable skill definition by name. Skills provide domain-specific instructions, conventions, and project structure guidelines.',
       parameters: {
         type: 'object',
         properties: {
-          name: {
-            type: 'string',
-            description: 'Skill name, e.g. "python-flask", "react-component", "testing"',
-          },
+          name: { type: 'string', description: 'Skill name: python-flask, react-component, testing' },
         },
         required: ['name'],
       },
@@ -105,19 +95,11 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'spawn_subagent',
-      description:
-        'Delegate a well-defined sub-task to a sub-agent that runs independently. '
-        + 'Use when the task has clearly separable parts that can be worked on in parallel. '
-        + 'Returns a subagent_id you can pass to collect_subagent later.',
+      description: 'Delegate a well-defined sub-task to a sub-agent that runs independently. Returns a subagent_id.',
       parameters: {
         type: 'object',
         properties: {
-          prompt: {
-            type: 'string',
-            description:
-              'Clear, self-contained instructions for the sub-agent. '
-              + 'Include file paths, what to write, and what to verify.',
-          },
+          prompt: { type: 'string', description: 'Clear, self-contained instructions for the sub-agent.' },
         },
         required: ['prompt'],
       },
@@ -127,10 +109,7 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'collect_subagent',
-      description:
-        'Retrieve the result of a previously spawned sub-agent by its subagent_id. '
-        + 'If the sub-agent is still running, returns a status message. '
-        + 'If done, returns the full result output.',
+      description: 'Retrieve the result of a previously spawned sub-agent by subagent_id.',
       parameters: {
         type: 'object',
         properties: {
@@ -140,12 +119,26 @@ export const TOOLS: OllamaToolDef[] = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'ask_user',
+      description: 'Ask the user a question when you need clarification. Pauses execution until the user responds.',
+      parameters: {
+        type: 'object',
+        properties: {
+          question: { type: 'string', description: 'The question to ask the user. Be specific and provide options if possible.' },
+        },
+        required: ['question'],
+      },
+    },
+  },
 ];
 
 export async function executeTool(
   name: string,
   args: Record<string, string>,
-  context?: { spawnSubagent?: (prompt: string) => Promise<string>; collectSubagent?: (id: string) => Promise<string> },
+  ctx?: ToolContext,
 ): Promise<string> {
   switch (name) {
     case 'read_file': {
@@ -205,37 +198,32 @@ export async function executeTool(
     case 'load_skill': {
       const name = args['name'];
       if (!name) return 'Error: load_skill requires "name"';
+      const Dir = `${import.meta.dirname}/../skills`.replace(/\\/g, '/');
       try {
-        const skillPath = `${import.meta.dirname}/../skills/${name}.md`;
-        const content = await readFile(skillPath, 'utf8');
-        return content;
+        return await readFile(`${Dir}/${name}.md`, 'utf8');
       } catch {
-        const skillsDir = `${import.meta.dirname}/../skills`;
         try {
-          const available = (await readdir(skillsDir)).map((f) => f.replace(/\.md$/, '')).join(', ');
-          return `Error: skill "${name}" not found. Available skills: ${available}`;
+          const available = (await readdir(Dir)).map((f) => f.replace(/\.md$/, '')).join(', ');
+          return `Error: skill "${name}" not found. Available: ${available}`;
         } catch {
-          return `Error: skill "${name}" not found and skills directory unavailable`;
+          return `Error: skill "${name}" not found`;
         }
       }
     }
 
     case 'spawn_subagent': {
-      if (!context?.spawnSubagent) return 'Error: subagent support not available in this context';
-      try {
-        return await context.spawnSubagent(args['prompt']);
-      } catch (e) {
-        return `Error spawning subagent: ${String(e)}`;
-      }
+      if (!ctx?.spawnSubagent) return 'Error: subagent support unavailable';
+      return ctx.spawnSubagent(args['prompt']);
     }
 
     case 'collect_subagent': {
-      if (!context?.collectSubagent) return 'Error: subagent support not available in this context';
-      try {
-        return await context.collectSubagent(args['subagent_id']);
-      } catch (e) {
-        return `Error collecting subagent: ${String(e)}`;
-      }
+      if (!ctx?.collectSubagent) return 'Error: subagent support unavailable';
+      return ctx.collectSubagent(args['subagent_id']);
+    }
+
+    case 'ask_user': {
+      if (!ctx?.askUser) return 'Error: ask_user is not available in this context';
+      return ctx.askUser(args['question'] ?? '');
     }
 
     default:

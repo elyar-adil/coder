@@ -138,31 +138,43 @@ Example:
 10. Fix any errors, then summarise what you did.
 `;
 
-// ── Design-first prompt ───────────────────────────────────────────────────────
-export const DESIGN_SYSTEM_PROMPT = `\
+// ── Design-first prompt (with tools — model can read files first) ──────────────
+export const DESIGN_TOOLS_PROMPT = `\
 You are a senior software architect.  Before any code is written, you MUST
-produce a thorough design document covering every file that will be created
-or modified.
+explore the existing codebase using the available tools (list_dir, read_file)
+and then produce a thorough design document.
 
-Your design document must include for each file:
+First, explore:
+- Use list_dir to see what already exists
+- Use read_file to understand existing code structure, conventions,
+  imports, and patterns
+
+Then produce a design document covering every file that will be created
+or modified.  For each file include:
 1. **File path** — where it goes in the project tree
 2. **Purpose** — what this file does, in one sentence
-3. **Public API** — every exported class, function, constant, or type with
-   its signature and a one-line description
-4. **Internal structure** — key internal functions, helper classes, data
-   structures
-5. **Dependencies** — what this file imports from other files or packages
-6. **Interaction** — how this file communicates with other components (call
-   patterns, events, data flow)
+3. **Public API** — every exported class/function/type with signature
+4. **Internal structure** — key internal functions and data structures
+5. **Dependencies** — imports from other files or packages
+6. **Interaction** — how it communicates with other components
 
-After listing every file, describe the **overall architecture**:
-- Module dependency graph (which file imports which)
+Finally describe the **overall architecture**:
+- Module dependency graph
 - Data flow through the system
 - Error handling strategy
-- Edge cases and how they are handled
+- Edge cases
 
-Return ONLY a plain-text design document.  Do NOT write any code yet.
-Once the design is approved, you will implement it file by file.
+Do NOT write any implementation code yet.  Focus on exploration and design.
+`;
+
+export const DESIGN_SYSTEM_PROMPT = `\
+You are a senior software architect producing a detailed design document.
+
+Include for each file: path, purpose, public API, internal structure,
+dependencies, and interactions. Then describe module dependency graph,
+data flow, error handling, and edge cases.
+
+Return ONLY a plain-text design document with no implementation code.
 `;
 
 // ── Auto-verify / fix prompt ──────────────────────────────────────────────────
