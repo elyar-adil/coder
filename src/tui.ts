@@ -18,8 +18,10 @@
 import readline from 'node:readline';
 import { stdin as input, stdout as output } from 'node:process';
 import chalk from 'chalk';
-import ora from 'ora';
+import ora, { type Ora } from 'ora';
 import { renderMarkdown } from './markdown.js';
+import { FetchError } from './fetch.js';
+import { ConversationStore, type ConversationEntry } from './store.js';
 import type { MasterCoordinator } from './master.js';
 import type { TaskMode, TaskPhase } from './types.js';
 
@@ -121,6 +123,8 @@ ${chalk.bold('Commands')}
   ${chalk.cyan('/approve <taskId>')}            Execute an approved plan task
   ${chalk.cyan('/model')}                       Show current model
   ${chalk.cyan('/resume <taskId>')}             Resume a queued/running task
+  ${chalk.cyan('/sessions')}                    List saved conversation sessions
+  ${chalk.cyan('/load <sessionId>')}            Load a saved conversation
   ${chalk.cyan('/help')}                        Show this help
   ${chalk.cyan('/exit')}  or  ${chalk.cyan('Ctrl+C')}            Quit
 
@@ -182,9 +186,20 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
   let mode: TaskMode = 'execute';
   const history: Array<{ role: 'user' | 'assistant'; content: string }> = [];
 
+  // ── Conversation persistence ────────────────────────────────────────────────
+  const convStore = new ConversationStore();
+  await convStore.init();
+  const sessionId = `session-${Date.now()}`;
+
+  // Auto-save on each exchange
+  async function saveHistory(): Promise<void> {
+    await convStore.save(sessionId, history);
+  }
+
   printHeader();
   console.log(chalk.dim(`  Type your prompt and press Enter. Use ${chalk.white('/help')} for commands.\n`));
   printStatusBar(modelName, mode);
+  process.stdout.write(`${ICONS.ok} ${chalk.green('Ready')} — ${chalk.dim('model:')} ${chalk.white(modelName)}  ${chalk.dim('mode:')} ${chalk.white(mode)}\n\n`);
 
   // eslint-disable-next-line no-constant-condition
   while (true) {
@@ -221,6 +236,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
       if (cmd === 'clear') {
         history.length = 0;
+        await convStore.remove(sessionId);
         console.clear();
         printHeader();
         printStatusBar(modelName, mode);
@@ -331,6 +347,35 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
         continue;
       }
 
+      if (cmd === 'sessions') {
+        const sessions = await convStore.list();
+        if (sessions.length === 0) {
+          console.log(chalk.dim('  (no saved sessions)'));
+        } else {
+          console.log(hr());
+          for (const s of sessions.slice(0, 10)) {
+            const ts = new Date(s.modified).toLocaleString();
+            console.log(`  ${chalk.dim(s.id)}  ${chalk.white(s.entries + ' msgs')}  ${chalk.dim(ts)}`);
+          }
+          console.log(hr());
+        }
+        continue;
+      }
+
+      if (cmd === 'load') {
+        const id = args[0];
+        if (!id) { console.log(`${ICONS.warn} Usage: /load <sessionId>`); continue; }
+        const loaded = await convStore.load(id);
+        if (loaded.length === 0) {
+          console.log(`${ICONS.fail} Session not found or empty: ${id}`);
+        } else {
+          history.length = 0;
+          history.push(...loaded);
+          console.log(`${ICONS.ok} Loaded ${chalk.white(loaded.length)} messages from ${chalk.dim(id)}`);
+        }
+        continue;
+      }
+
       console.log(`${ICONS.warn} Unknown command: ${chalk.white('/' + cmd)}. Type ${chalk.cyan('/help')}.`);
       continue;
     }
@@ -341,14 +386,20 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     process.stdout.write(`\n${ICONS.agent} ${chalk.magenta.bold('Agent')}\n`);
     process.stdout.write(hr('─', 40) + '\n');
 
-    const spinner = ora({ text: chalk.dim('Connecting…'), color: 'magenta', spinner: 'dots' }).start();
-    let spinnerStopped = false;
+    let spinner: Ora | null = null;
     let fullResponse   = '';
     let lineBuffer     = '';
 
-    function stopSpinner(): void {
-      if (!spinnerStopped) { spinner.stop(); spinnerStopped = true; }
+    function startSpinner(text: string): void {
+      if (spinner) spinner.stop();
+      spinner = ora({ text: chalk.dim(text), color: 'magenta', spinner: 'dots' }).start();
     }
+
+    function stopSpinner(): void {
+      if (spinner) { spinner.stop(); spinner = null; }
+    }
+
+    startSpinner('Thinking…');
 
     // Flush complete lines through the markdown renderer.
     // Partial last line is held in lineBuffer until the next newline or force.
@@ -379,9 +430,14 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
             break;
 
           case 'phase':
-            stopSpinner();
             flushBuffer(true);
             showPhase(chunk.phase, chunk.status, chunk.note);
+            if (chunk.status === 'in_progress') {
+              const label = PHASE_LABELS[chunk.phase] ?? chunk.phase;
+              startSpinner(label + '…');
+            } else {
+              stopSpinner();
+            }
             break;
 
           case 'token':
@@ -395,9 +451,11 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
             stopSpinner();
             flushBuffer(true);
             showToolCall(chunk.tool, chunk.input);
+            if (chunk.tool === 'bash') startSpinner('Running…');
             break;
 
           case 'tool_result':
+            stopSpinner();
             showToolResult(chunk.tool, chunk.output);
             break;
 
@@ -430,7 +488,14 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     } catch (err) {
       stopSpinner();
       flushBuffer(true);
-      process.stdout.write(`\n${ICONS.fail} ${chalk.red(String(err))}\n`);
+      if (err instanceof FetchError) {
+        process.stdout.write(`\n${ICONS.fail} ${chalk.red('Connection error:')} ${chalk.yellow(err.message)}\n`);
+        if (!err.retriable) {
+          process.stdout.write(`${ICONS.info} ${chalk.dim('Check that Ollama is running and OLLAMA_BASE_URL is correct.')}\n`);
+        }
+      } else {
+        process.stdout.write(`\n${ICONS.fail} ${chalk.red(String(err))}\n`);
+      }
     }
 
     stopSpinner();
@@ -440,9 +505,11 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       history.push({ role: 'assistant', content: fullResponse });
     }
 
+    await saveHistory();
     process.stdout.write('\n' + hr('─', 40) + '\n');
   }
 
   rl.close();
-  console.log(`\n${ICONS.info} ${chalk.dim('Goodbye.')}\n`);
+  await saveHistory();
+  console.log(`\n${ICONS.info} ${chalk.dim('Goodbye. Session saved.')}\n`);
 }

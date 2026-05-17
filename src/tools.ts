@@ -85,7 +85,7 @@ export const TOOLS: OllamaToolDef[] = [
       parameters: {
         type: 'object',
         properties: {
-          name: { type: 'string', description: 'Skill name: python-flask, react-component, testing' },
+          name: { type: 'string', description: 'Skill name: python-flask, react-component, testing, node-express, git-workflow, debugging, sql-database' },
         },
         required: ['name'],
       },

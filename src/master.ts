@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import type { PhaseEvent, PlanStep, PromptTask, SubAgentTask, TaskMode, TaskPhase, ToolContext, OllamaMsg } from './types.js';
 import { executeTool, TOOLS } from './tools.js';
 import { TaskStore, ResponseCache } from './store.js';
+import { chatStream, chatNonStream } from './backend.js';
+import type { BackendConfig } from './backend.js';
 import {
   EXECUTE_SYSTEM_PROMPT,
   DESIGN_TOOLS_PROMPT,
@@ -51,11 +53,21 @@ export class MasterCoordinator {
   private store = new TaskStore();
   private cache = new ResponseCache();
   private userAnswer = new Map<string, (answer: string) => void>();
+  private backend: BackendConfig;
 
   constructor(
-    private readonly ollamaBaseUrl: string,
-    private readonly model: string = 'gemma4:31b-cloud',
+    baseUrlOrConfig: string | BackendConfig,
+    model?: string,
   ) {
+    if (typeof baseUrlOrConfig === 'object') {
+      this.backend = baseUrlOrConfig;
+    } else {
+      this.backend = {
+        type: 'ollama',
+        baseUrl: baseUrlOrConfig,
+        model: model ?? 'gemma4:31b-cloud',
+      };
+    }
     this.store.init().then(() => this.loadPersistedTasks());
   }
 
@@ -632,35 +644,25 @@ export class MasterCoordinator {
     task.status = 'completed';
   }
 
-  // ── Ollama API calls ───────────────────────────────────────────────────────
+  // ── LLM API calls (backend-agnostic) ───────────────────────────────────────
   private async *streamModelWithTools(
     systemPrompt: string,
     messages: OllamaMsg[],
   ): AsyncGenerator<OllamaStreamChunk> {
-    const body = {
-      model: this.model,
-      stream: false,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
-      tools: TOOLS,
-    };
-
-    const response = await fetch(`${this.ollamaBaseUrl.replace(/\/$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    const data = await response.json() as OllamaStreamChunk;
-    yield data;
+    for await (const chunk of chatStream(this.backend, systemPrompt, messages, TOOLS)) {
+      const ollamaChunk: OllamaStreamChunk = {};
+      if (chunk.content !== null) ollamaChunk.message = { role: 'assistant', content: chunk.content };
+      if (chunk.toolCalls) ollamaChunk.message = { ...ollamaChunk.message, role: 'assistant', content: ollamaChunk.message?.content ?? null, tool_calls: chunk.toolCalls };
+      if (chunk.done) ollamaChunk.done = true;
+      if (ollamaChunk.message || ollamaChunk.done) yield ollamaChunk;
+    }
   }
 
   private async callModelWithTools(
     systemPrompt: string,
     messages: OllamaMsg[],
   ): Promise<{ text: string; toolCalls: OllamaMsg['tool_calls'] }> {
-    const cacheKey = `tools|${this.model}|${systemPrompt}|${JSON.stringify(messages)}`;
-    const cached = this.cache.get(this.model, systemPrompt, JSON.stringify(messages));
+    const cached = this.cache.get(this.backend.model, systemPrompt, JSON.stringify(messages));
     if (cached) return JSON.parse(cached);
 
     let text = '';
@@ -670,7 +672,7 @@ export class MasterCoordinator {
       if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
     }
     const result = { text: text.trim(), toolCalls };
-    this.cache.set(this.model, systemPrompt, JSON.stringify(messages), JSON.stringify(result));
+    this.cache.set(this.backend.model, systemPrompt, JSON.stringify(messages), JSON.stringify(result));
     return result;
   }
 
@@ -678,36 +680,9 @@ export class MasterCoordinator {
     systemPrompt: string,
     messages: OllamaMsg[],
   ): AsyncGenerator<string> {
-    const body = {
-      model: this.model,
-      stream: true,
-      messages: [{ role: 'system', content: systemPrompt }, ...messages],
-    };
-
-    const response = await fetch(`${this.ollamaBaseUrl.replace(/\/$/, '')}/api/chat`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) throw new Error(`HTTP ${response.status}: ${await response.text()}`);
-    if (!response.body) throw new Error('No response body');
-
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
-      for (const line of lines) {
-        const obj = parseOllamaNdjson(line);
-        if (obj?.message?.content) yield obj.message.content;
-        if (obj?.done) return;
-      }
+    for await (const chunk of chatStream(this.backend, systemPrompt, messages)) {
+      if (chunk.content) yield chunk.content;
+      if (chunk.done) return;
     }
   }
 
@@ -721,7 +696,7 @@ export class MasterCoordinator {
       ...(userPrompt ? [{ role: 'user', content: userPrompt }] : []),
     ];
 
-    const cached = this.cache.get(this.model, systemPrompt, JSON.stringify(messages));
+    const cached = this.cache.get(this.backend.model, systemPrompt, JSON.stringify(messages));
     if (cached) return cached;
 
     let full = '';
@@ -729,7 +704,7 @@ export class MasterCoordinator {
       full += chunk;
     }
     const result = full.trim();
-    this.cache.set(this.model, systemPrompt, JSON.stringify(messages), result);
+    this.cache.set(this.backend.model, systemPrompt, JSON.stringify(messages), result);
     return result;
   }
 }

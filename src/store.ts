@@ -6,6 +6,64 @@ import type { PromptTask } from './types.js';
 
 const BASE = join(homedir(), '.coder');
 
+export interface ConversationEntry {
+  role: 'user' | 'assistant';
+  content: string;
+}
+
+export class ConversationStore {
+  private dir: string;
+
+  constructor() {
+    this.dir = join(BASE, 'conversations');
+  }
+
+  async init(): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+  }
+
+  async save(sessionId: string, history: ConversationEntry[]): Promise<void> {
+    await mkdir(this.dir, { recursive: true });
+    await writeFile(join(this.dir, `${sessionId}.json`), JSON.stringify(history, null, 2), 'utf8');
+  }
+
+  async load(sessionId: string): Promise<ConversationEntry[]> {
+    try {
+      const raw = await readFile(join(this.dir, `${sessionId}.json`), 'utf8');
+      return JSON.parse(raw) as ConversationEntry[];
+    } catch {
+      return [];
+    }
+  }
+
+  async list(): Promise<Array<{ id: string; entries: number; modified: string }>> {
+    try {
+      const files = await readdir(this.dir);
+      const results: Array<{ id: string; entries: number; modified: string }> = [];
+      for (const f of files) {
+        if (!f.endsWith('.json')) continue;
+        try {
+          const raw = await readFile(join(this.dir, f), 'utf8');
+          const data = JSON.parse(raw) as ConversationEntry[];
+          const stat = await import('node:fs/promises').then((fs) => fs.stat(join(this.dir, f)));
+          results.push({
+            id: f.replace('.json', ''),
+            entries: data.length,
+            modified: stat.mtime.toISOString(),
+          });
+        } catch { /* skip corrupt */ }
+      }
+      return results.sort((a, b) => b.modified.localeCompare(a.modified));
+    } catch {
+      return [];
+    }
+  }
+
+  async remove(sessionId: string): Promise<void> {
+    try { await rm(join(this.dir, `${sessionId}.json`), { force: true }); } catch { /* ignore */ }
+  }
+}
+
 export class TaskStore {
   private dir: string;
 
