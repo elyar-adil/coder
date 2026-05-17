@@ -1,9 +1,17 @@
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'completed' | 'failed';
-export type TaskMode = 'execute' | 'plan';
+export type TaskMode = 'execute' | 'plan' | 'react';
+export type TaskPhase = 'plan' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
 
 export interface PlanStep {
   title: string;
   detail: string;
+}
+
+export interface PhaseEvent {
+  phase: TaskPhase;
+  status: 'pending' | 'in_progress' | 'done' | 'failed';
+  note?: string;
+  ts: string;
 }
 
 export interface PromptTask {
@@ -14,4 +22,5 @@ export interface PromptTask {
   status: TaskStatus;
   result?: string;
   plan: PlanStep[];
+  phaseEvents: PhaseEvent[];
 }
