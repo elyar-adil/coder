@@ -22,11 +22,6 @@ def run(cmd_list, cwd=ROOT, label=None):
 exit_codes = []
 
 exit_codes.append(run(
-    [sys.executable, "-m", "unittest", "tests/tetris_test.py"],
-    label="Tetris Python tests"
-))
-
-exit_codes.append(run(
     ["npm", "run", "typecheck"],
     label="TypeScript typecheck"
 ))

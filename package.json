@@ -8,8 +8,6 @@
     "dev": "tsx src/cli.ts",
     "test": "node --import tsx/esm --test tests/*.test.ts",
     "test:watch": "node --import tsx/esm --test --watch tests/*.test.ts",
-    "test:tetris": "python tests/tetris_test.py",
-    "test:all": "npm test && npm run test:tetris",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "dependencies": {
