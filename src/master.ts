@@ -15,6 +15,8 @@ import {
   REACT_INSPECT_PROMPT,
   REACT_IMPLEMENT_PROMPT,
   REACT_VERIFY_PROMPT,
+  CHAT_SYSTEM_PROMPT,
+  ROUTER_SYSTEM_PROMPT,
 } from './prompts.js';
 
 export type StreamChunk =
@@ -56,6 +58,8 @@ export function parseOllamaNdjson(line: string): OllamaStreamChunk | null {
     return null;
   }
 }
+
+
 
 export class MasterCoordinator {
   private tasks = new Map<string, PromptTask>();
@@ -261,6 +265,20 @@ export class MasterCoordinator {
       }
 
       // ── Execute mode ──────────────────────────────────────────────────────
+      yield { type: 'phase', phase: 'finalize', status: 'in_progress', note: 'Routing intent…' };
+      const route = (await this.callModelText(prompt, ROUTER_SYSTEM_PROMPT, conversationHistory)).trim().toUpperCase();
+      if (route === 'CHAT') {
+        const quick = await this.callModelText(prompt, CHAT_SYSTEM_PROMPT, conversationHistory);
+        task.result = quick;
+        task.status = 'completed';
+        this.persist(task);
+        yield { type: 'token', text: quick };
+        yield { type: 'phase', phase: 'finalize', status: 'done' };
+        yield { type: 'done', result: quick };
+        return;
+      }
+      yield { type: 'phase', phase: 'finalize', status: 'done', note: 'Coding flow selected' };
+
       const messages: OllamaMsg[] = [
         ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
         { role: 'user', content: prompt },
