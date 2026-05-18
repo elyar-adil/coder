@@ -139,7 +139,7 @@ ${chalk.bold('Agent tools')}
   ${chalk.blue('list_dir')}    Explore directory structure
   ${chalk.blue('bash')}        Run shell commands (build, test, git, …)
 
-${chalk.dim('Shortcut: Shift+Command+P toggles execute/plan mode (macOS terminal).')}
+${chalk.dim('Shortcut: Shift+Tab toggles execute/plan mode.')}
 ${chalk.dim('Just type your prompt and press Enter to chat.')}
 `);
 }
@@ -191,14 +191,15 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
   let mode: TaskMode = 'execute';
 
-  // Keyboard shortcuts (macOS Command maps to "meta" in terminal key events):
-  //   ⇧⌘P => toggle execute <-> plan
+  // Keyboard shortcuts:
+  //   Shift+Tab => toggle execute <-> plan
   // Plan mode is planning-only and does not modify files.
   readline.emitKeypressEvents(input);
   if (input.isTTY) input.setRawMode(true);
   const onKeypress = (_str: string, key: { name?: string; meta?: boolean; shift?: boolean; ctrl?: boolean; sequence?: string }): void => {
     if (key?.ctrl && key.name === 'c') return;
-    if (key?.meta && key?.shift && key.name === 'p') {
+    const isShiftTab = (key?.name === 'tab' && key?.shift) || key?.sequence === '\x1b[Z';
+    if (isShiftTab) {
       mode = mode === 'plan' ? 'execute' : 'plan';
       console.log(`
 ${ICONS.ok} Mode → ${chalk.white(mode)} ${chalk.dim(mode === 'plan' ? '(planning only; no file modifications)' : '')}`);
