@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import type { PhaseEvent, PlanStep, PromptTask, SubAgentTask, TaskMode, TaskPhase, ToolContext, OllamaMsg } from './types.js';
 import { executeTool, TOOLS } from './tools.js';
+import { SubagentManager } from './subagentManager.js';
 import { TaskStore, ResponseCache } from './store.js';
 import { chatStream, chatNonStream } from './backend.js';
+import { telemetry } from './telemetry.js';
 import type { BackendConfig } from './backend.js';
 import {
   EXECUTE_SYSTEM_PROMPT,
@@ -31,10 +33,18 @@ export interface OllamaStreamChunk {
 }
 
 export function parsePlan(content: string): PlanStep[] {
-  const cleaned = content.replace(/^```[a-z]*\n?/m, '').replace(/```$/m, '').trim();
-  const parsed = JSON.parse(cleaned) as Array<{ title?: string; detail?: string }>;
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? trimmed).trim();
+  const start = candidate.indexOf('[');
+  const end = candidate.lastIndexOf(']');
+  const jsonText = (start >= 0 && end >= start) ? candidate.slice(start, end + 1) : candidate;
+  const parsed = JSON.parse(jsonText) as Array<{ title?: string; detail?: string }>;
   if (!Array.isArray(parsed)) throw new Error('Plan mode expects JSON array');
-  return parsed.map((s) => ({ title: s.title ?? 'step', detail: s.detail ?? '' }));
+  return parsed.map((step, idx) => ({
+    title: (typeof step.title === 'string' && step.title.trim()) ? step.title.slice(0, 120) : 'step',
+    detail: (typeof step.detail === 'string' ? step.detail : '').slice(0, 1200),
+  }));
 }
 
 export function parseOllamaNdjson(line: string): OllamaStreamChunk | null {
@@ -54,6 +64,7 @@ export class MasterCoordinator {
   private cache = new ResponseCache();
   private userAnswer = new Map<string, (answer: string) => void>();
   private backend: BackendConfig;
+  private subagentManager = new SubagentManager(2);
 
   constructor(
     baseUrlOrConfig: string | BackendConfig,
@@ -95,7 +106,7 @@ export class MasterCoordinator {
   async acceptPrompt(userId: string, prompt: string, mode: TaskMode = 'execute'): Promise<string> {
     const taskId = randomUUID();
     const task: PromptTask = {
-      taskId, userId, prompt, mode, status: 'queued', plan: [], phaseEvents: [], messages: [],
+      taskId, userId, prompt, mode, status: 'queued', plan: [], phaseEvents: [], messages: [], traceId: telemetry.newTraceId(),
     };
     this.tasks.set(taskId, task);
     this.persist(task);
@@ -136,28 +147,41 @@ export class MasterCoordinator {
   async spawnSubagent(prompt: string): Promise<string> {
     const subId = randomUUID();
     const sub: SubAgentTask = {
-      taskId: subId, parentTaskId: '', prompt, status: 'running',
-      createdAt: new Date().toISOString(),
+      taskId: subId, parentTaskId: '', prompt, status: 'queued',
+      createdAt: new Date().toISOString(), startedAt: '', timeoutMs: 120000,
     };
     this.subagents.set(subId, sub);
-    this.runSubagent(subId);
+    this.subagentManager.enqueue(sub);
+    this.pumpSubagents();
     return subId;
   }
 
   async collectSubagent(subId: string): Promise<string> {
     const sub = this.subagents.get(subId);
     if (!sub) return `Error: subagent "${subId}" not found`;
-    if (sub.status === 'running') return `Subagent ${subId.slice(0, 8)} still running (started ${sub.createdAt})`;
+    if (sub.status === 'queued' || sub.status === 'running') return `SubagentStatus: ${sub.status}; id=${subId.slice(0, 8)}; createdAt=${sub.createdAt}`;
     return sub.result ?? `Subagent ${subId.slice(0, 8)} completed with no result`;
+  }
+
+  private pumpSubagents(): void {
+    while (this.subagentManager.canStart()) {
+      const id = this.subagentManager.next();
+      if (id) void this.runSubagent(id);
+    }
   }
 
   private async runSubagent(subId: string): Promise<void> {
     const sub = this.subagents.get(subId);
     if (!sub) return;
+    sub.status = 'running';
+    const started = Date.now();
+    sub.startedAt = new Date().toISOString();
+    const timeoutMs = sub.timeoutMs ?? 120000;
     try {
       const messages: OllamaMsg[] = [{ role: 'user', content: sub.prompt }];
       let result = '';
       for (let turn = 0; turn < 20; turn++) {
+        if (Date.now() - started > timeoutMs) throw new Error('subagent timeout');
         const { text, toolCalls } = await this.callModelWithTools(SUBAGENT_SYSTEM_PROMPT, messages);
         const msg: OllamaMsg = { role: 'assistant', content: text || null };
         if (toolCalls?.length) msg.tool_calls = toolCalls;
@@ -169,13 +193,18 @@ export class MasterCoordinator {
           messages.push({ role: 'tool', content: res });
         }
       }
+      await Promise.race([Promise.resolve(), new Promise((_, rej) => setTimeout(() => rej(new Error('subagent timeout')), timeoutMs))]);
       sub.result = result.trim();
       sub.status = 'completed';
       sub.completedAt = new Date().toISOString();
     } catch (err) {
       sub.status = 'failed';
+      sub.errorType = String(err).includes('timeout') ? 'timeout' : 'model_error';
       sub.result = `Subagent failed: ${String(err)}`;
       sub.completedAt = new Date().toISOString();
+    } finally {
+      this.subagentManager.done(subId);
+      this.pumpSubagents();
     }
   }
 
@@ -198,7 +227,7 @@ export class MasterCoordinator {
   ): AsyncGenerator<StreamChunk> {
     const taskId = randomUUID();
     const task: PromptTask = {
-      taskId, userId, prompt, mode, status: 'running', plan: [], phaseEvents: [], messages: [],
+      taskId, userId, prompt, mode, status: 'running', plan: [], phaseEvents: [], messages: [], traceId: telemetry.newTraceId(),
     };
     this.tasks.set(taskId, task);
     this.persist(task);
@@ -214,7 +243,7 @@ export class MasterCoordinator {
       if (mode === 'plan') {
         yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Generating execution plan…' };
         const content = await this.callModelText(prompt, PLAN_SYSTEM_PROMPT, []);
-        task.plan = parsePlan(content);
+        task.plan = await this.parsePlanWithRetry(content, prompt);
         yield { type: 'phase', phase: 'plan', status: 'done', note: `${task.plan.length} steps` };
         const planText = task.plan.map((s, i) => `**${i + 1}. ${s.title}**\n${s.detail}`).join('\n\n');
         yield { type: 'token', text: planText };
@@ -308,6 +337,20 @@ export class MasterCoordinator {
     }
   }
 
+
+  private async parsePlanWithRetry(content: string, originalPrompt: string): Promise<PlanStep[]> {
+    try {
+      return parsePlan(content);
+    } catch {
+      const repaired = await this.callModelText(
+        `${originalPrompt}\n\nYour previous output was invalid JSON. Return ONLY a JSON array with {"title","detail"}.`,
+        PLAN_SYSTEM_PROMPT,
+        [],
+      );
+      return parsePlan(repaired);
+    }
+  }
+
   private askUserInStream(taskId: string, question: string): Promise<string> {
     return new Promise((resolve) => {
       this.userAnswer.set(taskId, resolve);
@@ -323,7 +366,7 @@ export class MasterCoordinator {
   ): AsyncGenerator<StreamChunk> {
     yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Building plan…' };
     const planContent = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, []);
-    task.plan = parsePlan(planContent);
+    task.plan = await this.parsePlanWithRetry(planContent, task.prompt);
     yield { type: 'phase', phase: 'plan', status: 'done', note: `${task.plan.length} steps` };
     const planMd = task.plan.map((s, i) => `${i + 1}. **${s.title}** — ${s.detail}`).join('\n');
     yield { type: 'token', text: `## Plan\n${planMd}\n\n` };
@@ -462,6 +505,7 @@ export class MasterCoordinator {
   // ── Background task runner (non-streaming) ──────────────────────────────────
   private markPhase(task: PromptTask, phase: TaskPhase, status: PhaseEvent['status'], note?: string): void {
     task.phaseEvents.push({ phase, status, note, ts: new Date().toISOString() });
+    telemetry.add({ traceId: task.traceId ?? task.taskId, taskId: task.taskId, type: status === 'in_progress' ? 'phase_started' : 'phase_done', note: `${phase}:${status}${note ? `:${note}` : ''}` });
     this.persist(task);
   }
 
@@ -486,7 +530,7 @@ export class MasterCoordinator {
       if (task.mode === 'plan') {
         this.markPhase(task, 'plan', 'in_progress');
         const content = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, []);
-        task.plan = parsePlan(content);
+        task.plan = await this.parsePlanWithRetry(content, task.prompt);
         this.markPhase(task, 'plan', 'done', `${task.plan.length} steps`);
         task.result = 'plan_ready';
         task.status = 'blocked';
@@ -614,7 +658,7 @@ export class MasterCoordinator {
   private async runReactFlow(task: PromptTask, toolCtx: ToolContext): Promise<void> {
     this.markPhase(task, 'plan', 'in_progress');
     const planContent = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, []);
-    task.plan = parsePlan(planContent);
+    task.plan = await this.parsePlanWithRetry(planContent, task.prompt);
     this.markPhase(task, 'plan', 'done');
     const planMd = task.plan.map((s, i) => `${i + 1}. ${s.title} — ${s.detail}`).join('\n');
 

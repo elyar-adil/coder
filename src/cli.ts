@@ -4,10 +4,12 @@ import { MasterCoordinator } from './master.js';
 import { runTui } from './tui.js';
 import { detectBackend, type BackendConfig, type BackendType } from './backend.js';
 import { loadConfig } from './config.js';
+import { defaultPolicy } from './policy.js';
+import { setToolPolicy } from './tools.js';
 
 async function main(): Promise<void> {
   const program = new Command();
-  program.name('coding-agent').description('Top-tier coding agent CLI/TUI (TypeScript)').version('0.2.0');
+  program.name('coder').description('Top-tier coding agent CLI/TUI (TypeScript)').version('0.2.0');
 
   // Build backend config from env vars + .agentrc
   const fileConfig = await loadConfig();
@@ -22,6 +24,8 @@ async function main(): Promise<void> {
     model,
     ...(apiKey ? { apiKey } : {}),
   };
+
+  setToolPolicy(defaultPolicy(fileConfig.policyLevel ?? 'moderate', process.cwd()));
 
   const master = new MasterCoordinator(backendConfig);
 

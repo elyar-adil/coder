@@ -6,9 +6,10 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
-    "test": "node --import tsx/esm --test tests/*.test.ts",
-    "test:watch": "node --import tsx/esm --test --watch tests/*.test.ts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test": "node --import tsx/esm --test tests/*.test.ts tests/**/*.test.ts",
+    "test:watch": "node --import tsx/esm --test --watch tests/*.test.ts tests/**/*.test.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "eval:bench": "tsx tests/benchmarks/run_eval.ts"
   },
   "dependencies": {
     "ansi-escapes": "^7.3.0",
@@ -25,5 +26,9 @@
     "@types/node": "^22.10.5",
     "tsx": "^4.19.2",
     "typescript": "^5.6.3"
+  },
+  "bin": {
+    "coder": "dist/cli.js",
+    "coding-agent": "dist/cli.js"
   }
 }

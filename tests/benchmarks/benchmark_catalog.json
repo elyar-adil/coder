@@ -1,0 +1,9 @@
+{
+  "benchmarks": [
+    {"name": "SWE-bench Lite", "category": "repo bug-fixing", "metric": "pass@1 on issue tasks"},
+    {"name": "HumanEval", "category": "code generation", "metric": "pass@k"},
+    {"name": "MBPP", "category": "python programming", "metric": "accuracy/pass@1"},
+    {"name": "APPS", "category": "competitive/problem solving", "metric": "test case pass rate"},
+    {"name": "LiveCodeBench", "category": "temporal coding benchmark", "metric": "pass@1 by date split"}
+  ]
+}

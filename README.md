@@ -17,26 +17,36 @@ A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that 
 
 ```bash
 npm install
+npm run build
+npm link   # globally installs `coder` command
 ```
 
 ## CLI Usage
 
 ```bash
 # Submit a task
+coder submit --user alice --prompt "add error handling" --mode execute
+# or in development
 npm run dev -- submit --user alice --prompt "add error handling" --mode execute
 npm run dev -- submit --user alice --prompt "plan the refactor" --mode plan
 npm run dev -- submit --user alice --prompt "implement login" --mode react
 
 # Get task status
+coder get --task <task_id>
+# or
 npm run dev -- get --task <task_id>
 
 # Execute an approved plan
+coder execute-plan --task <task_id>
+# or
 npm run dev -- execute-plan --task <task_id>
 ```
 
 ## TUI Usage
 
 ```bash
+coder
+# or
 npm run dev -- tui
 ```
 
@@ -95,7 +105,8 @@ Create `.agentrc` in your project directory or home directory:
   "baseUrl": "http://localhost:11434",
   "model": "gemma4:31b-cloud",
   "backend": "ollama",
-  "defaultMode": "execute"
+  "defaultMode": "execute",
+  "policyLevel": "moderate"
 }
 ```
 
@@ -123,3 +134,17 @@ Built-in skill definitions for domain guidance:
 | `git-workflow` | Git branching and commit conventions |
 | `debugging` | Bug diagnosis methodology |
 | `sql-database` | SQL and ORM guidelines |
+
+
+## Benchmarks
+
+The project now includes a benchmark catalog at `tests/benchmarks/benchmark_catalog.json` covering SWE-bench Lite, HumanEval, MBPP, APPS, and LiveCodeBench and a runnable isolated-checkout harness under `tests/benchmarks/harness.ts`.
+
+
+### Run benchmark harness
+
+```bash
+npm run eval:bench
+# optional: custom tasks and output
+# npm run eval:bench -- tests/benchmarks/tasks.sample.json tests/benchmarks/reports/custom.json
+```
