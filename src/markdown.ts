@@ -36,7 +36,17 @@ export function renderMarkdown(text: string, cols = 80): string {
         inCodeBlock = false;
         const langLabel = codeLang ? chalk.dim.italic(` ${codeLang}`) : '';
         out.push(chalk.dim('┌' + '─'.repeat(Math.max(2, cols - 2))) + langLabel);
-        for (const cl of codeLines) out.push(chalk.dim('│ ') + chalk.greenBright(cl));
+        for (const cl of codeLines) {
+          if (codeLang === 'diff') {
+            const color = cl.startsWith('+') ? chalk.greenBright
+              : cl.startsWith('-') ? chalk.redBright
+              : cl.startsWith('@') ? chalk.cyan
+              : chalk.dim;
+            out.push(chalk.dim('│ ') + color(cl));
+          } else {
+            out.push(chalk.dim('│ ') + chalk.greenBright(cl));
+          }
+        }
         out.push(chalk.dim('└' + '─'.repeat(Math.max(2, cols - 2))));
         codeLang = '';
         codeLines = [];
@@ -82,7 +92,7 @@ export function renderMarkdown(text: string, cols = 80): string {
 
   if (inCodeBlock && codeLines.length > 0) {
     out.push(chalk.dim('┌─'));
-    for (const cl of codeLines) out.push(chalk.dim('│ ') + chalk.greenBright(cl));
+    for (const cl of codeLines) out.push(chalk.dim('│ ') + (codeLang === 'diff' ? (cl.startsWith('+') ? chalk.greenBright(cl) : cl.startsWith('-') ? chalk.redBright(cl) : chalk.dim(cl)) : chalk.greenBright(cl)));
     out.push(chalk.dim('└─'));
   }
 

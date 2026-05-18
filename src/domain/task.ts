@@ -20,6 +20,7 @@ export interface ClarificationRequest {
   clarificationId: string;
   taskId: string;
   question: string;
+  choices: string[];
   createdAt: string;
   status: 'pending' | 'answered';
   answer?: string;
@@ -101,7 +102,7 @@ export type ReleaseLock = () => void | Promise<void>;
 export interface ToolContext {
   spawnSubagent: (prompt: string) => Promise<string>;
   collectSubagent: (id: string) => Promise<string>;
-  requestClarification?: (question: string) => Promise<string>;
+  requestClarification?: (question: string, choices?: string[]) => Promise<string>;
   acquireWriteLock?: (path: string) => Promise<ReleaseLock>;
   policy?: ToolPolicy;
   sharedContext?: string;
@@ -111,6 +112,9 @@ export interface ToolContext {
 export type MasterEvent =
   | { type: 'task_created'; task: PromptTask; ts: string }
   | { type: 'task_updated'; task: PromptTask; ts: string }
+  | { type: 'subagent_created'; subagent: SubAgentTask; ts: string }
+  | { type: 'subagent_updated'; subagent: SubAgentTask; ts: string }
+  | { type: 'subagent_output'; subagentId: string; parentTaskId: string; text: string; ts: string }
   | { type: 'task_phase'; taskId: string; phase: TaskPhase; status: PhaseEvent['status']; note?: string; ts: string }
   | { type: 'task_output'; taskId: string; text: string; ts: string }
   | { type: 'tool_call'; taskId: string; tool: string; input: string; ts: string }

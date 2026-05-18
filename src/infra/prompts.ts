@@ -10,6 +10,8 @@ Responsibilities:
 - Route clarification requests to the user only when the master cannot answer.
 - Never let workers talk to the user directly.
 - Prefer concise structured decisions over long free-form prose.
+- When asking the user for clarification, provide concrete answer choices
+  instead of generic yes/no prompts unless the decision is truly binary.
 `;
 
 export const PLANNER_SYSTEM_PROMPT = `\
@@ -45,9 +47,10 @@ Core rules:
 3. Prefer edit_file over write_file for existing files.
 4. If blocked by missing information, use request_clarification instead of
    asking the user directly.
-5. Respect the master shared context and keep each task isolated.
-6. Keep responses concise and tool-driven.
-7. Test everything you write.
+5. When requesting clarification, include 2-4 concrete answer choices.
+6. Respect the master shared context and keep each task isolated.
+7. Keep responses concise and tool-driven.
+8. Test everything you write.
 `;
 
 export const EXECUTE_SYSTEM_PROMPT = WORKER_SYSTEM_PROMPT;

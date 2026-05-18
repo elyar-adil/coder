@@ -21,6 +21,7 @@ import {
   CHAT_SYSTEM_PROMPT,
   DESIGN_TOOLS_PROMPT,
   EXECUTE_SYSTEM_PROMPT,
+  MASTER_SYSTEM_PROMPT,
   PLAN_SYSTEM_PROMPT,
   PLANNER_SYSTEM_PROMPT,
   REACT_IMPLEMENT_PROMPT,
@@ -67,6 +68,24 @@ function excerpt(value: string | undefined, max = 200): string {
 
 function isRepoScopedPrompt(prompt: string): boolean {
   return /\b(repo|repository|project|module|function|file|src|test|bug|build|code|task)\b/i.test(prompt);
+}
+
+function parseClarificationChoices(content: string): string[] {
+  try {
+    const trimmed = content.trim();
+    const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const candidate = (fenced?.[1] ?? trimmed).trim();
+    const parsed = JSON.parse(candidate) as Array<{ label?: string; value?: string } | string>;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.map((item) => {
+      if (typeof item === 'string') return item.trim();
+      const label = typeof item?.label === 'string' ? item.label.trim() : '';
+      const value = typeof item?.value === 'string' ? item.value.trim() : '';
+      return label || value;
+    }).filter(Boolean).slice(0, 4);
+  } catch {
+    return [];
+  }
 }
 
 export class MasterCoordinator {
@@ -133,6 +152,10 @@ export class MasterCoordinator {
   private async persist(task: PromptTask): Promise<void> {
     task.updatedAt = now();
     await this.store.save(task);
+  }
+
+  private emitSubagentUpdate(subagent: SubAgentTask): void {
+    this.emit({ type: 'subagent_updated', subagent: { ...subagent }, ts: now() });
   }
 
   private emitTaskUpdate(task: PromptTask): void {
@@ -318,9 +341,46 @@ export class MasterCoordinator {
       readOnly,
     };
     this.subagents.set(subId, sub);
+    this.emit({ type: 'subagent_created', subagent: { ...sub }, ts: now() });
     this.subagentManager.enqueue(sub);
     this.pumpSubagents();
     return subId;
+  }
+
+  private async waitForSubagent(subId: string, timeoutMs = 120_000): Promise<SubAgentTask | undefined> {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      const sub = this.subagents.get(subId);
+      if (!sub) return undefined;
+      if (sub.status === 'completed' || sub.status === 'failed') return sub;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return this.subagents.get(subId);
+  }
+
+  private async dispatchPlannerSubtasks(task: PromptTask, planner: PlannerDecision): Promise<void> {
+    if (planner.subtasks.length === 0) return;
+
+    const spawned = await Promise.all(planner.subtasks.map((step, index) => {
+      const prompt = [
+        `Parent task: ${task.prompt}`,
+        `Subtask ${index + 1}: ${step.title}`,
+        `Detail: ${step.detail}`,
+        'Work independently, stay within scope, and report a concise result.',
+      ].join('\n');
+      return this.spawnSubagent(prompt, task.taskId, Boolean(task.readOnly));
+    }));
+
+    const results = await Promise.all(spawned.map((id) => this.waitForSubagent(id)));
+    const notes = results
+      .filter((sub): sub is SubAgentTask => Boolean(sub))
+      .map((sub) => `- ${sub.taskId.slice(0, 8)} [${sub.status}] ${excerpt(sub.result ?? sub.prompt, 160)}`);
+
+    if (notes.length > 0) {
+      task.sharedContext = `${task.sharedContext ?? ''}\n\nWorker results:\n${notes.join('\n')}`.trim();
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+    }
   }
 
   async collectSubagent(subId: string): Promise<string> {
@@ -345,11 +405,12 @@ export class MasterCoordinator {
 
     sub.status = 'running';
     sub.startedAt = now();
+    this.emitSubagentUpdate(sub);
     const taskPolicy = sub.readOnly ? readOnlyPolicy(this.basePolicy) : this.basePolicy;
     const toolCtx: ToolContext = {
       spawnSubagent: async () => 'Error: subagents cannot spawn other subagents',
       collectSubagent: async () => 'Error: subagents cannot collect siblings directly',
-      requestClarification: (question) => this.requestClarification(sub.parentTaskId || sub.taskId, question),
+      requestClarification: (question, choices) => this.requestClarification(sub.parentTaskId || sub.taskId, question, choices),
       acquireWriteLock: (path) => this.fileLocks.acquire(path),
       policy: taskPolicy,
       taskId: sub.parentTaskId || sub.taskId,
@@ -369,20 +430,38 @@ export class MasterCoordinator {
         if (toolCalls?.length) message.tool_calls = toolCalls;
         messages.push(message);
         result += `${text}\n`;
+        if (text.trim()) {
+          this.emit({
+            type: 'subagent_output',
+            subagentId: sub.taskId,
+            parentTaskId: sub.parentTaskId,
+            text,
+            ts: now(),
+          });
+        }
         if (!toolCalls?.length) break;
         for (const call of toolCalls) {
           const output = await executeTool(call.function.name, call.function.arguments, toolCtx);
+          this.emit({
+            type: 'subagent_output',
+            subagentId: sub.taskId,
+            parentTaskId: sub.parentTaskId,
+            text: `[tool:${call.function.name}] ${excerpt(output, 240)}`,
+            ts: now(),
+          });
           messages.push({ role: 'tool', content: output, tool_use_id: call.id });
         }
       }
       sub.result = result.trim();
       sub.status = 'completed';
       sub.completedAt = now();
+      this.emitSubagentUpdate(sub);
     } catch (error) {
       sub.status = 'failed';
       sub.errorType = String(error).includes('timeout') ? 'timeout' : 'model_error';
       sub.result = `Subagent failed: ${String(error)}`;
       sub.completedAt = now();
+      this.emitSubagentUpdate(sub);
     } finally {
       this.subagentManager.done(subId);
       this.pumpSubagents();
@@ -451,15 +530,36 @@ export class MasterCoordinator {
     }
   }
 
-  private async requestClarification(taskId: string, question: string): Promise<string> {
+  private async requestClarification(taskId: string, question: string, choices: string[] = []): Promise<string> {
     const task = this.tasks.get(taskId);
     if (!task) return '';
 
     const clarificationId = randomUUID();
+    let finalChoices = choices.slice(0, 4);
+    if (finalChoices.length === 0) {
+      const prompt = [
+        `Task: ${task.prompt}`,
+        `Question: ${question}`,
+        task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
+        '',
+        'Generate 2 to 4 concrete answer choices for the user.',
+        'Rules:',
+        '- Return ONLY valid JSON array.',
+        '- Each item must have "label" and "value" strings.',
+        '- Choices must be specific and useful, not yes/no or generic.',
+        '- Keep labels short and distinct.',
+      ].filter(Boolean).join('\n');
+      const content = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, []);
+      finalChoices = parseClarificationChoices(content);
+      if (finalChoices.length === 0) {
+        finalChoices = [question];
+      }
+    }
     const request: ClarificationRequest = {
       clarificationId,
       taskId,
       question,
+      choices: finalChoices,
       createdAt: now(),
       status: 'pending',
     };
@@ -501,6 +601,10 @@ export class MasterCoordinator {
         task.prompt = `${task.prompt}\n\nClarification from user:\n${answer}`;
         task.sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
         await this.persist(task);
+      }
+
+      if (task.mode !== 'plan' && planner.subtasks.length > 0) {
+        void this.dispatchPlannerSubtasks(task, planner);
       }
 
       if (task.mode === 'plan') {
@@ -563,56 +667,80 @@ export class MasterCoordinator {
 
       this.markPhase(task, 'design', 'in_progress', 'Exploring codebase and designing…');
       yield { type: 'phase', phase: 'design', status: 'in_progress', note: 'Exploring codebase and designing…' };
-      const designResult = await this.runToolLoopStream(
+      yield { type: 'token', text: '## Design\n' };
+      let designResult = '';
+      for await (const chunk of this.runToolLoopStream(
         [...messages, { role: 'user', content: DESIGN_TOOLS_PROMPT }],
         maxTurns,
         toolCtx,
         task.readOnly ?? false,
-      );
+        (text) => {
+          designResult += text;
+        },
+      )) {
+        yield chunk;
+      }
+      designResult = designResult.trim();
       messages.push({ role: 'assistant', content: `## Design\n${designResult}` });
       task.designDoc = designResult;
       fullResult += `## Design\n${designResult}\n\n`;
       await this.persist(task);
       this.markPhase(task, 'design', 'done');
-      yield { type: 'token', text: `## Design\n${designResult}\n\n` };
+      yield { type: 'token', text: '\n\n' };
       yield { type: 'phase', phase: 'design', status: 'done' };
 
       this.markPhase(task, 'write_code', 'in_progress', 'Writing implementation…');
       yield { type: 'phase', phase: 'write_code', status: 'in_progress', note: 'Writing implementation…' };
+      yield { type: 'token', text: '## Implementation\n' };
       let filesWritten = false;
-      const implementationResult = await this.runToolLoopStream(
+      let implementationResult = '';
+      for await (const chunk of this.runToolLoopStream(
         messages,
         maxTurns,
         toolCtx,
         task.readOnly ?? false,
+        (text) => {
+          implementationResult += text;
+        },
         (toolName) => {
           if (toolName === 'write_file' || toolName === 'edit_file') {
             filesWritten = true;
           }
         },
-      );
+      )) {
+        yield chunk;
+      }
+      implementationResult = implementationResult.trim();
       fullResult += implementationResult;
       task.messages = [...messages];
       await this.persist(task);
       this.markPhase(task, 'write_code', 'done');
-      yield { type: 'token', text: implementationResult };
+      yield { type: 'token', text: '\n\n' };
       yield { type: 'phase', phase: 'write_code', status: 'done' };
 
       if (filesWritten) {
         for (let attempt = 0; attempt < 3; attempt += 1) {
           this.markPhase(task, 'verify', 'in_progress', `Verifying (attempt ${attempt + 1})…`);
           yield { type: 'phase', phase: 'verify', status: 'in_progress', note: `Verifying (attempt ${attempt + 1})…` };
-          const verifyResult = await this.runToolLoopStream(
+          yield { type: 'token', text: `## Verification attempt ${attempt + 1}\n` };
+          let verifyResult = '';
+          for await (const chunk of this.runToolLoopStream(
             [...messages, { role: 'user', content: VERIFY_SELFIE_PROMPT }],
             maxTurns,
             toolCtx,
             false,
-          );
+            (text) => {
+              verifyResult += text;
+            },
+          )) {
+            yield chunk;
+          }
+          verifyResult = verifyResult.trim();
           messages.push({ role: 'assistant', content: verifyResult || null });
           fullResult += `\n${verifyResult}`;
           task.messages = [...messages];
           await this.persist(task);
-          yield { type: 'token', text: `\n${verifyResult}` };
+          yield { type: 'token', text: '\n\n' };
 
           const lower = verifyResult.toLowerCase();
           const passed = !/fail|error|traceback|exited with code/i.test(lower)
@@ -658,7 +786,13 @@ export class MasterCoordinator {
         content: `${task.sharedContext}\n\nUser request:\n${task.prompt}\n\nInspect the repository and answer the request. Use repo_map, list_dir, read_file, bash, and load_skill as needed. Do not modify files.`,
       },
     ];
-    const result = await this.runToolLoopStream(messages, 20, toolCtx, true);
+    let result = '';
+    for await (const chunk of this.runToolLoopStream(messages, 20, toolCtx, true, (text) => {
+      result += text;
+    })) {
+      yield chunk;
+    }
+    result = result.trim();
     task.result = result;
     task.status = 'completed';
     task.completedAt = now();
@@ -688,7 +822,7 @@ export class MasterCoordinator {
     return {
       spawnSubagent: (prompt) => this.spawnSubagent(prompt, task.taskId, Boolean(task.readOnly)),
       collectSubagent: (id) => this.collectSubagent(id),
-      requestClarification: (question) => this.requestClarification(task.taskId, question),
+      requestClarification: (question, choices) => this.requestClarification(task.taskId, question, choices),
       acquireWriteLock: (path) => this.fileLocks.acquire(path),
       policy,
       sharedContext: task.sharedContext,
@@ -862,38 +996,45 @@ export class MasterCoordinator {
     yield* this.agenticStreamRaw(messages, toolCtx, readOnly, onText);
   }
 
-  private async runToolLoopStream(
+  private async *runToolLoopStream(
     messages: OllamaMsg[],
     maxTurns: number,
     toolCtx: ToolContext,
     readOnly: boolean,
+    onText?: (text: string) => void,
     onToolCall?: (tool: string) => void,
-  ): Promise<string> {
+  ): AsyncGenerator<StreamChunk> {
     const tools = this.getToolsForTask(readOnly);
-    let fullResult = '';
     for (let turn = 0; turn < maxTurns; turn += 1) {
       let assistantText = '';
       let toolCalls: OllamaMsg['tool_calls'];
 
       for await (const chunk of this.streamModelWithTools(EXECUTE_SYSTEM_PROMPT, messages, tools)) {
-        if (chunk.message?.content) assistantText += chunk.message.content;
+        if (chunk.message?.content) {
+          assistantText += chunk.message.content;
+          onText?.(chunk.message.content);
+          yield { type: 'token', text: chunk.message.content };
+        }
         if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
       }
 
       const message: OllamaMsg = { role: 'assistant', content: assistantText || null };
       if (toolCalls?.length) message.tool_calls = toolCalls;
       messages.push(message);
-      fullResult += `${assistantText}\n`;
 
       if (!toolCalls?.length) break;
 
       for (const call of toolCalls) {
         onToolCall?.(call.function.name);
+        const toolName = call.function.name;
+        const toolArgs = call.function.arguments;
+        const preview = toolArgs['command'] ?? toolArgs['path'] ?? JSON.stringify(toolArgs);
+        yield { type: 'tool_call', tool: toolName, input: preview };
         const result = await executeTool(call.function.name, call.function.arguments, toolCtx);
+        yield { type: 'tool_result', tool: toolName, output: result };
         messages.push({ role: 'tool', content: result, tool_use_id: call.id });
       }
     }
-    return fullResult.trim();
   }
 
   private async *streamModelWithTools(

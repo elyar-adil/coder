@@ -24,6 +24,56 @@ async function gitAutoCommit(filePath: string, message: string): Promise<void> {
   }
 }
 
+function unifiedDiff(filePath: string, before: string, after: string, maxChangedLines = 160): string {
+  if (before === after) return '';
+  const beforeLines = before.split('\n');
+  const afterLines = after.split('\n');
+  let start = 0;
+  while (start < beforeLines.length && start < afterLines.length && beforeLines[start] === afterLines[start]) {
+    start += 1;
+  }
+
+  let beforeEnd = beforeLines.length - 1;
+  let afterEnd = afterLines.length - 1;
+  while (beforeEnd >= start && afterEnd >= start && beforeLines[beforeEnd] === afterLines[afterEnd]) {
+    beforeEnd -= 1;
+    afterEnd -= 1;
+  }
+
+  const contextBeforeStart = Math.max(0, start - 3);
+  const contextAfterEnd = Math.min(afterLines.length - 1, afterEnd + 3);
+  const lines = [
+    '```diff',
+    `--- ${filePath}`,
+    `+++ ${filePath}`,
+    `@@ -${contextBeforeStart + 1} +${contextBeforeStart + 1} @@`,
+  ];
+
+  for (const line of beforeLines.slice(contextBeforeStart, start)) {
+    lines.push(` ${line}`);
+  }
+
+  const removed = beforeLines.slice(start, beforeEnd + 1);
+  const added = afterLines.slice(start, afterEnd + 1);
+  const changed = [
+    ...removed.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
+  ];
+  if (changed.length > maxChangedLines) {
+    lines.push(...changed.slice(0, maxChangedLines));
+    lines.push(` ... ${changed.length - maxChangedLines} more changed lines`);
+  } else {
+    lines.push(...changed);
+  }
+
+  for (const line of afterLines.slice(afterEnd + 1, contextAfterEnd + 1)) {
+    lines.push(` ${line}`);
+  }
+
+  lines.push('```');
+  return lines.join('\n');
+}
+
 const SYMBOL_PATTERNS: Record<string, RegExp[]> = {
   '.ts': [
     /^export\s+(?:async\s+)?(?:function|class|interface|type|enum|const|let)\s+(\w+)/m,
@@ -142,7 +192,12 @@ export interface OllamaToolDef {
     description: string;
     parameters: {
       type: 'object';
-      properties: Record<string, { type: string; description: string }>;
+      properties: Record<string, {
+        type: string;
+        description: string;
+        items?: Record<string, unknown>;
+        enum?: string[];
+      }>;
       required: string[];
     };
   };
@@ -297,6 +352,11 @@ understand the codebase structure without reading every file. Returns a compact 
         type: 'object',
         properties: {
           question: { type: 'string', description: 'A precise clarification question describing what is missing.' },
+          choices: {
+            type: 'array',
+            description: 'Two to four concrete answer options for the user. Avoid generic yes/no labels unless the decision is truly binary.',
+            items: { type: 'string' },
+          },
         },
         required: ['question'],
       },
@@ -311,6 +371,11 @@ understand the codebase structure without reading every file. Returns a compact 
         type: 'object',
         properties: {
           question: { type: 'string', description: 'The clarification question.' },
+          choices: {
+            type: 'array',
+            description: 'Two to four concrete answer options for the user.',
+            items: { type: 'string' },
+          },
         },
         required: ['question'],
       },
@@ -379,7 +444,8 @@ export async function executeTool(
         try {
           await writeFile(path, content, 'utf8');
           await gitAutoCommit(path, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
-          return `OK: ${log.join('; ')}`;
+          const diff = unifiedDiff(path, src, content);
+          return [`OK: ${log.join('; ')}`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing edited file: ${String(error)}`;
         }
@@ -414,10 +480,17 @@ export async function executeTool(
 
       return withWriteLock(ctx, path, async () => {
         try {
+          let previous = '';
+          try {
+            previous = await readFile(path, 'utf8');
+          } catch {
+            previous = '';
+          }
           await mkdir(dirname(path), { recursive: true });
           await writeFile(path, content, 'utf8');
           await gitAutoCommit(path, `write: ${path}`);
-          return `OK: wrote ${path} (${content.length} chars)`;
+          const diff = unifiedDiff(path, previous, content);
+          return [`OK: wrote ${path} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing file: ${String(error)}`;
         }
@@ -484,7 +557,19 @@ export async function executeTool(
       if (!ctx?.requestClarification) {
         return 'Error: clarification requests are not available in this context';
       }
-      return ctx.requestClarification(args['question'] ?? '');
+      let choices: string[] | undefined;
+      const rawChoices = args['choices'];
+      if (rawChoices) {
+        try {
+          const parsed = JSON.parse(rawChoices) as unknown;
+          if (Array.isArray(parsed)) {
+            choices = parsed.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean);
+          }
+        } catch {
+          // Ignore malformed choices and fall back to master-generated options.
+        }
+      }
+      return ctx.requestClarification(args['question'] ?? '', choices);
     }
 
     default:

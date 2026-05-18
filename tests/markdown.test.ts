@@ -114,6 +114,13 @@ describe('renderMarkdown', () => {
     assert.ok(result.includes('print'));
   });
 
+  test('renders diff code block', () => {
+    const result = renderMarkdown('```diff\n-old\n+new\n@@\n```', 80);
+    assert.ok(result.includes('-old'));
+    assert.ok(result.includes('+new'));
+    assert.ok(result.includes('@@'));
+  });
+
   test('handles multiple paragraphs', () => {
     const result = renderMarkdown('para1\n\npara2', 80);
     const lines = result.split('\n');
