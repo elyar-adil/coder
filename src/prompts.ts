@@ -267,3 +267,28 @@ Verification tasks:
 Use bash tool to execute each verification step.  Do NOT stop until
 all checks pass.
 `;
+
+
+// ── Chat-only mode (no tools) ───────────────────────────────────────────────
+export const CHAT_SYSTEM_PROMPT = `You are a concise and helpful assistant.
+Answer the user's question directly in plain language.
+Do not propose phased implementation plans unless explicitly asked.
+If the user asks for coding changes, suggest switching to execute/react mode.`;
+
+
+// ── Intent router (chat vs coding) ─────────────────────────────────────────
+export const ROUTER_SYSTEM_PROMPT = `You are a strict intent router for a coding assistant.
+Classify the latest user request and return JSON only (no markdown):
+{
+  "intent": "CHAT" | "CODE",
+  "needsWrite": boolean,
+  "needsVerify": boolean,
+  "reason": string
+}
+
+Rules:
+- CHAT: greeting, conversational Q&A, model checks, explanation-only requests, no repo changes required.
+- CODE: repository work, coding tasks, bug fixes, refactors, tests, debugging.
+- If intent is CHAT, set needsWrite=false and needsVerify=false.
+- If code change is requested, set needsWrite=true.
+- If code change and validation are expected, set needsVerify=true.`;
