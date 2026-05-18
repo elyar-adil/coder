@@ -267,3 +267,19 @@ Verification tasks:
 Use bash tool to execute each verification step.  Do NOT stop until
 all checks pass.
 `;
+
+
+// ── Chat-only mode (no tools) ───────────────────────────────────────────────
+export const CHAT_SYSTEM_PROMPT = `You are a concise and helpful assistant.
+Answer the user's question directly in plain language.
+Do not propose phased implementation plans unless explicitly asked.
+If the user asks for coding changes, suggest switching to execute/react mode.`;
+
+
+// ── Intent router (chat vs coding) ─────────────────────────────────────────
+export const ROUTER_SYSTEM_PROMPT = `You are a strict intent router.
+Classify the latest user request as one of:
+- CHAT: conversational Q&A, greeting, model check, explanation, no repository modifications requested
+- CODE: coding or repository work, file changes, tests, debugging, refactor, implementation
+
+Return exactly one token: CHAT or CODE.`;

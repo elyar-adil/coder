@@ -414,14 +414,33 @@ ${ICONS.ok} Mode → ${chalk.white(mode)} ${chalk.dim(mode === 'plan' ? '(planni
     let spinner: Ora | null = null;
     let fullResponse   = '';
     let lineBuffer     = '';
+    let progressTicker: NodeJS.Timeout | null = null;
+
+    function startProgressTicker(text: string): void {
+      if (progressTicker) clearInterval(progressTicker);
+      const started = Date.now();
+      progressTicker = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - started) / 1000);
+        process.stdout.write(`${ICONS.info} ${chalk.dim(`${text} (${elapsed}s)`) }\n`);
+      }, 4000);
+    }
+
+    function stopProgressTicker(): void {
+      if (progressTicker) {
+        clearInterval(progressTicker);
+        progressTicker = null;
+      }
+    }
 
     function startSpinner(text: string): void {
       if (spinner) spinner.stop();
       spinner = ora({ text: chalk.dim(text), color: 'magenta', spinner: 'dots' }).start();
+      startProgressTicker(text);
     }
 
     function stopSpinner(): void {
       if (spinner) { spinner.stop(); spinner = null; }
+      stopProgressTicker();
     }
 
     startSpinner('Thinking…');
