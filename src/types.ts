@@ -21,7 +21,11 @@ export interface SubAgentTask {
   status: TaskStatus;
   result?: string;
   createdAt: string;
+  startedAt?: string;
   completedAt?: string;
+  timeoutMs?: number;
+  cancelled?: boolean;
+  errorType?: 'timeout' | 'tool_error' | 'model_error' | 'cancelled';
 }
 
 export interface OllamaMsg {
@@ -33,6 +37,7 @@ export interface OllamaMsg {
 }
 
 export interface PromptTask {
+  traceId?: string;
   taskId: string;
   userId: string;
   prompt: string;
@@ -49,4 +54,13 @@ export interface ToolContext {
   spawnSubagent: (p: string) => Promise<string>;
   collectSubagent: (id: string) => Promise<string>;
   askUser?: (question: string) => Promise<string>;
+}
+
+export interface TelemetryEvent {
+  traceId: string;
+  ts: string;
+  type: 'phase_started' | 'phase_done' | 'tool_call' | 'tool_result' | 'backend_retry' | 'error';
+  taskId: string;
+  note?: string;
+  latencyMs?: number;
 }

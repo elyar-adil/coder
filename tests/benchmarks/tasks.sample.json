@@ -1,0 +1,22 @@
+{
+  "tasks": [
+    {
+      "id": "repo-typecheck",
+      "name": "project typecheck in isolated checkout",
+      "repoPath": ".",
+      "setupCommands": [
+        "npm install"
+      ],
+      "testCommand": "npm run typecheck"
+    },
+    {
+      "id": "repo-tests",
+      "name": "project tests in isolated checkout",
+      "repoPath": ".",
+      "setupCommands": [
+        "npm install"
+      ],
+      "testCommand": "npm test"
+    }
+  ]
+}

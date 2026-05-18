@@ -26,6 +26,7 @@ export interface AgentConfig {
   backend?: BackendType;
   apiKey?: string;
   defaultMode?: 'execute' | 'plan' | 'react';
+  policyLevel?: 'strict' | 'moderate' | 'off';
 }
 
 const CONFIG_FILES = ['.agentrc', '.agentrc.json'];

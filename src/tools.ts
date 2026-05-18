@@ -3,8 +3,16 @@ import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname } from 'node:path';
 import type { ToolContext } from './types.js';
+import { authorizeToolCall, defaultPolicy, formatPolicyError, type ToolPolicy } from './policy.js';
 
 const execAsync = promisify(exec);
+
+let activePolicy: ToolPolicy = defaultPolicy();
+
+export function setToolPolicy(policy: ToolPolicy): void {
+  activePolicy = policy;
+}
+
 
 export interface OllamaToolDef {
   type: 'function';
@@ -140,6 +148,9 @@ export async function executeTool(
   args: Record<string, string>,
   ctx?: ToolContext,
 ): Promise<string> {
+  const decision = authorizeToolCall(activePolicy, name, args);
+  if (!decision.ok) return formatPolicyError(name, decision);
+
   switch (name) {
     case 'read_file': {
       const path = args['path'];

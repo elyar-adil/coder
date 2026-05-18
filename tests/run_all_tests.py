@@ -28,7 +28,7 @@ exit_codes.append(run(
 
 exit_codes.append(run(
     ["npm", "test"],
-    label="TypeScript unit tests"
+    label="TypeScript unit + benchmark smoke tests"
 ))
 
 print(f"\n{'='*60}")
