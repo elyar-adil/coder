@@ -61,6 +61,34 @@ export function parseOllamaNdjson(line: string): OllamaStreamChunk | null {
 
 
 
+
+interface IntentRoute {
+  intent: 'CHAT' | 'CODE';
+  needsWrite: boolean;
+  needsVerify: boolean;
+  reason?: string;
+}
+
+function parseRoute(raw: string): IntentRoute {
+  const text = raw.trim();
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? text).trim();
+  try {
+    const parsed = JSON.parse(candidate) as Partial<IntentRoute>;
+    const intent = parsed.intent === 'CHAT' ? 'CHAT' : 'CODE';
+    return {
+      intent,
+      needsWrite: intent === 'CHAT' ? false : Boolean(parsed.needsWrite),
+      needsVerify: intent === 'CHAT' ? false : Boolean(parsed.needsVerify),
+      reason: typeof parsed.reason === 'string' ? parsed.reason : undefined,
+    };
+  } catch {
+    const upper = candidate.toUpperCase();
+    if (upper.includes('CHAT')) return { intent: 'CHAT', needsWrite: false, needsVerify: false };
+    return { intent: 'CODE', needsWrite: true, needsVerify: true };
+  }
+}
+
 export class MasterCoordinator {
   private tasks = new Map<string, PromptTask>();
   private subagents = new Map<string, SubAgentTask>();
@@ -266,18 +294,19 @@ export class MasterCoordinator {
 
       // ── Execute mode ──────────────────────────────────────────────────────
       yield { type: 'phase', phase: 'finalize', status: 'in_progress', note: 'Routing intent…' };
-      const route = (await this.callModelText(prompt, ROUTER_SYSTEM_PROMPT, conversationHistory)).trim().toUpperCase();
-      if (route === 'CHAT') {
+      const routeRaw = await this.callModelText(prompt, ROUTER_SYSTEM_PROMPT, conversationHistory);
+      const route = parseRoute(routeRaw);
+      if (route.intent === 'CHAT') {
         const quick = await this.callModelText(prompt, CHAT_SYSTEM_PROMPT, conversationHistory);
         task.result = quick;
         task.status = 'completed';
         this.persist(task);
         yield { type: 'token', text: quick };
-        yield { type: 'phase', phase: 'finalize', status: 'done' };
+        yield { type: 'phase', phase: 'finalize', status: 'done', note: 'Chat flow selected' };
         yield { type: 'done', result: quick };
         return;
       }
-      yield { type: 'phase', phase: 'finalize', status: 'done', note: 'Coding flow selected' };
+      yield { type: 'phase', phase: 'finalize', status: 'done', note: route.reason ?? 'Coding flow selected' };
 
       const messages: OllamaMsg[] = [
         ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
@@ -340,6 +369,8 @@ export class MasterCoordinator {
           }
         }
       }
+
+      
 
       task.messages = messages;
       task.result = fullResult;
@@ -618,6 +649,8 @@ export class MasterCoordinator {
           else this.markPhase(task, 'write_code', 'in_progress', 'Fixing issues…');
         }
       }
+
+      
 
       task.messages = messages;
       task.result = fullResult;
