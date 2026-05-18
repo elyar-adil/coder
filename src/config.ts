@@ -9,7 +9,7 @@
  *  {
  *    "baseUrl": "http://localhost:11434",
  *    "model": "gemma4:31b-cloud",
- *    "backend": "ollama",
+ *    "backend": "openai",
  *    "apiKey": "sk-...",
  *    "defaultMode": "execute"
  *  }
@@ -33,8 +33,8 @@ const CONFIG_FILES = ['.agentrc', '.agentrc.json'];
 
 function parseConfig(raw: string): AgentConfig {
   const parsed = JSON.parse(raw) as AgentConfig;
-  if (parsed.backend && !['ollama', 'openai'].includes(parsed.backend)) {
-    throw new Error(`Invalid backend "${parsed.backend}" in config. Use "ollama" or "openai".`);
+  if (parsed.backend && !['ollama', 'openai', 'anthropic'].includes(parsed.backend)) {
+    throw new Error(`Invalid backend "${parsed.backend}" in config. Use "openai", "anthropic", or "ollama".`);
   }
   if (parsed.defaultMode && !['execute', 'plan', 'react'].includes(parsed.defaultMode)) {
     throw new Error(`Invalid defaultMode "${parsed.defaultMode}" in config. Use "execute", "plan", or "react".`);

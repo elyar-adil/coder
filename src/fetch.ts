@@ -4,7 +4,7 @@
  * Wraps the native `fetch` with:
  *  • Configurable retry count and backoff
  *  • Request timeout
- *  • Connection-refused detection (Ollama not running)
+ *  • Connection-refused detection for local LLM servers
  */
 
 export interface FetchOptions extends RequestInit {
@@ -38,10 +38,10 @@ function getErrorMessage(status: number | null, cause: unknown): string {
   if (cause instanceof Error && 'code' in cause) {
     const code = (cause as NodeJS.ErrnoException).code;
     if (code === 'ECONNREFUSED') {
-      return 'Connection refused — is Ollama running? (OLLAMA_BASE_URL)';
+      return 'Connection refused — is the configured LLM server running? (LLM_BASE_URL / OLLAMA_BASE_URL)';
     }
     if (code === 'ENOTFOUND') {
-      return 'DNS lookup failed — check OLLAMA_BASE_URL';
+      return 'DNS lookup failed — check LLM_BASE_URL';
     }
     if (code === 'ECONNRESET') {
       return 'Connection reset by server';

@@ -1,6 +1,6 @@
 # Top-tier Coding Agent CLI/TUI
 
-A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that connects to Ollama or any OpenAI-compatible API for AI-powered code generation, planning, and verification.
+A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that connects to OpenAI-compatible, Anthropic, or local NDJSON chat APIs for AI-powered code generation, planning, and verification.
 
 ## Features
 
@@ -8,7 +8,7 @@ A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that 
 - **Plan mode** — generate step-by-step execution plans for manual approval
 - **ReAct mode** — automated plan → inspect → implement → verify pipeline
 - **TUI** — interactive terminal UI with streaming output, conversation history, and task management
-- **Multi-backend** — Ollama or any OpenAI-compatible API (LM Studio, Together, etc.)
+- **Multi-backend** — OpenAI-compatible APIs, Anthropic, and local NDJSON-compatible runtimes
 - **Conversation persistence** — sessions auto-saved and can be loaded later
 - **Config file** — `.agentrc` for persistent settings
 - **Resilient networking** — automatic retry with backoff on connection failures
@@ -91,9 +91,10 @@ npm run typecheck
 
 | Env var | Default | Description |
 |---------|---------|-------------|
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | LLM server URL |
+| `LLM_BASE_URL` | `http://localhost:11434` | LLM server URL |
+| `OLLAMA_BASE_URL` | legacy alias | Backward-compatible alias for `LLM_BASE_URL` |
 | `AGENT_MODEL` | `gemma4:31b-cloud` | Model name |
-| `LLM_BACKEND` | auto-detected | `ollama` or `openai` |
+| `LLM_BACKEND` | auto-detected | `openai`, `anthropic`, or `ollama` |
 | `LLM_API_KEY` | — | API key (for OpenAI-compatible backends) |
 
 ### Config file (.agentrc)
@@ -104,7 +105,7 @@ Create `.agentrc` in your project directory or home directory:
 {
   "baseUrl": "http://localhost:11434",
   "model": "gemma4:31b-cloud",
-  "backend": "ollama",
+  "backend": "openai",
   "defaultMode": "execute",
   "policyLevel": "moderate"
 }
@@ -118,6 +119,17 @@ For OpenAI-compatible backends:
   "model": "gpt-4o",
   "backend": "openai",
   "apiKey": "sk-..."
+}
+```
+
+For Anthropic backends:
+
+```json
+{
+  "baseUrl": "https://api.anthropic.com",
+  "model": "claude-sonnet-4-20250514",
+  "backend": "anthropic",
+  "apiKey": "sk-ant-..."
 }
 ```
 

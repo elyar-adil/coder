@@ -17,6 +17,17 @@ export interface PolicyDecision {
   reason?: string;
 }
 
+export function clonePolicy(policy: ToolPolicy): ToolPolicy {
+  return {
+    level: policy.level,
+    workspaceRoot: policy.workspaceRoot,
+    allowedReadRoots: [...policy.allowedReadRoots],
+    allowedWriteRoots: [...policy.allowedWriteRoots],
+    bashAllowlist: [...policy.bashAllowlist],
+    bashDenylist: [...policy.bashDenylist],
+  };
+}
+
 export function defaultPolicy(level: PolicyLevel = 'off', workspaceRoot = process.cwd()): ToolPolicy {
   return {
     level,
@@ -26,6 +37,12 @@ export function defaultPolicy(level: PolicyLevel = 'off', workspaceRoot = proces
     bashAllowlist: ['npm test', 'npm run typecheck', 'npm run build', 'node --version', 'echo '],
     bashDenylist: ['rm -rf /', 'curl | sh', 'wget | sh', 'mkfs', ':(){:|:&};:'],
   };
+}
+
+export function readOnlyPolicy(base: ToolPolicy): ToolPolicy {
+  const policy = clonePolicy(base);
+  policy.allowedWriteRoots = [];
+  return policy;
 }
 
 function withinRoots(target: string, roots: string[]): boolean {

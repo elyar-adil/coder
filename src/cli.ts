@@ -13,7 +13,7 @@ async function main(): Promise<void> {
 
   // Build backend config from env vars + .agentrc
   const fileConfig = await loadConfig();
-  const baseUrl  = process.env.OLLAMA_BASE_URL ?? fileConfig.baseUrl ?? 'http://localhost:11434';
+  const baseUrl  = process.env.LLM_BASE_URL ?? process.env.OLLAMA_BASE_URL ?? fileConfig.baseUrl ?? 'http://localhost:11434';
   const model    = process.env.AGENT_MODEL    ?? fileConfig.model    ?? 'gemma4:31b-cloud';
   const backend  = (process.env.LLM_BACKEND   ?? fileConfig.backend  ?? detectBackend(baseUrl)) as BackendType;
   const apiKey   = process.env.LLM_API_KEY    ?? fileConfig.apiKey;

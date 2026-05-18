@@ -2,8 +2,9 @@
  * backend.ts — LLM backend abstraction.
  *
  * Supports:
- *  • Ollama (default): POST /api/chat with NDJSON streaming
- *  • OpenAI-compatible: POST /v1/chat/completions with SSE streaming
+ *  • OpenAI-compatible chat completions over SSE
+ *  • Anthropic Messages API over SSE
+ *  • Local NDJSON chat endpoints used by some OpenAI-style runtimes
  *
  * The backend is selected via the LLM_BACKEND env var or .agentrc config.
  */
@@ -12,7 +13,7 @@ import { resilientFetch, FetchError } from './fetch.js';
 import type { OllamaMsg } from './types.js';
 import type { OllamaToolDef } from './tools.js';
 
-export type BackendType = 'ollama' | 'openai';
+export type BackendType = 'openai' | 'anthropic' | 'ollama';
 
 export interface BackendConfig {
   type: BackendType;
@@ -27,13 +28,32 @@ export interface ChatChunk {
   done: boolean;
 }
 
-// ── Ollama backend ──────────────────────────────────────────────────────────
+const ANTHROPIC_VERSION = '2023-06-01';
+const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192;
 
-function parseOllamaNdjson(line: string): { message?: OllamaMsg & { content: string | null }; done?: boolean } | null {
+function parseNdjsonLine(line: string): { message?: OllamaMsg & { content: string | null }; done?: boolean } | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
-  try { return JSON.parse(trimmed); } catch { return null; }
+  try {
+    return JSON.parse(trimmed) as { message?: OllamaMsg & { content: string | null }; done?: boolean };
+  } catch {
+    return null;
+  }
 }
+
+function normalizeToolArguments(args: Record<string, unknown> | undefined): Record<string, string> {
+  const normalized: Record<string, string> = {};
+  for (const [key, value] of Object.entries(args ?? {})) {
+    normalized[key] = typeof value === 'string' ? value : JSON.stringify(value);
+  }
+  return normalized;
+}
+
+function toolCallId(prefix = 'call'): string {
+  return `${prefix}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+// ── Local NDJSON backend ────────────────────────────────────────────────────
 
 async function* ollamaStream(
   config: BackendConfig,
@@ -56,8 +76,8 @@ async function* ollamaStream(
     timeout: 120_000,
   });
 
-  if (!response.ok) throw new FetchError(`Ollama HTTP ${response.status}`, response.status, false);
-  if (!response.body) throw new Error('No response body from Ollama');
+  if (!response.ok) throw new FetchError(`NDJSON backend HTTP ${response.status}`, response.status, false);
+  if (!response.body) throw new Error('No response body from NDJSON backend');
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -70,7 +90,7 @@ async function* ollamaStream(
     const lines = buffer.split('\n');
     buffer = lines.pop() ?? '';
     for (const line of lines) {
-      const obj = parseOllamaNdjson(line);
+      const obj = parseNdjsonLine(line);
       if (!obj) continue;
       if (obj.message?.content) {
         yield { content: obj.message.content, done: false };
@@ -78,7 +98,10 @@ async function* ollamaStream(
       if (obj.message?.tool_calls?.length) {
         yield { content: null, toolCalls: obj.message.tool_calls, done: false };
       }
-      if (obj.done) { yield { content: null, done: true }; return; }
+      if (obj.done) {
+        yield { content: null, done: true };
+        return;
+      }
     }
   }
 }
@@ -104,7 +127,9 @@ async function ollamaNonStream(
     timeout: 120_000,
   });
 
-  if (!response.ok) throw new FetchError(`Ollama HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  if (!response.ok) {
+    throw new FetchError(`NDJSON backend HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  }
   const data = await response.json() as { message?: OllamaMsg & { content: string | null }; done?: boolean };
   return {
     content: data.message?.content ?? null,
@@ -113,7 +138,7 @@ async function ollamaNonStream(
   };
 }
 
-// ── OpenAI-compatible backend ───────────────────────────────────────────────
+// ── OpenAI-compatible chat completions ──────────────────────────────────────
 
 interface OpenAIToolCall {
   id: string;
@@ -126,47 +151,63 @@ interface OpenAIChoice {
     content?: string | null;
     tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }>;
   };
-  finish_reason?: string;
+  finish_reason?: string | null;
 }
 
 function convertToOpenAIMessages(systemPrompt: string, messages: OllamaMsg[]): Array<Record<string, unknown>> {
   const result: Array<Record<string, unknown>> = [{ role: 'system', content: systemPrompt }];
-  for (const m of messages) {
-    if (m.role === 'tool') {
-      result.push({ role: 'tool', content: m.content });
-    } else if (m.tool_calls?.length) {
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      result.push({
+        role: 'tool',
+        content: message.content,
+        ...(message.tool_use_id ? { tool_call_id: message.tool_use_id } : {}),
+      });
+      continue;
+    }
+    if (message.tool_calls?.length) {
       result.push({
         role: 'assistant',
-        content: m.content,
-        tool_calls: m.tool_calls.map((tc) => ({
-          id: `call_${Math.random().toString(36).slice(2, 10)}`,
+        content: message.content,
+        tool_calls: message.tool_calls.map((toolCall) => ({
+          id: toolCall.id ?? toolCallId(),
           type: 'function' as const,
-          function: { name: tc.function.name, arguments: JSON.stringify(tc.function.arguments) },
+          function: {
+            name: toolCall.function.name,
+            arguments: JSON.stringify(toolCall.function.arguments),
+          },
         })),
       });
-    } else {
-      result.push({ role: m.role, content: m.content });
+      continue;
     }
+    result.push({ role: message.role, content: message.content });
   }
   return result;
 }
 
 function convertToOllamaToolCalls(openaiCalls: OpenAIToolCall[]): OllamaMsg['tool_calls'] {
-  return openaiCalls.map((tc) => {
+  return openaiCalls.map((toolCall) => {
     let args: Record<string, string> = {};
-    try { args = JSON.parse(tc.function.arguments); } catch { /* keep empty */ }
-    return { function: { name: tc.function.name, arguments: args } };
+    try {
+      args = JSON.parse(toolCall.function.arguments) as Record<string, string>;
+    } catch {
+      // Keep empty args if malformed.
+    }
+    return {
+      id: toolCall.id,
+      function: { name: toolCall.function.name, arguments: args },
+    };
   });
 }
 
 function convertToolsToOpenAI(tools?: OllamaToolDef[]): Array<Record<string, unknown>> | undefined {
   if (!tools?.length) return undefined;
-  return tools.map((t) => ({
+  return tools.map((tool) => ({
     type: 'function',
     function: {
-      name: t.function.name,
-      description: t.function.description,
-      parameters: t.function.parameters,
+      name: tool.function.name,
+      description: tool.function.description,
+      parameters: tool.function.parameters,
     },
   }));
 }
@@ -196,8 +237,8 @@ async function* openaiStream(
     timeout: 120_000,
   });
 
-  if (!response.ok) throw new FetchError(`OpenAI HTTP ${response.status}: ${await response.text()}`, response.status, false);
-  if (!response.body) throw new Error('No response body from OpenAI');
+  if (!response.ok) throw new FetchError(`OpenAI-compatible HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  if (!response.body) throw new Error('No response body from OpenAI-compatible backend');
 
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
@@ -216,8 +257,12 @@ async function* openaiStream(
       if (!trimmed || trimmed === 'data: [DONE]') {
         if (trimmed === 'data: [DONE]' && pendingToolCalls.size > 0) {
           yield { content: null, toolCalls: convertToOllamaToolCalls([...pendingToolCalls.values()]), done: false };
+          pendingToolCalls.clear();
         }
-        if (trimmed === 'data: [DONE]') { yield { content: null, done: true }; return; }
+        if (trimmed === 'data: [DONE]') {
+          yield { content: null, done: true };
+          return;
+        }
         continue;
       }
       if (!trimmed.startsWith('data: ')) continue;
@@ -232,17 +277,20 @@ async function* openaiStream(
         }
 
         if (choice.delta?.tool_calls) {
-          for (const tc of choice.delta.tool_calls) {
-            if (tc.id) {
-              pendingToolCalls.set(tc.index, {
-                id: tc.id,
+          for (const toolCall of choice.delta.tool_calls) {
+            if (toolCall.id) {
+              pendingToolCalls.set(toolCall.index, {
+                id: toolCall.id,
                 type: 'function',
-                function: { name: tc.function?.name ?? '', arguments: tc.function?.arguments ?? '' },
+                function: {
+                  name: toolCall.function?.name ?? '',
+                  arguments: toolCall.function?.arguments ?? '',
+                },
               });
-            } else if (pendingToolCalls.has(tc.index)) {
-              const existing = pendingToolCalls.get(tc.index)!;
-              if (tc.function?.name) existing.function.name += tc.function.name;
-              if (tc.function?.arguments) existing.function.arguments += tc.function.arguments;
+            } else if (pendingToolCalls.has(toolCall.index)) {
+              const existing = pendingToolCalls.get(toolCall.index)!;
+              if (toolCall.function?.name) existing.function.name += toolCall.function.name;
+              if (toolCall.function?.arguments) existing.function.arguments += toolCall.function.arguments;
             }
           }
         }
@@ -256,7 +304,9 @@ async function* openaiStream(
           yield { content: null, done: true };
           return;
         }
-      } catch { /* skip malformed SSE */ }
+      } catch {
+        // Skip malformed SSE chunks.
+      }
     }
   }
 }
@@ -286,7 +336,7 @@ async function openaiNonStream(
     timeout: 120_000,
   });
 
-  if (!response.ok) throw new FetchError(`OpenAI HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  if (!response.ok) throw new FetchError(`OpenAI-compatible HTTP ${response.status}: ${await response.text()}`, response.status, false);
   const data = await response.json() as {
     choices?: Array<{ message?: { content?: string | null; tool_calls?: OpenAIToolCall[] } }>;
   };
@@ -299,6 +349,274 @@ async function openaiNonStream(
   };
 }
 
+// ── Anthropic Messages API ───────────────────────────────────────────────────
+
+interface AnthropicToolCallState {
+  id: string;
+  name: string;
+  inputText: string;
+  initialInput?: Record<string, unknown>;
+}
+
+interface AnthropicContentBlock {
+  type: string;
+  text?: string;
+  id?: string;
+  name?: string;
+  input?: Record<string, unknown>;
+}
+
+function convertToolsToAnthropic(tools?: OllamaToolDef[]): Array<Record<string, unknown>> | undefined {
+  if (!tools?.length) return undefined;
+  return tools.map((tool) => ({
+    name: tool.function.name,
+    description: tool.function.description,
+    input_schema: tool.function.parameters,
+  }));
+}
+
+function convertToAnthropicMessages(messages: OllamaMsg[]): Array<Record<string, unknown>> {
+  const result: Array<Record<string, unknown>> = [];
+  for (const message of messages) {
+    if (message.role === 'tool') {
+      if (message.tool_use_id) {
+        result.push({
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: message.tool_use_id,
+            content: message.content ?? '',
+          }],
+        });
+      } else {
+        result.push({ role: 'user', content: message.content ?? '' });
+      }
+      continue;
+    }
+
+    if (message.tool_calls?.length) {
+      const content: Array<Record<string, unknown>> = [];
+      if (message.content) content.push({ type: 'text', text: message.content });
+      for (const toolCall of message.tool_calls) {
+        content.push({
+          type: 'tool_use',
+          id: toolCall.id ?? toolCallId('toolu'),
+          name: toolCall.function.name,
+          input: toolCall.function.arguments,
+        });
+      }
+      result.push({ role: 'assistant', content });
+      continue;
+    }
+
+    result.push({
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      content: message.content ?? '',
+    });
+  }
+  return result;
+}
+
+function buildAnthropicHeaders(config: BackendConfig): Record<string, string> {
+  const headers: Record<string, string> = {
+    'content-type': 'application/json',
+    'anthropic-version': ANTHROPIC_VERSION,
+  };
+  if (config.apiKey) headers['x-api-key'] = config.apiKey;
+  return headers;
+}
+
+function anthropicToolStateToCall(state: AnthropicToolCallState): NonNullable<OllamaMsg['tool_calls']>[number] {
+  let input: Record<string, string> = {};
+  if (state.inputText.trim()) {
+    try {
+      input = normalizeToolArguments(JSON.parse(state.inputText) as Record<string, unknown>);
+    } catch {
+      input = normalizeToolArguments(state.initialInput);
+    }
+  } else {
+    input = normalizeToolArguments(state.initialInput);
+  }
+  return {
+    id: state.id,
+    function: {
+      name: state.name,
+      arguments: input,
+    },
+  };
+}
+
+function parseSseFrame(frame: string): { event?: string; data?: string } {
+  const lines = frame.split('\n');
+  let event: string | undefined;
+  const dataLines: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith('event:')) {
+      event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trimStart());
+    }
+  }
+  return { event, data: dataLines.join('\n') };
+}
+
+async function* anthropicStream(
+  config: BackendConfig,
+  systemPrompt: string,
+  messages: OllamaMsg[],
+  tools?: OllamaToolDef[],
+): AsyncGenerator<ChatChunk> {
+  const body: Record<string, unknown> = {
+    model: config.model,
+    max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+    stream: true,
+    system: systemPrompt,
+    messages: convertToAnthropicMessages(messages),
+  };
+  const anthropicTools = convertToolsToAnthropic(tools);
+  if (anthropicTools) body.tools = anthropicTools;
+
+  const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/v1/messages`, {
+    method: 'POST',
+    headers: buildAnthropicHeaders(config),
+    body: JSON.stringify(body),
+    retries: 2,
+    timeout: 120_000,
+  });
+
+  if (!response.ok) throw new FetchError(`Anthropic HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  if (!response.body) throw new Error('No response body from Anthropic backend');
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const pendingToolCalls = new Map<number, AnthropicToolCallState>();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split('\n\n');
+    buffer = frames.pop() ?? '';
+
+    for (const frame of frames) {
+      const { event, data } = parseSseFrame(frame);
+      if (!data || data === '[DONE]') {
+        if (data === '[DONE]') {
+          yield { content: null, done: true };
+          return;
+        }
+        continue;
+      }
+
+      if (event === 'ping') continue;
+
+      try {
+        const parsed = JSON.parse(data) as {
+          index?: number;
+          delta?: { type?: string; text?: string; partial_json?: string };
+          content_block?: AnthropicContentBlock;
+          error?: { message?: string };
+          type?: string;
+        };
+
+        if (event === 'error') {
+          throw new Error(parsed.error?.message ?? 'Anthropic streaming error');
+        }
+
+        if (event === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+          pendingToolCalls.set(parsed.index ?? pendingToolCalls.size, {
+            id: parsed.content_block.id ?? toolCallId('toolu'),
+            name: parsed.content_block.name ?? '',
+            inputText: '',
+            initialInput: parsed.content_block.input,
+          });
+          continue;
+        }
+
+        if (event === 'content_block_delta') {
+          if (parsed.delta?.type === 'text_delta' && parsed.delta.text) {
+            yield { content: parsed.delta.text, done: false };
+          }
+          if (parsed.delta?.type === 'input_json_delta' && typeof parsed.index === 'number') {
+            const existing = pendingToolCalls.get(parsed.index);
+            if (existing && parsed.delta.partial_json) {
+              existing.inputText += parsed.delta.partial_json;
+            }
+          }
+          continue;
+        }
+
+        if (event === 'content_block_stop' && typeof parsed.index === 'number' && pendingToolCalls.has(parsed.index)) {
+          const toolCall = anthropicToolStateToCall(pendingToolCalls.get(parsed.index)!);
+          pendingToolCalls.delete(parsed.index);
+          yield { content: null, toolCalls: [toolCall], done: false };
+          continue;
+        }
+
+        if (event === 'message_stop') {
+          yield { content: null, done: true };
+          return;
+        }
+      } catch {
+        // Ignore malformed frames and keep streaming.
+      }
+    }
+  }
+}
+
+async function anthropicNonStream(
+  config: BackendConfig,
+  systemPrompt: string,
+  messages: OllamaMsg[],
+  tools?: OllamaToolDef[],
+): Promise<ChatChunk> {
+  const body: Record<string, unknown> = {
+    model: config.model,
+    max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
+    stream: false,
+    system: systemPrompt,
+    messages: convertToAnthropicMessages(messages),
+  };
+  const anthropicTools = convertToolsToAnthropic(tools);
+  if (anthropicTools) body.tools = anthropicTools;
+
+  const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/v1/messages`, {
+    method: 'POST',
+    headers: buildAnthropicHeaders(config),
+    body: JSON.stringify(body),
+    retries: 2,
+    timeout: 120_000,
+  });
+
+  if (!response.ok) throw new FetchError(`Anthropic HTTP ${response.status}: ${await response.text()}`, response.status, false);
+  const data = await response.json() as { content?: AnthropicContentBlock[] };
+
+  const textParts: string[] = [];
+  const toolCalls: NonNullable<OllamaMsg['tool_calls']> = [];
+  for (const block of data.content ?? []) {
+    if (block.type === 'text' && block.text) {
+      textParts.push(block.text);
+      continue;
+    }
+    if (block.type === 'tool_use') {
+      toolCalls.push({
+        id: block.id ?? toolCallId('toolu'),
+        function: {
+          name: block.name ?? '',
+          arguments: normalizeToolArguments(block.input),
+        },
+      });
+    }
+  }
+
+  return {
+    content: textParts.join('') || null,
+    toolCalls: toolCalls.length > 0 ? toolCalls : undefined,
+    done: true,
+  };
+}
+
 // ── Public API ──────────────────────────────────────────────────────────────
 
 export function chatStream(
@@ -307,6 +625,7 @@ export function chatStream(
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
 ): AsyncGenerator<ChatChunk> {
+  if (config.type === 'anthropic') return anthropicStream(config, systemPrompt, messages, tools);
   if (config.type === 'openai') return openaiStream(config, systemPrompt, messages, tools);
   return ollamaStream(config, systemPrompt, messages, tools);
 }
@@ -317,21 +636,22 @@ export async function chatNonStream(
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
 ): Promise<ChatChunk> {
+  if (config.type === 'anthropic') return anthropicNonStream(config, systemPrompt, messages, tools);
   if (config.type === 'openai') return openaiNonStream(config, systemPrompt, messages, tools);
   return ollamaNonStream(config, systemPrompt, messages, tools);
 }
 
 /**
  * Detect backend type from a URL heuristically.
- * - Paths containing "/v1" or known OpenAI hosts → openai
- * - Otherwise → ollama
+ * - Anthropic hosts or `/v1/messages` → anthropic
+ * - `/v1` or known OpenAI hosts → openai
+ * - localhost:11434 → ollama transport
+ * - Otherwise → openai
  */
 export function detectBackend(url: string): BackendType {
   const lower = url.toLowerCase();
-  if (lower.includes('/v1')) return 'openai';
-  if (lower.includes('api.openai.com')) return 'openai';
-  if (lower.includes('api.anthropic.com')) return 'openai';
-  if (lower.includes('localhost:11434')) return 'ollama';
-  if (lower.includes('127.0.0.1:11434')) return 'ollama';
-  return 'ollama';
+  if (lower.includes('api.anthropic.com') || lower.includes('/v1/messages')) return 'anthropic';
+  if (lower.includes('/v1') || lower.includes('api.openai.com')) return 'openai';
+  if (lower.includes('localhost:11434') || lower.includes('127.0.0.1:11434')) return 'ollama';
+  return 'openai';
 }
