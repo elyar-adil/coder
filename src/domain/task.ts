@@ -2,6 +2,7 @@ import type { ToolPolicy } from '../policy.js';
 
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'waiting_user' | 'completed' | 'failed';
 export type TaskMode = 'execute' | 'plan' | 'react';
+export type TaskKind = 'worker' | 'inquiry' | 'derived_worker' | 'sync_worker' | 'clarification';
 export type TaskPhase = 'plan' | 'execute' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
 export type PlanStepIntent = 'answer' | 'tool_loop' | 'code_change' | 'verify' | 'ask_user';
 export type PlanStepToolPolicy = 'none' | 'safe' | 'read_only' | 'code_write' | 'verify';
@@ -29,6 +30,29 @@ export interface ClarificationRequest {
   createdAt: string;
   status: 'pending' | 'answered';
   answer?: string;
+}
+
+export interface TaskMailboxMessage {
+  messageId: string;
+  text: string;
+  sourceTaskId?: string;
+  createdAt: string;
+  absorbedAt?: string;
+  status: 'pending' | 'absorbed';
+}
+
+export interface TaskContextSnapshot {
+  taskId: string;
+  kind?: TaskKind;
+  prompt: string;
+  summary?: string;
+  mode: TaskMode;
+  status: TaskStatus;
+  phase?: string;
+  recentOutput?: string;
+  result?: string;
+  pendingUpdates: string[];
+  updatedAt?: string;
 }
 
 export interface TaskSummary {
@@ -95,6 +119,7 @@ export interface PromptTask {
   taskId: string;
   userId: string;
   prompt: string;
+  kind?: TaskKind;
   mode: TaskMode;
   status: TaskStatus;
   result?: string;
@@ -112,6 +137,9 @@ export interface PromptTask {
   completedAt?: string;
   updatedAt?: string;
   parentTaskId?: string;
+  relatedTaskIds?: string[];
+  mailbox?: TaskMailboxMessage[];
+  contextSnapshot?: string;
 }
 
 export type ReleaseLock = () => void | Promise<void>;
@@ -129,6 +157,8 @@ export interface ToolContext {
 export type MasterEvent =
   | { type: 'task_created'; task: PromptTask; ts: string }
   | { type: 'task_updated'; task: PromptTask; ts: string }
+  | { type: 'master_response'; text: string; relatedTaskIds?: string[]; ts: string }
+  | { type: 'task_mailbox_updated'; taskId: string; message: TaskMailboxMessage; ts: string }
   | { type: 'subagent_created'; subagent: SubAgentTask; ts: string }
   | { type: 'subagent_updated'; subagent: SubAgentTask; ts: string }
   | { type: 'subagent_output'; subagentId: string; parentTaskId: string; text: string; ts: string }

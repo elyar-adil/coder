@@ -69,7 +69,25 @@ describe('MasterCoordinator', () => {
           let toolCalls: unknown;
           const userContent = body.messages?.map((message) => message.content ?? '').join('\n') ?? '';
           const hasToolResult = body.messages?.some((message) => message.role === 'tool') ?? false;
-          if (system.includes('senior planner agent')) {
+          if (system.includes('master router')) {
+            const taskIds = [...userContent.matchAll(/"taskId":\s*"([^"]+)"/g)].map((match) => match[1]);
+            const targetTaskIds = taskIds[0] ? [taskIds[0]] : [];
+            const action = userContent.includes('red theme')
+              ? 'update_task'
+              : userContent.includes('how is the ppt')
+                ? 'query_task'
+                : userContent.includes('html')
+                  ? 'derived_task'
+                  : 'new_task';
+            content = JSON.stringify({
+              action,
+              targetTaskIds: action === 'new_task' ? [] : targetTaskIds,
+              reason: 'mock route',
+              prompt: userContent.includes('red theme') ? 'Use a red theme for the PPT.' : 'mock routed prompt',
+            });
+          } else if (system.includes('master coordinator answering')) {
+            content = 'The referenced task is in progress.';
+          } else if (system.includes('senior planner agent')) {
             if (userContent.includes('123456789')) {
               content = JSON.stringify({
                 summary: 'calculate sum',
@@ -175,6 +193,43 @@ describe('MasterCoordinator', () => {
         assert.ok(!phases.includes('design'));
         assert.ok(tools.includes('bash'));
         assert.ok(done?.result.includes('223456788'));
+      });
+    });
+
+    test('answers task questions from master without creating an extra task', async () => {
+      await withMockBackend(async (baseUrl) => {
+        const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
+        let pptTaskId = '';
+        for await (const chunk of coordinator.streamPrompt('u', 'make a ppt about roadmap', 'execute')) {
+          if (chunk.type === 'task_id') pptTaskId = chunk.taskId;
+        }
+
+        const beforeCount = coordinator.listTasks().length;
+        let answer = '';
+        for await (const chunk of coordinator.streamPrompt('u', 'how is the ppt going?', 'execute')) {
+          if (chunk.type === 'token') answer += chunk.text;
+        }
+
+        assert.equal(coordinator.listTasks().length, beforeCount);
+        assert.ok(answer.includes('in progress'));
+        assert.equal(coordinator.getTask(pptTaskId)?.mailbox, undefined);
+      });
+    });
+
+    test('routes requirement changes into the target task mailbox', async () => {
+      await withMockBackend(async (baseUrl) => {
+        const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
+        const pptTaskId = await coordinator.acceptPrompt('u', 'make a ppt about launch', 'execute');
+
+        let routedTaskId = '';
+        for await (const chunk of coordinator.streamPrompt('u', 'change the ppt to a red theme', 'execute')) {
+          if (chunk.type === 'task_id') routedTaskId = chunk.taskId;
+        }
+
+        const target = coordinator.getTask(pptTaskId);
+        assert.equal(routedTaskId, pptTaskId);
+        assert.ok(target?.mailbox?.some((message) => message.text.includes('red theme')));
+        assert.equal(coordinator.listTasks().filter((task) => task.taskId !== pptTaskId).length, 0);
       });
     });
   });

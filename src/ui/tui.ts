@@ -10,7 +10,7 @@ import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
 import type { BackendConfig } from '../backend.js';
 import type { MasterCoordinator } from '../runtime/coordinator.js';
-import type { ClarificationRequest, LlmTraceEntry, PromptTask, TaskMode, TaskPhase } from '../domain/task.js';
+import type { ClarificationRequest, LlmTraceEntry, PromptTask, TaskMode, TaskPhase, TaskStatus } from '../domain/task.js';
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
   plan: 'Planning',
@@ -27,18 +27,14 @@ type TaskView = {
   title: string;
   prompt: string;
   mode: TaskMode;
+  kind?: string;
+  relatedTaskIds?: string[];
+  pendingMailboxUpdates: number;
   lines: string[];
   stream: string;
   llmTrace: LlmTraceEntry[];
   status: string;
   updatedAt: string;
-};
-
-type StatusSnapshot = {
-  usedTokens: number;
-  totalTokens: number;
-  remainingTokens: number;
-  remainingRatio: number;
 };
 
 type ResolvedModel = {
@@ -86,6 +82,7 @@ const THEME = {
   text: '#d7e0ea',
   textMuted: '#7f92a6',
   textSoft: '#a9b7c6',
+  model: '#cdd6df',
   accent: '#6fb1d6',
   accentStrong: '#8ac3e6',
   planAccent: '#d987c7',
@@ -107,25 +104,6 @@ function titleForTask(task: PromptTask): string {
 
 function phaseText(phase: TaskPhase, note?: string): string {
   return `${PHASE_LABELS[phase]}${note ? `: ${note}` : ''}`;
-}
-
-function estimateTokens(text: string): number {
-  return Math.max(1, Math.ceil(text.length / 4));
-}
-
-function inferContextWindow(modelName: string): number {
-  const normalized = modelName.toLowerCase();
-  const match = normalized.match(/(\d{2,3})k/);
-  if (match?.[1]) {
-    const parsed = Number.parseInt(match[1], 10);
-    if (Number.isFinite(parsed) && parsed > 0) return parsed * 1000;
-  }
-  if (/128k/.test(normalized)) return 128_000;
-  if (/64k/.test(normalized)) return 64_000;
-  if (/32k/.test(normalized)) return 32_000;
-  if (/16k/.test(normalized)) return 16_000;
-  if (/8k/.test(normalized)) return 8_000;
-  return 32_000;
 }
 
 function renderTraceMessage(entry: LlmTraceEntry): string {
@@ -155,32 +133,63 @@ function renderTrace(view: TaskView, verbose: boolean): string[] {
   ];
 }
 
+function formatTimestamp(value?: string): string {
+  if (!value) return '--:--';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '--:--';
+  return new Intl.DateTimeFormat(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function statusColor(status: TaskStatus | string): string {
+  switch (status) {
+    case 'completed':
+      return THEME.success;
+    case 'failed':
+      return THEME.danger;
+    case 'blocked':
+    case 'waiting_user':
+      return THEME.warning;
+    case 'running':
+      return THEME.accentStrong;
+    default:
+      return THEME.textMuted;
+  }
+}
+
+function modeColor(taskMode: TaskMode): string {
+  return taskMode === 'plan' ? THEME.planAccentStrong : THEME.accentStrong;
+}
+
+function modeSoftColor(taskMode: TaskMode): string {
+  return taskMode === 'plan' ? THEME.planAccent : THEME.accent;
+}
+
+function renderTaskMeta(view: TaskView): string {
+  const modeLabel = chalk.hex(modeColor(view.mode))(view.mode.toUpperCase());
+  const statusLabel = chalk.hex(statusColor(view.status))(view.status.replace(/_/g, ' ').toUpperCase());
+  const updatedLabel = chalk.hex(THEME.textMuted)(`updated ${formatTimestamp(view.updatedAt)}`);
+  const kindLabel = view.kind && view.kind !== 'worker' ? chalk.hex(THEME.textSoft)(view.kind.replace(/_/g, ' ')) : '';
+  const mailboxLabel = view.pendingMailboxUpdates > 0 ? chalk.hex(THEME.warning)(`${view.pendingMailboxUpdates} pending update${view.pendingMailboxUpdates === 1 ? '' : 's'}`) : '';
+  return [modeLabel, statusLabel, kindLabel, mailboxLabel, updatedLabel].filter(Boolean).join('  ');
+}
+
 function renderTask(view: TaskView, verbose: boolean): string {
   const body = [...view.lines];
   if (view.stream.trim()) body.push(renderMarkdown(view.stream, 96));
   body.push(...renderTrace(view, verbose));
+  const divider = chalk.hex(THEME.panelElevated)('─'.repeat(72));
 
   return [
-    `${chalk.hex(THEME.accent)('➤')} ${chalk.bold.hex(THEME.accentStrong)(view.title)}`,
-    `${chalk.hex(THEME.textMuted)('↳')} ${chalk.hex(THEME.textSoft)(`You: ${view.prompt}`)}`,
+    divider,
+    renderTaskMeta(view),
+    chalk.bold.hex(THEME.text)(view.title),
+    `${chalk.hex(THEME.textMuted)('Prompt')} ${chalk.hex(THEME.textSoft)(view.prompt)}`,
     '',
-    ...body.map((line) => (line.trim() ? `${chalk.hex(THEME.textMuted)('↳')} ${line}` : line)),
+    ...body.map((line) => (line.trim() ? `${chalk.hex(THEME.textMuted)('│')} ${line}` : line)),
   ].join('\n');
-}
-
-function collectStatusSnapshot(tasks: Map<string, TaskView>, modelName: string, contextWindow?: number): StatusSnapshot {
-  const totalTokens = contextWindow ?? inferContextWindow(modelName);
-  let usedTokens = 0;
-  for (const view of tasks.values()) {
-    usedTokens += estimateTokens(view.title);
-    usedTokens += estimateTokens(view.prompt);
-    usedTokens += estimateTokens(view.lines.join('\n'));
-    usedTokens += estimateTokens(view.stream);
-  }
-  usedTokens = Math.min(usedTokens, totalTokens);
-  const remainingTokens = Math.max(0, totalTokens - usedTokens);
-  const remainingRatio = totalTokens === 0 ? 0 : remainingTokens / totalTokens;
-  return { usedTokens, totalTokens, remainingTokens, remainingRatio };
 }
 
 function ensurePromptReading(
@@ -241,12 +250,66 @@ function printableTailForSequences(value: string, sequences: readonly string[]):
   return tails.join('');
 }
 
-function promptAccent(mode: TaskMode): string {
-  return mode === 'plan' ? THEME.planAccent : THEME.accent;
+const SEND_ANIMATION_INTERVAL_MS = 33;
+const SEND_ANIMATION_DURATION_MS = 900;
+const SEND_ANIMATION_GLYPH = '>>>';
+const INPUT_DIVIDER_CHAR = '─';
+
+function mixHexColor(fromHex: string, toHex: string, amount: number): string {
+  const parse = (hex: string): [number, number, number] => {
+    const value = hex.replace('#', '');
+    const normalized = value.length === 3
+      ? value.split('').map((part) => part + part).join('')
+      : value.padEnd(6, '0').slice(0, 6);
+    return [
+      Number.parseInt(normalized.slice(0, 2), 16),
+      Number.parseInt(normalized.slice(2, 4), 16),
+      Number.parseInt(normalized.slice(4, 6), 16),
+    ];
+  };
+  const clamp = (value: number): number => Math.max(0, Math.min(255, Math.round(value)));
+  const [fr, fg, fb] = parse(fromHex);
+  const [tr, tg, tb] = parse(toHex);
+  const mix = (start: number, end: number): number => clamp(start + (end - start) * amount);
+  return `#${[mix(fr, tr), mix(fg, tg), mix(fb, tb)].map((value) => value.toString(16).padStart(2, '0')).join('')}`;
 }
 
-function promptAccentStrong(mode: TaskMode): string {
-  return mode === 'plan' ? THEME.planAccentStrong : THEME.accentStrong;
+function easeInExpo(value: number): number {
+  if (value <= 0) return 0;
+  if (value >= 1) return 1;
+  return 2 ** (10 * value - 10);
+}
+
+function renderDividerAnimationFrame(width: number, elapsedMs: number, modeColorValue: string): string {
+  const normalizedWidth = Math.max(1, width);
+  const progress = easeInExpo(Math.max(0, Math.min(1, elapsedMs / SEND_ANIMATION_DURATION_MS)));
+  const baseColor = mixHexColor(modeColorValue, THEME.panelSoft, 0.55);
+  const trailNearColor = mixHexColor(modeColorValue, THEME.panelSoft, 0.18);
+  const trailFarColor = mixHexColor(modeColorValue, THEME.panelSoft, 0.42);
+  const headColor = modeColorValue;
+  const chars = new Array<string>(normalizedWidth).fill(chalk.hex(baseColor)(INPUT_DIVIDER_CHAR));
+  const glyphChars = Array.from(SEND_ANIMATION_GLYPH);
+  const glyphWidth = glyphChars.length;
+  const travel = progress * (normalizedWidth + glyphWidth - 1);
+  const start = Math.floor(travel) - glyphWidth + 1;
+  const trailWidth = Math.max(4, Math.floor(normalizedWidth * 0.18));
+
+  for (let offset = 0; offset < glyphWidth; offset += 1) {
+    const index = start + offset;
+    if (index < 0 || index >= normalizedWidth) continue;
+    chars[index] = chalk.bold.hex(headColor)(glyphChars[offset] ?? '>');
+  }
+
+  for (let offset = 0; offset < trailWidth; offset += 1) {
+    const index = start - offset - 1;
+    if (index < 0 || index >= normalizedWidth) continue;
+    const trailProgress = 1 - (offset / Math.max(1, trailWidth));
+    const trailColor = mixHexColor(trailFarColor, trailNearColor, trailProgress);
+    const trailChar = offset < 2 ? '>' : (offset < Math.floor(trailWidth * 0.45) ? '━' : '─');
+    chars[index] = chalk.hex(trailColor)(trailChar);
+  }
+
+  return chars.join('');
 }
 
 export async function runTui(
@@ -271,6 +334,8 @@ export async function runTui(
   let modelPickerOpen = false;
   let modelPicker: BlessedModelPicker | undefined;
   let modelPickerItems: string[] = [];
+  let sendAnimationStartedAt: number | undefined;
+  let sendAnimationTimer: NodeJS.Timeout | undefined;
   const promptReadState = { pending: false };
 
   const ProgramCtor = (blessed as unknown as { Program: { prototype: BlessedProgramWithAlt } }).Program;
@@ -291,7 +356,7 @@ export async function runTui(
   screen.program.disableMouse();
 
   const outputBox = blessed.box({
-    top: 0,
+    top: 3,
     left: 0,
     right: 0,
     bottom: 4,
@@ -312,12 +377,66 @@ export async function runTui(
     bottom: 1,
     left: 0,
     right: 0,
-    height: 3,
+    height: 4,
     tags: true,
     style: {
       bg: THEME.panelElevated,
       fg: THEME.text,
     },
+  });
+
+  const headerBox = blessed.box({
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 3,
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.text,
+    },
+  });
+
+  const headerTitle = blessed.box({
+    parent: headerBox,
+    top: 0,
+    left: 1,
+    right: 1,
+    height: 1,
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.text,
+    },
+    content: '',
+  });
+
+  const headerSubtitle = blessed.box({
+    parent: headerBox,
+    top: 1,
+    left: 1,
+    right: 1,
+    height: 1,
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.textMuted,
+    },
+    content: '',
+  });
+
+  const headerDivider = blessed.box({
+    parent: headerBox,
+    top: 2,
+    left: 0,
+    right: 0,
+    height: 1,
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.panelElevated,
+    },
+    content: '',
   });
 
   const inputDivider = blessed.box({
@@ -331,20 +450,20 @@ export async function runTui(
       bg: THEME.panelElevated,
       fg: THEME.accent,
     },
-    content: '‾'.repeat(Math.max(1, process.stdout.columns ?? 80)),
+    content: INPUT_DIVIDER_CHAR.repeat(Math.max(1, process.stdout.columns ?? 80)),
   });
 
   const promptMarker = blessed.box({
     parent: inputShell,
     top: 1,
     left: 1,
-    width: 2,
+    width: 1,
     height: 1,
-    tags: true,
-    content: chalk.hex(promptAccentStrong(mode))('›'),
+    tags: false,
+    content: '›',
     style: {
       bg: THEME.panelElevated,
-      fg: promptAccentStrong(mode),
+      fg: THEME.text,
     },
   });
 
@@ -365,9 +484,44 @@ export async function runTui(
     },
   }) as BlessedPromptInput;
 
+  const dividerWidth = (): number => Math.max(1, (process.stdout.columns ?? 80) - 1);
+
+  const stopSendAnimation = (): void => {
+    sendAnimationStartedAt = undefined;
+    if (!sendAnimationTimer) return;
+    clearInterval(sendAnimationTimer);
+    sendAnimationTimer = undefined;
+  };
+
+  const renderInputDivider = (modeColorValue: string): void => {
+    inputDivider.style.fg = modeColorValue;
+    const width = dividerWidth();
+    const content = sendAnimationStartedAt === undefined
+      ? chalk.hex(modeColorValue)(INPUT_DIVIDER_CHAR.repeat(width))
+      : renderDividerAnimationFrame(width, Date.now() - sendAnimationStartedAt, modeColorValue);
+    inputDivider.setContent(content);
+  };
+
+  const startSendAnimation = (): void => {
+    stopSendAnimation();
+    sendAnimationStartedAt = Date.now();
+    sendAnimationTimer = setInterval(() => {
+      if (exiting) return;
+      if (sendAnimationStartedAt === undefined) return;
+      const elapsed = Date.now() - sendAnimationStartedAt;
+      if (elapsed >= SEND_ANIMATION_DURATION_MS) {
+        stopSendAnimation();
+        renderAll();
+        return;
+      }
+      renderAll();
+    }, SEND_ANIMATION_INTERVAL_MS);
+    sendAnimationTimer.unref?.();
+  };
+
   const resizePrompt = (): void => {
     const width = Math.max(1, (process.stdout.columns ?? 80) - 4);
-    const maxLines = Math.max(1, Math.floor(((process.stdout.rows ?? 24) - 6) / 2));
+    const maxLines = Math.max(1, Math.floor(((process.stdout.rows ?? 24) - 9) / 2));
     const lines = Math.min(promptLineCount(inputBox.getValue(), width), maxLines);
     const shellHeight = lines + 2;
     inputShell.height = shellHeight;
@@ -428,6 +582,7 @@ export async function runTui(
     content: '',
   });
 
+  screen.append(headerBox);
   screen.append(outputBox);
   screen.append(inputShell);
   screen.append(statusBox);
@@ -456,6 +611,9 @@ export async function runTui(
         title: titleForTask(task),
         prompt: task.prompt,
         mode: task.mode,
+        kind: task.kind,
+        relatedTaskIds: task.relatedTaskIds ? [...task.relatedTaskIds] : undefined,
+        pendingMailboxUpdates: (task.mailbox ?? []).filter((message) => message.status === 'pending').length,
         lines: [],
         stream: '',
         llmTrace: task.llmTrace ?? [],
@@ -468,6 +626,9 @@ export async function runTui(
     view.title = titleForTask(task);
     view.prompt = task.prompt;
     view.mode = task.mode;
+    view.kind = task.kind;
+    view.relatedTaskIds = task.relatedTaskIds ? [...task.relatedTaskIds] : undefined;
+    view.pendingMailboxUpdates = (task.mailbox ?? []).filter((message) => message.status === 'pending').length;
     view.llmTrace = task.llmTrace ?? [];
     view.status = task.status;
     view.updatedAt = task.updatedAt ?? view.updatedAt;
@@ -482,36 +643,54 @@ export async function runTui(
 
     const intro = tasks.size === 0
       ? [
-          `${chalk.hex(THEME.accent)('➤')} ${chalk.hex(THEME.textSoft)(`model ${activeModelName} | mode ${mode}`)}`,
-          chalk.hex(THEME.textMuted)('Type a prompt. Use /mode execute|plan|react, /clear, /history, or /exit.'),
+          chalk.bold.hex(THEME.text)('Coder workspace is ready'),
+          [
+            chalk.hex(THEME.textMuted)('Model'),
+            chalk.bold.hex(THEME.model)(activeModelName),
+            chalk.hex(THEME.textMuted)('•'),
+            chalk.hex(THEME.textMuted)('Mode'),
+            chalk.hex(modeColor(mode))(mode),
+          ].join(' '),
         ].join('\n')
       : chunks.join('\n\n');
 
     outputBox.setContent(intro);
     applyOutputScroll();
     resizePrompt();
-    const status = collectStatusSnapshot(tasks, activeModelName, master.getBackendConfig().contextWindow);
     const width = Math.max(20, (process.stdout.columns ?? 80) - 1);
-    const left = `context ${Math.round(status.remainingRatio * 100)}% left (${status.usedTokens}/${status.totalTokens})`;
+    const activeTask = [...taskOrder]
+      .reverse()
+      .map((taskId) => tasks.get(taskId))
+      .find((view): view is TaskView => Boolean(view && view.taskId !== '__system__'));
+    const taskCount = taskOrder.filter((taskId) => taskId !== '__system__').length;
+    const activeModeColor = modeColor(mode);
+    const titleContent = [
+      chalk.bold.hex(THEME.text)('Coder'),
+      chalk.bold.hex(THEME.model)(`  ${activeModelName}`),
+      chalk.hex(activeModeColor)(mode.toUpperCase()),
+    ].join('  ');
+    const subtitleParts = [
+      taskCount === 0 ? 'No active tasks yet' : `${taskCount} task${taskCount === 1 ? '' : 's'} in session`,
+      activeTask ? `focused on ${simplifyText(activeTask.title, 42)}` : 'ready for a new request',
+    ];
+    headerTitle.setContent(titleContent);
+    headerSubtitle.setContent(chalk.hex(THEME.textMuted)(subtitleParts.join('  •  ')));
+    headerDivider.setContent(chalk.hex(THEME.panelElevated)('─'.repeat(width)));
     const rightWidth = activeModelName.length + mode.length + 3;
-    const availableLeft = Math.max(0, width - rightWidth - 1);
-    const leftVisible = left.length > availableLeft ? `context ${Math.round(status.remainingRatio * 100)}%` : left;
-    statusBox.setContent(`${leftVisible}${' '.repeat(Math.max(0, width - leftVisible.length))}`);
+    statusBox.setContent(' '.repeat(width));
     statusModel.setContent(activeModelName);
+    statusModel.style.fg = THEME.model;
     statusSeparator.setContent(' | ');
+    statusSeparator.style.fg = THEME.textMuted;
     statusMode.setContent(mode);
-    statusMode.style.fg = promptAccentStrong(mode);
+    statusMode.style.fg = activeModeColor;
     statusMode.left = Math.max(0, width - mode.length);
     statusSeparator.left = Math.max(0, statusMode.left - 3);
     statusModel.left = Math.max(0, statusSeparator.left - activeModelName.length);
     statusModel.width = activeModelName.length;
-    const accent = promptAccent(mode);
-    const strongAccent = promptAccentStrong(mode);
-    inputDivider.style.fg = accent;
-    promptMarker.style.fg = strongAccent;
-    promptMarker.setContent(chalk.hex(strongAccent)('›'));
-    inputBox.style.focus = { bg: THEME.panelElevated, fg: strongAccent };
-    inputDivider.setContent(chalk.hex(accent)('‾'.repeat(width)));
+    promptMarker.style.fg = THEME.text;
+    inputBox.style.focus = { bg: THEME.panelElevated, fg: activeModeColor };
+    renderInputDivider(activeModeColor);
     screen.render();
     ensurePromptReading(inputBox, modelPickerOpen, exiting, promptReadState);
   };
@@ -544,6 +723,7 @@ export async function runTui(
         title: 'Session',
         prompt: 'System messages',
         mode,
+        pendingMailboxUpdates: 0,
         lines: [],
         stream: '',
         llmTrace: [],
@@ -742,6 +922,7 @@ export async function runTui(
       return;
     }
 
+    startSendAnimation();
     history.push({ role: 'user', content: userInput });
     await saveHistory();
     await master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1));
@@ -762,6 +943,19 @@ export async function runTui(
 
     if (event.type === 'task_updated') {
       ensureTaskView(event.task);
+      renderAll();
+      return;
+    }
+
+    if (event.type === 'master_response') {
+      const related = event.relatedTaskIds?.length ? ` (ref ${event.relatedTaskIds.map((id) => id.slice(0, 8)).join(', ')})` : '';
+      logSystem(`${chalk.bold.hex(THEME.accentStrong)(`Master${related}`)}\n${renderMarkdown(event.text, 96)}`);
+      renderAll();
+      return;
+    }
+
+    if (event.type === 'task_mailbox_updated') {
+      appendLine(event.taskId, chalk.hex(THEME.warning)(`Master queued an update: ${simplifyText(event.message.text, 140)}`));
       renderAll();
       return;
     }
@@ -987,15 +1181,12 @@ export async function runTui(
     }
   });
 
-  const flushTimer = setInterval(renderAll, 120);
-  flushTimer.unref?.();
-
   let cleanedUp = false;
   const cleanup = (): void => {
     if (cleanedUp) return;
     cleanedUp = true;
     exiting = true;
-    clearInterval(flushTimer);
+    stopSendAnimation();
     rawInput.removeListener('data', handleRawInput);
     terminalOutput.write(DISABLE_ENHANCED_KEYS);
     unsubscribe();

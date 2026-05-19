@@ -9,8 +9,10 @@ import type {
   PlanStep,
   PlannerDecision,
   PromptTask,
-  SharedContextSnapshot,
   SubAgentTask,
+  TaskContextSnapshot,
+  TaskKind,
+  TaskMailboxMessage,
   TaskMode,
   TaskPhase,
   ToolContext,
@@ -21,16 +23,16 @@ import {
   CHAT_SYSTEM_PROMPT,
   DESIGN_TOOLS_PROMPT,
   EXECUTE_SYSTEM_PROMPT,
+  MASTER_QUERY_SYSTEM_PROMPT,
+  MASTER_ROUTER_SYSTEM_PROMPT,
   MASTER_SYSTEM_PROMPT,
   PLAN_SYSTEM_PROMPT,
   PLANNER_SYSTEM_PROMPT,
   REACT_IMPLEMENT_PROMPT,
   REACT_INSPECT_PROMPT,
   REACT_VERIFY_PROMPT,
-  ROUTER_SYSTEM_PROMPT,
   STEP_EXECUTOR_SYSTEM_PROMPT,
   SUBAGENT_SYSTEM_PROMPT,
-  VERIFY_SELFIE_PROMPT,
 } from '../infra/prompts.js';
 import { WORKER_TOOLS, executeTool, getToolPolicy } from '../infra/tools.js';
 import { ResponseCache, TaskStore, type ConversationEntry } from '../store.js';
@@ -42,7 +44,6 @@ import {
   parseOllamaNdjson,
   parsePlan,
   parsePlannerDecision,
-  renderSharedContext,
   type OllamaStreamChunk,
 } from './planner.js';
 
@@ -58,6 +59,15 @@ export type StreamChunk =
 
 type EventListener = (event: MasterEvent) => void;
 
+type RouteAction = 'new_task' | 'query_task' | 'update_task' | 'derived_task' | 'sync_task' | 'clarify_target';
+
+type RouteDecision = {
+  action: RouteAction;
+  targetTaskIds: string[];
+  reason: string;
+  prompt: string;
+};
+
 function now(): string {
   return new Date().toISOString();
 }
@@ -65,14 +75,6 @@ function now(): string {
 function excerpt(value: string | undefined, max = 200): string {
   if (!value) return '';
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
-}
-
-function isRepoScopedPrompt(prompt: string): boolean {
-  return /\b(repo|repository|project|module|function|file|src|test|bug|build|code|task)\b/i.test(prompt);
-}
-
-function needsRepositoryInspection(prompt: string): boolean {
-  return /\b(repo|repository|codebase|project|module|function|file|src|test|bug|build|implementation|stack trace|error|failing|failure|refactor|architecture)\b/i.test(prompt);
 }
 
 function parseClarificationChoices(content: string): string[] {
@@ -93,6 +95,30 @@ function parseClarificationChoices(content: string): string[] {
   }
 }
 
+function isRouteAction(value: unknown): value is RouteAction {
+  return value === 'new_task'
+    || value === 'query_task'
+    || value === 'update_task'
+    || value === 'derived_task'
+    || value === 'sync_task'
+    || value === 'clarify_target';
+}
+
+function parseRouteDecision(content: string, prompt: string): RouteDecision {
+  const trimmed = content.trim();
+  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = (fenced?.[1] ?? trimmed).trim();
+  const parsed = JSON.parse(candidate) as Partial<RouteDecision>;
+  return {
+    action: isRouteAction(parsed.action) ? parsed.action : 'new_task',
+    targetTaskIds: Array.isArray(parsed.targetTaskIds)
+      ? parsed.targetTaskIds.filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+      : [],
+    reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 300) : '',
+    prompt: typeof parsed.prompt === 'string' && parsed.prompt.trim() ? parsed.prompt : prompt,
+  };
+}
+
 export class MasterCoordinator {
   private tasks = new Map<string, PromptTask>();
   private taskHistory = new Map<string, ConversationEntry[]>();
@@ -104,6 +130,7 @@ export class MasterCoordinator {
   private backend: BackendConfig;
   private subagentManager = new SubagentManager(2);
   private fileLocks = new FileLockManager();
+  private sessionTaskIds = new Set<string>();
   private sharedSummary = '';
   private basePolicy = getToolPolicy();
   private llmTracingEnabled = false;
@@ -162,6 +189,8 @@ export class MasterCoordinator {
       ...task,
       plan: [...task.plan],
       phaseEvents: [...task.phaseEvents],
+      relatedTaskIds: task.relatedTaskIds ? [...task.relatedTaskIds] : undefined,
+      mailbox: task.mailbox ? task.mailbox.map((message) => ({ ...message })) : undefined,
       messages: task.messages ? [...task.messages] : undefined,
       llmTrace: task.llmTrace ? task.llmTrace.map((entry) => ({
         ...entry,
@@ -223,60 +252,158 @@ export class MasterCoordinator {
     this.emitTaskUpdate(task);
   }
 
-  private buildSharedSnapshot(excludeTaskId?: string): SharedContextSnapshot {
-    const activeTasks = [...this.tasks.values()]
-      .filter((task) => task.taskId !== excludeTaskId)
-      .filter((task) => task.status === 'queued' || task.status === 'running' || task.status === 'waiting_user' || task.status === 'blocked')
-      .slice(0, 6)
-      .map((task) => ({
-        taskId: task.taskId,
-        prompt: task.prompt,
-        mode: task.mode,
-        status: task.status,
-        result: excerpt(task.result, 120),
-        updatedAt: task.updatedAt,
-      }));
-
-    const recentTasks = [...this.tasks.values()]
-      .filter((task) => task.taskId !== excludeTaskId)
-      .filter((task) => task.status === 'completed' || task.status === 'failed')
-      .sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''))
-      .slice(0, 6)
-      .map((task) => ({
-        taskId: task.taskId,
-        prompt: task.prompt,
-        mode: task.mode,
-        status: task.status,
-        result: excerpt(task.result, 120),
-        updatedAt: task.updatedAt,
-      }));
-
+  private buildTaskContextSnapshot(task: PromptTask): TaskContextSnapshot {
+    const lastPhase = task.phaseEvents.at(-1);
+    const pendingUpdates = (task.mailbox ?? [])
+      .filter((message) => message.status === 'pending')
+      .map((message) => excerpt(message.text, 240));
     return {
-      summary: this.sharedSummary || 'No shared summary yet.',
-      activeTasks,
-      recentTasks,
+      taskId: task.taskId,
+      kind: task.kind,
+      prompt: excerpt(task.prompt, 600),
+      summary: task.summary,
+      mode: task.mode,
+      status: task.status,
+      phase: lastPhase ? `${lastPhase.phase}:${lastPhase.status}${lastPhase.note ? `:${lastPhase.note}` : ''}` : undefined,
+      result: excerpt(task.result, 1200),
+      pendingUpdates,
+      updatedAt: task.updatedAt,
     };
+  }
+
+  private renderTaskContextBundle(taskIds: string[]): string {
+    const snapshots = taskIds
+      .map((taskId) => this.tasks.get(taskId))
+      .filter((task): task is PromptTask => Boolean(task))
+      .map((task) => this.buildTaskContextSnapshot(task));
+    if (snapshots.length === 0) return '';
+    return [
+      'Target task context snapshots:',
+      JSON.stringify(snapshots, null, 2),
+    ].join('\n');
+  }
+
+  private routeCandidates(): TaskContextSnapshot[] {
+    return [...this.tasks.values()]
+      .filter((task) => this.sessionTaskIds.has(task.taskId))
+      .filter((task) => task.kind !== 'clarification')
+      .sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''))
+      .slice(0, 12)
+      .map((task) => this.buildTaskContextSnapshot(task));
+  }
+
+  private async routePrompt(prompt: string, conversationHistory: ConversationEntry[] = []): Promise<RouteDecision> {
+    const candidates = this.routeCandidates();
+    if (candidates.length === 0) {
+      return { action: 'new_task', targetTaskIds: [], reason: 'No existing tasks.', prompt };
+    }
+
+    const routePrompt = [
+      `Latest user prompt:\n${prompt}`,
+      '',
+      'Current task snapshots:',
+      JSON.stringify(candidates, null, 2),
+    ].join('\n');
+
+    try {
+      const content = await this.callModelText(routePrompt, MASTER_ROUTER_SYSTEM_PROMPT, conversationHistory, undefined, 'master_router');
+      const decision = parseRouteDecision(content, prompt);
+      const validIds = new Set(candidates.map((task) => task.taskId));
+      decision.targetTaskIds = decision.targetTaskIds.filter((taskId) => validIds.has(taskId));
+      if (decision.action !== 'new_task' && decision.targetTaskIds.length === 0) {
+        return { action: 'new_task', targetTaskIds: [], reason: 'Router did not select a valid target task.', prompt };
+      }
+      return decision;
+    } catch {
+      return { action: 'new_task', targetTaskIds: [], reason: 'Router failed; defaulting to independent task.', prompt };
+    }
+  }
+
+  private async appendTaskMailboxUpdate(taskId: string, text: string, sourceTaskId?: string): Promise<TaskMailboxMessage | undefined> {
+    const task = this.tasks.get(taskId);
+    if (!task) return undefined;
+    const message: TaskMailboxMessage = {
+      messageId: randomUUID(),
+      text,
+      sourceTaskId,
+      createdAt: now(),
+      status: 'pending',
+    };
+    task.mailbox = [...(task.mailbox ?? []), message];
+    await this.persist(task);
+    this.emit({ type: 'task_mailbox_updated', taskId, message: { ...message }, ts: now() });
+    this.emitTaskUpdate(task);
+    return message;
+  }
+
+  private async answerTaskQuery(prompt: string, targetTaskIds: string[], conversationHistory: ConversationEntry[] = []): Promise<string> {
+    const context = this.renderTaskContextBundle(targetTaskIds);
+    const userPrompt = [
+      context,
+      '',
+      `Latest user prompt:\n${prompt}`,
+    ].join('\n');
+    return this.callModelText(userPrompt, MASTER_QUERY_SYSTEM_PROMPT, conversationHistory, undefined, 'master_query');
+  }
+
+  private async absorbMailboxUpdates(task: PromptTask): Promise<string[]> {
+    const pending = (task.mailbox ?? []).filter((message) => message.status === 'pending');
+    if (pending.length === 0) return [];
+    const absorbedAt = now();
+    for (const message of pending) {
+      message.status = 'absorbed';
+      message.absorbedAt = absorbedAt;
+    }
+    const updates = pending.map((message) => message.text);
+    task.prompt = [
+      task.prompt,
+      '',
+      'Additional user requirements absorbed by master:',
+      ...updates.map((update) => `- ${update}`),
+    ].join('\n');
+    task.sharedContext = [
+      task.sharedContext ?? '',
+      '',
+      'Absorbed mailbox updates:',
+      ...updates.map((update) => `- ${update}`),
+    ].join('\n').trim();
+    await this.persist(task);
+    this.emitTaskUpdate(task);
+    return updates;
   }
 
   private createTask(
     userId: string,
     prompt: string,
     mode: TaskMode,
+    options: {
+      kind?: TaskKind;
+      relatedTaskIds?: string[];
+      sharedContext?: string;
+      contextSnapshot?: string;
+      readOnly?: boolean;
+    } = {},
   ): PromptTask {
     const task: PromptTask = {
       traceId: telemetry.newTraceId(),
       taskId: randomUUID(),
       userId,
       prompt,
+      kind: options.kind ?? 'worker',
       mode,
       status: 'queued',
       plan: [],
       phaseEvents: [],
       messages: [],
       pendingClarifications: [],
+      relatedTaskIds: options.relatedTaskIds,
+      sharedContext: options.sharedContext,
+      contextSnapshot: options.contextSnapshot,
+      readOnly: options.readOnly,
       updatedAt: now(),
     };
     this.tasks.set(task.taskId, task);
+    this.sessionTaskIds.add(task.taskId);
     void this.persist(task);
     this.emit({ type: 'task_created', task: this.cloneTask(task), ts: now() });
     this.emitTaskUpdate(task);
@@ -289,7 +416,42 @@ export class MasterCoordinator {
     mode: TaskMode = 'execute',
     conversationHistory: ConversationEntry[] = [],
   ): Promise<string> {
-    const task = this.createTask(userId, prompt, mode);
+    const decision = await this.routePrompt(prompt, conversationHistory);
+    if (decision.action === 'query_task') {
+      const answer = await this.answerTaskQuery(decision.prompt || prompt, decision.targetTaskIds, conversationHistory);
+      this.emit({ type: 'master_response', text: answer, relatedTaskIds: decision.targetTaskIds, ts: now() });
+      return '';
+    }
+    if (decision.action === 'update_task') {
+      const targetId = decision.targetTaskIds[0]!;
+      await this.appendTaskMailboxUpdate(targetId, decision.prompt || prompt);
+      const target = this.tasks.get(targetId);
+      if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
+        target.status = 'queued';
+        await this.persist(target);
+        this.emitTaskUpdate(target);
+        setTimeout(() => {
+          void this.runTask(targetId);
+        }, 0);
+      }
+      return targetId;
+    }
+
+    const targetContext = this.renderTaskContextBundle(decision.targetTaskIds);
+    const kind: TaskKind = decision.action === 'derived_task'
+        ? 'derived_worker'
+        : decision.action === 'sync_task'
+          ? 'sync_worker'
+          : decision.action === 'clarify_target'
+            ? 'clarification'
+            : 'worker';
+    const taskPrompt = decision.prompt || prompt;
+    const task = this.createTask(userId, taskPrompt, mode, {
+      kind,
+      relatedTaskIds: decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined,
+      sharedContext: targetContext || undefined,
+      contextSnapshot: targetContext || undefined,
+    });
     this.taskHistory.set(task.taskId, [...conversationHistory]);
     setTimeout(() => {
       void this.runTask(task.taskId);
@@ -535,7 +697,47 @@ export class MasterCoordinator {
     mode: TaskMode = 'execute',
     conversationHistory: ConversationEntry[] = [],
   ): AsyncGenerator<StreamChunk> {
-    const task = this.createTask(userId, prompt, mode);
+    const decision = await this.routePrompt(prompt, conversationHistory);
+    if (decision.action === 'query_task') {
+      const answer = await this.answerTaskQuery(decision.prompt || prompt, decision.targetTaskIds, conversationHistory);
+      this.emit({ type: 'master_response', text: answer, relatedTaskIds: decision.targetTaskIds, ts: now() });
+      yield { type: 'token', text: answer };
+      yield { type: 'done', result: answer };
+      return;
+    }
+    if (decision.action === 'update_task') {
+      const targetId = decision.targetTaskIds[0]!;
+      await this.appendTaskMailboxUpdate(targetId, decision.prompt || prompt);
+      const target = this.tasks.get(targetId);
+      if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
+        target.status = 'queued';
+        await this.persist(target);
+        this.emitTaskUpdate(target);
+        setTimeout(() => {
+          void this.runTask(targetId);
+        }, 0);
+      }
+      yield { type: 'task_id', taskId: targetId };
+      const result = `Queued update for task ${targetId.slice(0, 8)}.`;
+      yield { type: 'token', text: result };
+      yield { type: 'done', result };
+      return;
+    }
+
+    const targetContext = this.renderTaskContextBundle(decision.targetTaskIds);
+    const kind: TaskKind = decision.action === 'derived_task'
+        ? 'derived_worker'
+        : decision.action === 'sync_task'
+          ? 'sync_worker'
+          : decision.action === 'clarify_target'
+            ? 'clarification'
+            : 'worker';
+    const task = this.createTask(userId, decision.prompt || prompt, mode, {
+      kind,
+      relatedTaskIds: decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined,
+      sharedContext: targetContext || undefined,
+      contextSnapshot: targetContext || undefined,
+    });
     this.taskHistory.set(task.taskId, [...conversationHistory]);
     yield { type: 'task_id', taskId: task.taskId };
     yield* this.runTaskStream(task, conversationHistory);
@@ -650,7 +852,10 @@ export class MasterCoordinator {
     conversationHistory: ConversationEntry[],
   ): AsyncGenerator<StreamChunk> {
     try {
-      task.sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
+      if (!task.sharedContext && task.relatedTaskIds?.length) {
+        task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
+      }
+      await this.absorbMailboxUpdates(task);
       this.markPhase(task, 'plan', 'in_progress', 'Planning next steps…');
       yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Planning next steps…' };
       const planner = await this.planTask(task, conversationHistory);
@@ -665,7 +870,9 @@ export class MasterCoordinator {
       if (planner.questions[0]) {
         const answer = await this.requestClarification(task.taskId, planner.questions[0]);
         task.prompt = `${task.prompt}\n\nClarification from user:\n${answer}`;
-        task.sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
+        if (task.relatedTaskIds?.length) {
+          task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
+        }
         await this.persist(task);
       }
 
@@ -733,10 +940,28 @@ export class MasterCoordinator {
     steps: PlanStep[],
   ): AsyncGenerator<StreamChunk, string> {
     const results: string[] = [];
-    for (let index = 0; index < steps.length; index += 1) {
-      const step = steps[index]!;
+    let activeSteps = [...steps];
+    for (let index = 0; index < activeSteps.length; index += 1) {
+      const updates = await this.absorbMailboxUpdates(task);
+      if (updates.length > 0) {
+        const note = `Absorbed ${updates.length} update${updates.length === 1 ? '' : 's'}; replanning`;
+        this.markPhase(task, 'plan', 'in_progress', note);
+        yield { type: 'phase', phase: 'plan', status: 'in_progress', note };
+        const planner = await this.planTask(task, conversationHistory);
+        task.planner = planner;
+        task.summary = planner.summary;
+        task.readOnly = planner.readOnly;
+        task.plan = planner.steps;
+        activeSteps = [...planner.steps];
+        await this.persist(task);
+        this.markPhase(task, 'plan', 'done', `${planner.steps.length} replanned step${planner.steps.length === 1 ? '' : 's'}`);
+        yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} replanned step${planner.steps.length === 1 ? '' : 's'}` };
+        index = -1;
+        continue;
+      }
+      const step = activeSteps[index]!;
       const phase = this.phaseForStep(step);
-      const note = `${index + 1}/${steps.length}: ${step.title}`;
+      const note = `${index + 1}/${activeSteps.length}: ${step.title}`;
       this.markPhase(task, phase, 'in_progress', note);
       yield { type: 'phase', phase, status: 'in_progress', note };
       const heading = `## ${step.title}\n`;
@@ -857,8 +1082,10 @@ export class MasterCoordinator {
     task: PromptTask,
     conversationHistory: ConversationEntry[],
   ): Promise<PlannerDecision> {
-    const sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
-    const prompt = `${sharedContext}\n\nUser request:\n${task.prompt}`;
+    const prompt = [
+      task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
+      `User request:\n${task.prompt}`,
+    ].filter(Boolean).join('\n\n');
     try {
       const content = await this.callModelText(prompt, PLANNER_SYSTEM_PROMPT, conversationHistory, task, 'planner');
       return parsePlannerDecision(content, task.prompt);
