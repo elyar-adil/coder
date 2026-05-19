@@ -4,9 +4,9 @@ A TypeScript-based coding agent with CLI and TUI (Terminal User Interface) that 
 
 ## Features
 
-- **Execute mode** — agentic tool-use loop (read/write files, run bash)
+- **Execute mode** — planner-driven agentic execution; the planner chooses direct answer, bash, read-only inspection, code edits, and verification steps dynamically
 - **Plan mode** — generate step-by-step execution plans for manual approval
-- **ReAct mode** — automated plan → inspect → implement → verify pipeline
+- **ReAct mode** — compatibility alias for planner-driven execution
 - **TUI** — interactive terminal UI with streaming output, conversation history, and task management
 - **Multi-backend** — OpenAI-compatible APIs, Anthropic, and local NDJSON-compatible runtimes
 - **Conversation persistence** — sessions auto-saved and can be loaded later
@@ -60,7 +60,7 @@ TUI commands:
 | `/tasks` | List all background tasks |
 | `/view <taskId>` | Inspect a task in detail |
 | `/approve <taskId>` | Execute an approved plan task |
-| `/model` | Show current model |
+| `/model` | Open model picker and persist selection |
 | `/resume <taskId>` | Resume a queued/running task |
 | `/sessions` | List saved conversation sessions |
 | `/load <sessionId>` | Load a saved conversation |
@@ -77,13 +77,9 @@ npm test
 npm run typecheck
 ```
 
-## REACT Mode Pipeline
+## Planner-Driven Execution
 
-1. `plan` — generate structured plan
-2. `inspect_code` — explore codebase using tools
-3. `write_code` — implement changes using tools
-4. `verify` — run build/test commands using bash tool
-5. `finalize` — collect results
+For each prompt, the planner first creates dynamic steps. Simple questions can be answered directly, exact calculations can use `bash`, repository inspection can stay read-only, and code changes can include edit and verification steps. There is no fixed design phase unless the planner decides a design step is actually needed.
 
 ## Configuration
 
@@ -96,6 +92,8 @@ npm run typecheck
 | `AGENT_MODEL` | `gemma4:31b-cloud` | Model name |
 | `LLM_BACKEND` | auto-detected | `openai`, `anthropic`, or `ollama` |
 | `LLM_API_KEY` | — | API key (for OpenAI-compatible backends) |
+
+For `openai` backends, `baseUrl` may be either the API root (`https://api.openai.com`) or a `/v1` URL (`https://gateway.example/v1`). The client normalizes both forms and sends requests to `/v1/chat/completions`.
 
 ### Config file (.agentrc)
 

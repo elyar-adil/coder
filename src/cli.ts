@@ -2,8 +2,8 @@
 import { Command } from 'commander';
 import { MasterCoordinator } from './master.js';
 import { runTui } from './tui.js';
-import { detectBackend, type BackendConfig, type BackendType } from './backend.js';
-import { loadConfig } from './config.js';
+import { loadConfig, saveSelectedModel } from './config.js';
+import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { setToolPolicy } from './tools.js';
 
@@ -12,22 +12,16 @@ async function main(): Promise<void> {
   program.name('coder').description('Top-tier coding agent CLI/TUI (TypeScript)').version('0.2.0');
 
   // Build backend config from env vars + .agentrc
-  const fileConfig = await loadConfig();
-  const baseUrl  = process.env.LLM_BASE_URL ?? process.env.OLLAMA_BASE_URL ?? fileConfig.baseUrl ?? 'http://localhost:11434';
-  const model    = process.env.AGENT_MODEL    ?? fileConfig.model    ?? 'gemma4:31b-cloud';
-  const backend  = (process.env.LLM_BACKEND   ?? fileConfig.backend  ?? detectBackend(baseUrl)) as BackendType;
-  const apiKey   = process.env.LLM_API_KEY    ?? fileConfig.apiKey;
-
-  const backendConfig: BackendConfig = {
-    type: backend,
-    baseUrl,
-    model,
-    ...(apiKey ? { apiKey } : {}),
-  };
+  let fileConfig = await loadConfig();
+  let resolvedModel = resolveModelConfig(fileConfig);
 
   setToolPolicy(defaultPolicy(fileConfig.policyLevel ?? 'moderate', process.cwd()));
 
-  const master = new MasterCoordinator(backendConfig);
+  const master = new MasterCoordinator(resolvedModel.config);
+
+  program
+    .option('--model <name>', 'model name or .agentrc model alias')
+    .option('--verbose', 'show raw LLM prompt/reply traces in the TUI');
 
   program
     .command('submit')
@@ -35,6 +29,10 @@ async function main(): Promise<void> {
     .requiredOption('--prompt <text>')
     .option('--mode <mode>', 'execute | plan | react', 'execute')
     .action(async (opts: { user: string; prompt: string; mode: 'execute' | 'plan' | 'react' }) => {
+      const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
+      resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
+      master.setBackendConfig(resolvedModel.config);
+      master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
       const taskId = await master.acceptPrompt(opts.user, opts.prompt, opts.mode);
       console.log(JSON.stringify({ taskId, status: 'accepted', mode: opts.mode }, null, 2));
     });
@@ -59,11 +57,32 @@ async function main(): Promise<void> {
     .command('tui')
     .description('Interactive terminal UI — Claude Code-class experience')
     .action(async () => {
-      await runTui(master, model);
+      const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
+      resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
+      master.setBackendConfig(resolvedModel.config);
+      master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
+      await runTui(
+        master,
+        resolvedModel.name,
+        (name?: string) => resolveModelConfig(fileConfig, name),
+        Array.from(new Set([
+          ...(fileConfig.model ? [fileConfig.model] : []),
+          ...Object.keys(fileConfig.models ?? {}),
+        ])),
+        async (name: string) => {
+          await saveSelectedModel(name);
+          fileConfig = {
+            ...fileConfig,
+            model: name,
+          };
+        },
+        { verbose: Boolean(globalOpts.verbose) },
+      );
     });
 
-  // Default to TUI when no subcommand given
-  if (process.argv.length === 2) {
+  // Default to TUI when no subcommand is given, including global-option-only invocations.
+  const subcommands = new Set(program.commands.map((command) => command.name()));
+  if (!process.argv.slice(2).some((arg) => subcommands.has(arg))) {
     process.argv.push('tui');
   }
 

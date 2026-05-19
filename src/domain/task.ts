@@ -2,11 +2,16 @@ import type { ToolPolicy } from '../policy.js';
 
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'waiting_user' | 'completed' | 'failed';
 export type TaskMode = 'execute' | 'plan' | 'react';
-export type TaskPhase = 'plan' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
+export type TaskPhase = 'plan' | 'execute' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
+export type PlanStepIntent = 'answer' | 'tool_loop' | 'code_change' | 'verify' | 'ask_user';
+export type PlanStepToolPolicy = 'none' | 'safe' | 'read_only' | 'code_write' | 'verify';
 
 export interface PlanStep {
   title: string;
   detail: string;
+  intent?: PlanStepIntent;
+  toolPolicy?: PlanStepToolPolicy;
+  instruction?: string;
 }
 
 export interface PhaseEvent {
@@ -46,6 +51,7 @@ export interface PlannerDecision {
   mode: 'analyze' | 'code' | 'mixed';
   readOnly: boolean;
   subtasks: PlanStep[];
+  steps: PlanStep[];
   questions: string[];
 }
 
@@ -74,6 +80,16 @@ export interface OllamaMsg {
   tool_use_id?: string;
 }
 
+export interface LlmTraceEntry {
+  ts: string;
+  label: string;
+  systemPrompt: string;
+  messages: OllamaMsg[];
+  response: string;
+  toolCalls?: OllamaMsg['tool_calls'];
+  cached?: boolean;
+}
+
 export interface PromptTask {
   traceId?: string;
   taskId: string;
@@ -85,6 +101,7 @@ export interface PromptTask {
   plan: PlanStep[];
   phaseEvents: PhaseEvent[];
   messages?: OllamaMsg[];
+  llmTrace?: LlmTraceEntry[];
   designDoc?: string;
   summary?: string;
   sharedContext?: string;

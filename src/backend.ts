@@ -20,6 +20,13 @@ export interface BackendConfig {
   baseUrl: string;
   model: string;
   apiKey?: string;
+  requestOptions?: {
+    extraBody?: Record<string, unknown>;
+    temperature?: number;
+    topP?: number;
+    maxTokens?: number;
+  };
+  contextWindow?: number;
 }
 
 export interface ChatChunk {
@@ -30,6 +37,14 @@ export interface ChatChunk {
 
 const ANTHROPIC_VERSION = '2023-06-01';
 const DEFAULT_ANTHROPIC_MAX_TOKENS = 8192;
+
+export function normalizeOpenAIBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
+export function openAIChatCompletionsUrl(baseUrl: string): string {
+  return `${normalizeOpenAIBaseUrl(baseUrl)}/v1/chat/completions`;
+}
 
 function parseNdjsonLine(line: string): { message?: OllamaMsg & { content: string | null }; done?: boolean } | null {
   const trimmed = line.trim();
@@ -212,6 +227,15 @@ function convertToolsToOpenAI(tools?: OllamaToolDef[]): Array<Record<string, unk
   }));
 }
 
+function applyOpenAIRequestOptions(body: Record<string, unknown>, config: BackendConfig): void {
+  const options = config.requestOptions;
+  if (!options) return;
+  if (typeof options.temperature === 'number') body.temperature = options.temperature;
+  if (typeof options.topP === 'number') body.top_p = options.topP;
+  if (typeof options.maxTokens === 'number') body.max_tokens = options.maxTokens;
+  if (options.extraBody) Object.assign(body, options.extraBody);
+}
+
 async function* openaiStream(
   config: BackendConfig,
   systemPrompt: string,
@@ -226,10 +250,11 @@ async function* openaiStream(
     stream: true,
     messages: convertToOpenAIMessages(systemPrompt, messages),
   };
+  applyOpenAIRequestOptions(body, config);
   const openaiTools = convertToolsToOpenAI(tools);
   if (openaiTools) body.tools = openaiTools;
 
-  const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+  const response = await resilientFetch(openAIChatCompletionsUrl(config.baseUrl), {
     method: 'POST',
     headers,
     body: JSON.stringify(body),
@@ -325,10 +350,11 @@ async function openaiNonStream(
     stream: false,
     messages: convertToOpenAIMessages(systemPrompt, messages),
   };
+  applyOpenAIRequestOptions(body, config);
   const openaiTools = convertToolsToOpenAI(tools);
   if (openaiTools) body.tools = openaiTools;
 
-  const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/v1/chat/completions`, {
+  const response = await resilientFetch(openAIChatCompletionsUrl(config.baseUrl), {
     method: 'POST',
     headers,
     body: JSON.stringify(body),

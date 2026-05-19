@@ -8,11 +8,13 @@ import stripAnsi from 'strip-ansi';
 
 import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
+import type { BackendConfig } from '../backend.js';
 import type { MasterCoordinator } from '../runtime/coordinator.js';
-import type { ClarificationRequest, PromptTask, TaskMode, TaskPhase } from '../domain/task.js';
+import type { ClarificationRequest, LlmTraceEntry, PromptTask, TaskMode, TaskPhase } from '../domain/task.js';
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
   plan: 'Planning',
+  execute: 'Executing',
   design: 'Designing',
   inspect_code: 'Inspecting',
   write_code: 'Writing',
@@ -27,6 +29,7 @@ type TaskView = {
   mode: TaskMode;
   lines: string[];
   stream: string;
+  llmTrace: LlmTraceEntry[];
   status: string;
   updatedAt: string;
 };
@@ -37,6 +40,60 @@ type StatusSnapshot = {
   remainingTokens: number;
   remainingRatio: number;
 };
+
+type ResolvedModel = {
+  name: string;
+  config: BackendConfig;
+};
+
+type ResolveModel = (name?: string) => ResolvedModel;
+type PersistModelSelection = (name: string) => Promise<void>;
+type RunTuiOptions = {
+  verbose?: boolean;
+};
+type BlessedScreen = blessed.Widgets.Screen & {
+  _listenedMouse?: boolean;
+  leave?: () => void;
+};
+type BlessedPromptInput = blessed.Widgets.TextareaElement & {
+  readInput: (callback?: ((err: Error | null, value: string | null) => void) | null) => void;
+  _reading?: boolean;
+  _done?: (err: string | Error | null, value?: string | null) => void;
+  _listener?: (ch: string | undefined, key: blessed.Widgets.Events.IKeyEventArg) => void;
+};
+type BlessedModelPicker = blessed.Widgets.ListElement & {
+  selected: number;
+};
+type BlessedScrollableBox = blessed.Widgets.BoxElement & {
+  scroll: (offset: number, always?: boolean) => unknown;
+  scrollTo: (offset: number, always?: boolean) => unknown;
+  getScroll: () => number;
+  getScrollHeight: () => number;
+  setScroll: (offset: number) => unknown;
+  setScrollPerc: (percent: number) => unknown;
+};
+type BlessedProgramWithAlt = {
+  normalBuffer: () => unknown;
+  alternateBuffer?: () => unknown;
+  isAlt?: boolean;
+};
+
+const THEME = {
+  bg: '#0b1117',
+  panel: '#101821',
+  panelElevated: '#1d2b39',
+  panelSoft: '#1a2633',
+  text: '#d7e0ea',
+  textMuted: '#7f92a6',
+  textSoft: '#a9b7c6',
+  accent: '#6fb1d6',
+  accentStrong: '#8ac3e6',
+  planAccent: '#d987c7',
+  planAccentStrong: '#f0a8dc',
+  success: '#7fb98f',
+  warning: '#d0a86e',
+  danger: '#c97c7c',
+} as const;
 
 function simplifyText(text: string, max = 90): string {
   const single = text.replace(/\s+/g, ' ').trim();
@@ -71,20 +128,48 @@ function inferContextWindow(modelName: string): number {
   return 32_000;
 }
 
-function renderTask(view: TaskView): string {
+function renderTraceMessage(entry: LlmTraceEntry): string {
+  const userMessages = entry.messages
+    .filter((message) => message.content)
+    .map((message) => `${message.role}: ${message.content ?? ''}`)
+    .join('\n');
+  const prompt = simplifyText(`${entry.systemPrompt}\n${userMessages}`, 260);
+  const response = simplifyText(entry.response || '[no text response]', 260);
+  const tools = entry.toolCalls?.map((call) => call.function.name).filter(Boolean).join(', ');
+  const cached = entry.cached ? ' cached' : '';
+  return [
+    chalk.bold.hex(THEME.warning)(`LLM ${entry.label}${cached}`),
+    `${chalk.hex(THEME.textMuted)('prompt')} ${chalk.hex(THEME.textSoft)(prompt)}`,
+    `${chalk.hex(THEME.textMuted)('reply')} ${chalk.hex(THEME.textSoft)(response)}`,
+    tools ? `${chalk.hex(THEME.textMuted)('tools')} ${chalk.hex(THEME.textSoft)(tools)}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+function renderTrace(view: TaskView, verbose: boolean): string[] {
+  if (!verbose || view.llmTrace.length === 0) return [];
+  const entries = view.llmTrace.slice(-4).map(renderTraceMessage);
+  return [
+    '',
+    chalk.bold.hex(THEME.warning)('LLM Trace'),
+    ...entries,
+  ];
+}
+
+function renderTask(view: TaskView, verbose: boolean): string {
   const body = [...view.lines];
   if (view.stream.trim()) body.push(renderMarkdown(view.stream, 96));
+  body.push(...renderTrace(view, verbose));
 
   return [
-    `${chalk.cyan('➤')} ${chalk.bold.cyan(view.title)}`,
-    `${chalk.dim('↳')} ${chalk.dim(`You: ${view.prompt}`)}`,
+    `${chalk.hex(THEME.accent)('➤')} ${chalk.bold.hex(THEME.accentStrong)(view.title)}`,
+    `${chalk.hex(THEME.textMuted)('↳')} ${chalk.hex(THEME.textSoft)(`You: ${view.prompt}`)}`,
     '',
-    ...body.map((line) => (line.trim() ? `${chalk.dim('↳')} ${line}` : line)),
+    ...body.map((line) => (line.trim() ? `${chalk.hex(THEME.textMuted)('↳')} ${line}` : line)),
   ].join('\n');
 }
 
-function collectStatusSnapshot(tasks: Map<string, TaskView>, modelName: string): StatusSnapshot {
-  const totalTokens = inferContextWindow(modelName);
+function collectStatusSnapshot(tasks: Map<string, TaskView>, modelName: string, contextWindow?: number): StatusSnapshot {
+  const totalTokens = contextWindow ?? inferContextWindow(modelName);
   let usedTokens = 0;
   for (const view of tasks.values()) {
     usedTokens += estimateTokens(view.title);
@@ -98,7 +183,80 @@ function collectStatusSnapshot(tasks: Map<string, TaskView>, modelName: string):
   return { usedTokens, totalTokens, remainingTokens, remainingRatio };
 }
 
-export async function runTui(master: MasterCoordinator, modelName: string): Promise<void> {
+function ensurePromptReading(
+  inputBox: BlessedPromptInput,
+  modelPickerOpen: boolean,
+  exiting: boolean,
+  scheduleState: { pending: boolean },
+): void {
+  if (scheduleState.pending || modelPickerOpen || exiting) return;
+  scheduleState.pending = true;
+  setImmediate(() => {
+    scheduleState.pending = false;
+    if (modelPickerOpen || exiting) return;
+    inputBox.focus();
+    inputBox.screen.program.showCursor();
+  });
+}
+
+function promptLineCount(text: string, cols: number): number {
+  const width = Math.max(1, cols);
+  return Math.max(
+    1,
+    text.split('\n').reduce((sum, line) => sum + Math.max(1, Math.ceil(line.length / width)), 0),
+  );
+}
+
+function pausePromptReading(inputBox: BlessedPromptInput, scheduleState: { pending: boolean }): void {
+  scheduleState.pending = false;
+  if (!inputBox._reading) return;
+  inputBox._done?.('stop');
+}
+
+const SHIFT_ENTER_SEQUENCES = ['\x1b[13;2u', '\x1b[13;2~', '\x1b[27;2;13~'] as const;
+const CTRL_C_SEQUENCES = ['\x1b[99;5u', '\x1b[27;5;99~'] as const;
+const ENABLE_ENHANCED_KEYS = '\x1b[>1u\x1b[>4;2m';
+const DISABLE_ENHANCED_KEYS = '\x1b[<u\x1b[>4;0m';
+
+function isShiftEnterSequence(value: string): boolean {
+  return SHIFT_ENTER_SEQUENCES.some((sequence) => value === sequence);
+}
+
+function printableShiftEnterTail(value: string): string {
+  return value.replace(/\x1b\[/g, '').replace(/\x1b/g, '');
+}
+
+function printableTailForSequences(value: string, sequences: readonly string[]): string {
+  const tails: string[] = [];
+  let rest = value;
+  while (rest) {
+    const next = sequences
+      .map((sequence) => ({ sequence, index: rest.indexOf(sequence) }))
+      .filter((item) => item.index >= 0)
+      .sort((left, right) => left.index - right.index)[0];
+    if (!next) break;
+    tails.push(printableShiftEnterTail(next.sequence));
+    rest = rest.slice(next.index + next.sequence.length);
+  }
+  return tails.join('');
+}
+
+function promptAccent(mode: TaskMode): string {
+  return mode === 'plan' ? THEME.planAccent : THEME.accent;
+}
+
+function promptAccentStrong(mode: TaskMode): string {
+  return mode === 'plan' ? THEME.planAccentStrong : THEME.accentStrong;
+}
+
+export async function runTui(
+  master: MasterCoordinator,
+  modelName: string,
+  resolveModel?: ResolveModel,
+  modelAliases: string[] = [],
+  persistModelSelection?: PersistModelSelection,
+  options: RunTuiOptions = {},
+): Promise<void> {
   const convStore = new ConversationStore();
   await convStore.init();
 
@@ -107,33 +265,48 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
   const tasks = new Map<string, TaskView>();
   const taskOrder: string[] = [];
   let mode: TaskMode = 'execute';
+  let activeModelName = modelName;
   let activeClarification: ClarificationRequest | undefined;
   let exiting = false;
+  let modelPickerOpen = false;
+  let modelPicker: BlessedModelPicker | undefined;
+  let modelPickerItems: string[] = [];
+  const promptReadState = { pending: false };
 
+  const ProgramCtor = (blessed as unknown as { Program: { prototype: BlessedProgramWithAlt } }).Program;
+  const originalAlternateBuffer = ProgramCtor.prototype.alternateBuffer;
+  ProgramCtor.prototype.alternateBuffer = function noAlternateBuffer(this: BlessedProgramWithAlt) {
+    this.isAlt = false;
+    return '';
+  };
   const screen = blessed.screen({
     smartCSR: true,
     fullUnicode: true,
     dockBorders: false,
+    terminal: 'xterm',
+    useBCE: false,
     title: 'Coding Agent',
-  });
+  }) as BlessedScreen;
+  ProgramCtor.prototype.alternateBuffer = originalAlternateBuffer;
+  screen.program.disableMouse();
 
   const outputBox = blessed.box({
     top: 0,
     left: 0,
     right: 0,
-    bottom: 5,
+    bottom: 4,
     tags: true,
     scrollable: true,
     alwaysScroll: true,
-    keys: true,
-    vi: true,
-    mouse: true,
+    keys: false,
+    vi: false,
     style: {
-      bg: 'black',
-      fg: 'white',
+      bg: THEME.bg,
+      fg: THEME.text,
+      scrollbar: { bg: THEME.panelSoft },
     },
     content: '',
-  });
+  }) as BlessedScrollableBox;
 
   const inputShell = blessed.box({
     bottom: 1,
@@ -142,41 +315,66 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     height: 3,
     tags: true,
     style: {
-      bg: '#102433',
-      fg: 'white',
+      bg: THEME.panelElevated,
+      fg: THEME.text,
     },
   });
 
-  blessed.box({
+  const inputDivider = blessed.box({
+    parent: inputShell,
+    top: 0,
+    left: 0,
+    right: 0,
+    height: 1,
+    tags: false,
+    style: {
+      bg: THEME.panelElevated,
+      fg: THEME.accent,
+    },
+    content: '‾'.repeat(Math.max(1, process.stdout.columns ?? 80)),
+  });
+
+  const promptMarker = blessed.box({
     parent: inputShell,
     top: 1,
     left: 1,
     width: 2,
     height: 1,
     tags: true,
-    content: chalk.cyan('›'),
+    content: chalk.hex(promptAccentStrong(mode))('›'),
     style: {
-      bg: '#102433',
-      fg: 'cyan',
+      bg: THEME.panelElevated,
+      fg: promptAccentStrong(mode),
     },
   });
 
-  const inputBox = blessed.textbox({
+  const inputBox = blessed.textarea({
     parent: inputShell,
     top: 1,
     left: 3,
     right: 1,
     height: 1,
     tags: true,
-    inputOnFocus: true,
-    keys: true,
-    mouse: true,
+    inputOnFocus: false,
+    keys: false,
+    scrollable: false,
     style: {
-      bg: '#102433',
-      fg: 'white',
-      focus: { bg: '#102433', fg: 'white' },
+      bg: THEME.panelElevated,
+      fg: THEME.text,
+      focus: { bg: THEME.panelElevated, fg: THEME.text },
     },
-  });
+  }) as BlessedPromptInput;
+
+  const resizePrompt = (): void => {
+    const width = Math.max(1, (process.stdout.columns ?? 80) - 4);
+    const maxLines = Math.max(1, Math.floor(((process.stdout.rows ?? 24) - 6) / 2));
+    const lines = Math.min(promptLineCount(inputBox.getValue(), width), maxLines);
+    const shellHeight = lines + 2;
+    inputShell.height = shellHeight;
+    inputBox.height = lines;
+    outputBox.bottom = shellHeight + 1;
+    promptMarker.top = 1;
+  };
 
   const statusBox = blessed.box({
     bottom: 0,
@@ -185,8 +383,47 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     height: 1,
     tags: true,
     style: {
-      bg: 'black',
-      fg: 'gray',
+      bg: THEME.panel,
+      fg: THEME.textMuted,
+    },
+    content: '',
+  });
+  const statusModel = blessed.box({
+    parent: statusBox,
+    top: 0,
+    left: 0,
+    height: 1,
+    width: 'shrink',
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.textMuted,
+    },
+    content: '',
+  });
+  const statusSeparator = blessed.box({
+    parent: statusBox,
+    top: 0,
+    height: 1,
+    width: 3,
+    tags: true,
+    align: 'center',
+    style: {
+      bg: THEME.panel,
+      fg: THEME.textMuted,
+    },
+    content: ' | ',
+  });
+  const statusMode = blessed.box({
+    parent: statusBox,
+    top: 0,
+    right: 0,
+    height: 1,
+    width: 'shrink',
+    tags: true,
+    style: {
+      bg: THEME.panel,
+      fg: THEME.textMuted,
     },
     content: '',
   });
@@ -194,6 +431,18 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
   screen.append(outputBox);
   screen.append(inputShell);
   screen.append(statusBox);
+
+  let followOutput = true;
+  let outputScrollOffset = 0;
+
+  const clampOutputScroll = (): number => Math.max(0, Math.min(outputScrollOffset, outputBox.getScrollHeight()));
+
+  const applyOutputScroll = (): void => {
+    if (followOutput) {
+      outputScrollOffset = outputBox.getScrollHeight();
+    }
+    outputBox.setScroll(clampOutputScroll());
+  };
 
   const saveHistory = async (): Promise<void> => {
     await convStore.save(sessionId, history);
@@ -209,6 +458,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
         mode: task.mode,
         lines: [],
         stream: '',
+        llmTrace: task.llmTrace ?? [],
         status: task.status,
         updatedAt: task.updatedAt ?? new Date().toISOString(),
       };
@@ -218,6 +468,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     view.title = titleForTask(task);
     view.prompt = task.prompt;
     view.mode = task.mode;
+    view.llmTrace = task.llmTrace ?? [];
     view.status = task.status;
     view.updatedAt = task.updatedAt ?? view.updatedAt;
     return view;
@@ -227,23 +478,42 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     const chunks = taskOrder
       .map((taskId) => tasks.get(taskId))
       .filter((view): view is TaskView => Boolean(view))
-      .map(renderTask);
+      .map((view) => renderTask(view, Boolean(options.verbose)));
 
     const intro = tasks.size === 0
       ? [
-          `${chalk.cyan('➤')} ${chalk.dim(`model ${modelName} · mode ${mode}`)}`,
-          chalk.dim('Type a prompt. Use /mode execute|plan|react, /clear, /history, or /exit.'),
+          `${chalk.hex(THEME.accent)('➤')} ${chalk.hex(THEME.textSoft)(`model ${activeModelName} | mode ${mode}`)}`,
+          chalk.hex(THEME.textMuted)('Type a prompt. Use /mode execute|plan|react, /clear, /history, or /exit.'),
         ].join('\n')
       : chunks.join('\n\n');
 
     outputBox.setContent(intro);
-    const status = collectStatusSnapshot(tasks, modelName);
-    const left = `${chalk.dim(`context ${Math.round(status.remainingRatio * 100)}% left`)} ${chalk.dim(`(${status.usedTokens}/${status.totalTokens})`)}`;
-    const right = chalk.dim(`model ${modelName}`);
-    const width = Math.max(20, process.stdout.columns ?? 80);
-    const gap = Math.max(1, width - stripAnsi(left).length - stripAnsi(right).length);
-    statusBox.setContent(`${left}${' '.repeat(gap)}${right}`);
+    applyOutputScroll();
+    resizePrompt();
+    const status = collectStatusSnapshot(tasks, activeModelName, master.getBackendConfig().contextWindow);
+    const width = Math.max(20, (process.stdout.columns ?? 80) - 1);
+    const left = `context ${Math.round(status.remainingRatio * 100)}% left (${status.usedTokens}/${status.totalTokens})`;
+    const rightWidth = activeModelName.length + mode.length + 3;
+    const availableLeft = Math.max(0, width - rightWidth - 1);
+    const leftVisible = left.length > availableLeft ? `context ${Math.round(status.remainingRatio * 100)}%` : left;
+    statusBox.setContent(`${leftVisible}${' '.repeat(Math.max(0, width - leftVisible.length))}`);
+    statusModel.setContent(activeModelName);
+    statusSeparator.setContent(' | ');
+    statusMode.setContent(mode);
+    statusMode.style.fg = promptAccentStrong(mode);
+    statusMode.left = Math.max(0, width - mode.length);
+    statusSeparator.left = Math.max(0, statusMode.left - 3);
+    statusModel.left = Math.max(0, statusSeparator.left - activeModelName.length);
+    statusModel.width = activeModelName.length;
+    const accent = promptAccent(mode);
+    const strongAccent = promptAccentStrong(mode);
+    inputDivider.style.fg = accent;
+    promptMarker.style.fg = strongAccent;
+    promptMarker.setContent(chalk.hex(strongAccent)('›'));
+    inputBox.style.focus = { bg: THEME.panelElevated, fg: strongAccent };
+    inputDivider.setContent(chalk.hex(accent)('‾'.repeat(width)));
     screen.render();
+    ensurePromptReading(inputBox, modelPickerOpen, exiting, promptReadState);
   };
 
   const appendLine = (taskId: string, line: string): void => {
@@ -276,6 +546,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
         mode,
         lines: [],
         stream: '',
+        llmTrace: [],
         status: 'idle',
         updatedAt: new Date().toISOString(),
       };
@@ -285,10 +556,109 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     view.lines.push(line);
   };
 
+  const closeModelPicker = (): void => {
+    if (!modelPickerOpen) return;
+    modelPicker?.detach();
+    modelPicker = undefined;
+    modelPickerItems = [];
+    modelPickerOpen = false;
+    ensurePromptReading(inputBox, modelPickerOpen, exiting, promptReadState);
+    renderAll();
+  };
+
+  const applyModelSelection = async (requested: string): Promise<void> => {
+    if (!resolveModel) {
+      logSystem(chalk.hex(THEME.warning)('/model switching is not configured for this session.'));
+      renderAll();
+      return;
+    }
+
+    try {
+      const next = resolveModel(requested);
+      master.setBackendConfig(next.config);
+      activeModelName = next.name;
+      if (persistModelSelection) {
+        await persistModelSelection(requested);
+      }
+      logSystem(chalk.hex(THEME.success)(`Model changed to ${activeModelName}.`));
+      if (process.env.AGENT_MODEL) {
+        logSystem(chalk.hex(THEME.warning)(`AGENT_MODEL=${process.env.AGENT_MODEL} is set and will override saved config on restart.`));
+      }
+    } catch (error) {
+      logSystem(chalk.hex(THEME.danger)(error instanceof Error ? error.message : String(error)));
+    }
+
+    ensurePromptReading(inputBox, modelPickerOpen, exiting, promptReadState);
+    renderAll();
+  };
+
+  const openModelPicker = (): void => {
+    if (modelPickerOpen) return;
+    if (modelAliases.length === 0) {
+      logSystem(chalk.hex(THEME.warning)('No configured model aliases found. Add entries to .agentrc "models" to enable selection.'));
+      renderAll();
+      return;
+    }
+
+    modelPickerOpen = true;
+    pausePromptReading(inputBox, promptReadState);
+    screen.grabKeys = false;
+    modelPickerItems = Array.from(new Set(modelAliases));
+    const selectedIndex = Math.max(0, modelPickerItems.findIndex((item) => item === activeModelName));
+    modelPicker = blessed.list({
+      parent: screen,
+      label: ' Models ',
+      top: 'center',
+      left: 'center',
+      width: '50%',
+      height: Math.min(modelPickerItems.length + 4, 16),
+      border: 'line',
+      keys: false,
+      vi: false,
+      style: {
+        bg: THEME.panel,
+        fg: THEME.text,
+        border: { fg: THEME.accent },
+        selected: { bg: THEME.accent, fg: THEME.bg },
+      },
+      items: modelPickerItems.map((item) => item === activeModelName ? `${item} (current)` : item),
+    }) as BlessedModelPicker;
+
+    screen.focusPush(modelPicker);
+    modelPicker.focus();
+    modelPicker.select(selectedIndex);
+    screen.render();
+
+    modelPicker.on('select', async (_item, index) => {
+      const requested = modelPickerItems[index];
+      closeModelPicker();
+      await applyModelSelection(requested);
+    });
+  };
+
+  const moveModelPicker = (offset: number): boolean => {
+    if (!modelPickerOpen || !modelPicker) return false;
+    if (offset < 0) {
+      modelPicker.up(Math.abs(offset));
+    } else {
+      modelPicker.down(offset);
+    }
+    screen.render();
+    return true;
+  };
+
+  const chooseModelPickerSelection = (): boolean => {
+    if (!modelPickerOpen || !modelPicker) return false;
+    const requested = modelPickerItems[modelPicker.selected];
+    closeModelPicker();
+    if (requested) void applyModelSelection(requested);
+    return true;
+  };
+
   const answerClarification = (answer: string): boolean => {
     if (!activeClarification) return false;
     master.answerClarification(activeClarification.taskId, activeClarification.clarificationId, answer);
-    appendLine(activeClarification.taskId, chalk.green(`You answered: ${answer}`));
+    appendLine(activeClarification.taskId, chalk.hex(THEME.success)(`You answered: ${answer}`));
     activeClarification = undefined;
     return true;
   };
@@ -297,7 +667,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     const [cmd = '', ...args] = line.slice(1).trim().split(/\s+/);
 
     if (cmd === 'exit' || cmd === 'quit') {
-      cleanup();
+      shutdown();
       process.exit(0);
     }
 
@@ -305,11 +675,21 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       const next = args[0] as TaskMode | undefined;
       if (next === 'execute' || next === 'plan' || next === 'react') {
         mode = next;
-        logSystem(chalk.green(`Mode changed to ${mode}.`));
       } else {
-        logSystem(chalk.yellow('Usage: /mode execute|plan|react'));
+        logSystem(chalk.hex(THEME.warning)('Usage: /mode execute|plan|react'));
       }
       renderAll();
+      return;
+    }
+
+    if (cmd === 'model') {
+      const requested = args[0];
+      if (!requested) {
+        logSystem(chalk.hex(THEME.textMuted)(`Current model: ${activeModelName}. Use ↑/↓ to choose, Enter to confirm, Esc to cancel.`));
+        openModelPicker();
+        return;
+      }
+      await applyModelSelection(requested);
       return;
     }
 
@@ -324,7 +704,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
     if (cmd === 'history') {
       logSystem(history.length === 0
-        ? chalk.dim('No conversation history yet.')
+        ? chalk.hex(THEME.textMuted)('No conversation history yet.')
         : history.map((entry) => `${entry.role}: ${simplifyText(entry.content, 120)}`).join('\n'));
       renderAll();
       return;
@@ -332,8 +712,9 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
     if (cmd === 'help') {
       logSystem([
-        chalk.bold('Commands'),
+        chalk.bold.hex(THEME.accentStrong)('Commands'),
         '/mode execute|plan|react',
+        '/model [name]',
         '/clear',
         '/history',
         '/exit',
@@ -342,7 +723,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       return;
     }
 
-    logSystem(chalk.yellow(`Unknown command: /${cmd}`));
+    logSystem(chalk.hex(THEME.warning)(`Unknown command: /${cmd}`));
     renderAll();
   }
 
@@ -372,8 +753,8 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       const view = ensureTaskView(event.task);
       view.title = 'Working on request';
       view.lines = [
-        chalk.bold('Master'),
-        chalk.dim('Preparing the request.'),
+        chalk.bold.hex(THEME.accentStrong)('Master'),
+        chalk.hex(THEME.textMuted)('Preparing the request.'),
       ];
       renderAll();
       return;
@@ -386,7 +767,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     }
 
     if (event.type === 'task_phase') {
-      appendLine(event.taskId, chalk.yellow(phaseText(event.phase, event.note)));
+      appendLine(event.taskId, chalk.bold.hex(THEME.warning)(phaseText(event.phase, event.note)));
       renderAll();
       return;
     }
@@ -399,11 +780,11 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
     if (event.type === 'tool_call') {
       if (event.tool === 'write_file' || event.tool === 'edit_file') {
-        appendLine(event.taskId, chalk.yellow(`Editing code: ${simplifyText(event.input, 100)}`));
+        appendLine(event.taskId, chalk.hex(THEME.accent)(`Editing code: ${simplifyText(event.input, 100)}`));
       } else if (event.tool === 'bash') {
-        appendLine(event.taskId, chalk.dim(`Running: ${simplifyText(event.input, 120)}`));
+        appendLine(event.taskId, chalk.hex(THEME.textMuted)(`Running: ${simplifyText(event.input, 120)}`));
       } else if (event.tool !== 'read_file' && event.tool !== 'list_dir') {
-        appendLine(event.taskId, chalk.dim(`Using ${event.tool}.`));
+        appendLine(event.taskId, chalk.hex(THEME.textMuted)(`Using ${event.tool}.`));
       }
       renderAll();
       return;
@@ -413,7 +794,7 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       if (event.tool === 'write_file' || event.tool === 'edit_file') {
         appendLine(event.taskId, renderMarkdown(event.output, 96));
       } else if (event.tool === 'bash') {
-        appendLine(event.taskId, chalk.dim(simplifyText(event.output.split('\n')[0] ?? '', 160)));
+        appendLine(event.taskId, chalk.hex(THEME.textMuted)(simplifyText(event.output.split('\n')[0] ?? '', 160)));
       }
       renderAll();
       return;
@@ -421,9 +802,9 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
 
     if (event.type === 'clarification_requested') {
       activeClarification = event.clarification;
-      appendLine(event.taskId, chalk.yellow(`Question: ${event.clarification.question}`));
+      appendLine(event.taskId, chalk.bold.hex(THEME.warning)(`Question: ${event.clarification.question}`));
       if (event.clarification.choices.length > 0) {
-        appendLine(event.taskId, event.clarification.choices.map((choice) => `- ${choice}`).join('\n'));
+        appendLine(event.taskId, event.clarification.choices.map((choice) => `${chalk.hex(THEME.accent)('•')} ${choice}`).join('\n'));
       }
       renderAll();
       return;
@@ -440,8 +821,8 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
       appendLine(
         event.taskId,
         event.status === 'completed'
-          ? chalk.green('Done.')
-          : chalk.red(`Failed: ${event.result}`),
+          ? chalk.bold.hex(THEME.success)('Done.')
+          : chalk.bold.hex(THEME.danger)(`Failed: ${event.result}`),
       );
       if (event.status === 'completed') {
         history.push({ role: 'assistant', content: event.result });
@@ -451,29 +832,199 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     }
   });
 
-  inputBox.on('submit', (value: string) => {
-    inputBox.clearValue();
-    void submitPrompt(value);
-  });
-
-  screen.key(['C-c'], () => {
+  const handleCtrlC = (): void => {
     if (!exiting) {
       exiting = true;
-      logSystem(chalk.dim('Press Ctrl+C again to exit.'));
+      if (modelPickerOpen) closeModelPicker();
+      logSystem(chalk.hex(THEME.textMuted)('Press Ctrl+C again to exit.'));
       renderAll();
       return;
     }
-    cleanup();
+    shutdown();
     process.exit(0);
+  };
+
+  const setPromptValue = (value: string): void => {
+    inputBox.setValue(value);
+    resizePrompt();
+    inputBox.focus();
+    screen.render();
+  };
+
+  const togglePlanMode = (): void => {
+    mode = mode === 'plan' ? 'execute' : 'plan';
+    renderAll();
+  };
+
+  const scrollOutput = (offset: number): void => {
+    followOutput = false;
+    outputScrollOffset = Math.max(0, outputScrollOffset + offset);
+    applyOutputScroll();
+    inputBox.focus();
+    screen.render();
+  };
+
+  const scrollOutputTo = (position: 'top' | 'bottom'): void => {
+    followOutput = position === 'bottom';
+    outputScrollOffset = position === 'top' ? 0 : outputBox.getScrollHeight();
+    applyOutputScroll();
+    inputBox.focus();
+    screen.render();
+  };
+
+  const rawInput = screen.program.input as NodeJS.ReadStream;
+  const terminalOutput = screen.program.output as NodeJS.WriteStream;
+  let rawInputBuffer = '';
+  let suppressedInputTail = '';
+  terminalOutput.write(ENABLE_ENHANCED_KEYS);
+  const handleRawInput = (data: Buffer | string): void => {
+    rawInputBuffer = `${rawInputBuffer}${data.toString('utf8')}`.slice(-64);
+    const ctrlCSequence = CTRL_C_SEQUENCES.find((candidate) => rawInputBuffer.includes(candidate));
+    if (ctrlCSequence) {
+      suppressedInputTail += printableTailForSequences(rawInputBuffer, CTRL_C_SEQUENCES);
+      rawInputBuffer = '';
+      handleCtrlC();
+      return;
+    }
+    if (modelPickerOpen || exiting) return;
+    const sequence = SHIFT_ENTER_SEQUENCES.find((candidate) => rawInputBuffer.includes(candidate));
+    if (!sequence) return;
+    suppressedInputTail = printableShiftEnterTail(sequence);
+    rawInputBuffer = '';
+    setPromptValue(`${inputBox.getValue()}\n`);
+  };
+  rawInput.prependListener('data', handleRawInput);
+
+  screen.program.on('keypress', (ch: string | undefined, key: blessed.Widgets.Events.IKeyEventArg) => {
+    if (suppressedInputTail && ch === suppressedInputTail[0]) {
+      suppressedInputTail = suppressedInputTail.slice(1);
+      return;
+    }
+
+    if (key.ctrl && key.name === 'c') {
+      handleCtrlC();
+      return;
+    }
+
+    if (modelPickerOpen) {
+      if (key.name === 'up' || ch === 'k') {
+        moveModelPicker(-1);
+        return;
+      }
+      if (key.name === 'down' || ch === 'j') {
+        moveModelPicker(1);
+        return;
+      }
+      if (key.name === 'enter') {
+        chooseModelPickerSelection();
+        return;
+      }
+      if (key.name === 'escape' || ch === 'q') {
+        closeModelPicker();
+        return;
+      }
+      return;
+    }
+
+    if (key.shift && key.name === 'tab') {
+      togglePlanMode();
+      return;
+    }
+
+    if (key.name === 'pageup') {
+      scrollOutput(-Math.max(1, Math.floor((process.stdout.rows ?? 24) * 0.75)));
+      return;
+    }
+    if (key.name === 'pagedown') {
+      scrollOutput(Math.max(1, Math.floor((process.stdout.rows ?? 24) * 0.75)));
+      return;
+    }
+    if (key.name === 'home') {
+      scrollOutputTo('top');
+      return;
+    }
+    if (key.name === 'end') {
+      scrollOutputTo('bottom');
+      return;
+    }
+    if (key.name === 'up') {
+      scrollOutput(-1);
+      return;
+    }
+    if (key.name === 'down') {
+      scrollOutput(1);
+      return;
+    }
+    if (key.ctrl && key.name === 'u') {
+      return;
+    }
+    if (key.ctrl && key.name === 'd') {
+      return;
+    }
+
+    if (exiting) exiting = false;
+
+    if (key.name === 'enter') {
+      if (key.shift) {
+        setPromptValue(`${inputBox.getValue()}\n`);
+        return;
+      }
+      const value = inputBox.getValue();
+      setPromptValue('');
+      void submitPrompt(value);
+      return;
+    }
+    if (key.name === 'escape') {
+      setPromptValue('');
+      return;
+    }
+    if (key.name === 'backspace') {
+      setPromptValue(Array.from(inputBox.getValue()).slice(0, -1).join(''));
+      return;
+    }
+    if (ch && !/^[\x00-\x08\x0b-\x1f\x7f]$/.test(ch)) {
+      setPromptValue(inputBox.getValue() + ch);
+    }
   });
 
   const flushTimer = setInterval(renderAll, 120);
   flushTimer.unref?.();
 
+  let cleanedUp = false;
   const cleanup = (): void => {
+    if (cleanedUp) return;
+    cleanedUp = true;
     exiting = true;
     clearInterval(flushTimer);
+    rawInput.removeListener('data', handleRawInput);
+    terminalOutput.write(DISABLE_ENHANCED_KEYS);
     unsubscribe();
+  };
+
+  const shutdown = (): void => {
+    cleanup();
+    closeModelPicker();
+    promptReadState.pending = false;
+    try {
+      inputBox.removeAllListeners('blur');
+      inputBox.removeAllListeners('cancel');
+      inputBox.removeAllListeners('submit');
+    } catch {
+      // ignore
+    }
+    try {
+      screen.program.showCursor();
+      screen.program.disableMouse();
+    } catch {
+      // ignore
+    }
+    try {
+      if (typeof screen.leave === 'function') {
+        screen.leave();
+      }
+    } catch {
+      // ignore
+    }
     try {
       screen.destroy();
     } catch {
@@ -481,6 +1032,6 @@ export async function runTui(master: MasterCoordinator, modelName: string): Prom
     }
   };
 
-  inputBox.focus();
+  ensurePromptReading(inputBox, modelPickerOpen, exiting, promptReadState);
   renderAll();
 }

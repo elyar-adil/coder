@@ -28,6 +28,7 @@ import {
   REACT_INSPECT_PROMPT,
   REACT_VERIFY_PROMPT,
   ROUTER_SYSTEM_PROMPT,
+  STEP_EXECUTOR_SYSTEM_PROMPT,
   SUBAGENT_SYSTEM_PROMPT,
   VERIFY_SELFIE_PROMPT,
 } from '../infra/prompts.js';
@@ -70,6 +71,10 @@ function isRepoScopedPrompt(prompt: string): boolean {
   return /\b(repo|repository|project|module|function|file|src|test|bug|build|code|task)\b/i.test(prompt);
 }
 
+function needsRepositoryInspection(prompt: string): boolean {
+  return /\b(repo|repository|codebase|project|module|function|file|src|test|bug|build|implementation|stack trace|error|failing|failure|refactor|architecture)\b/i.test(prompt);
+}
+
 function parseClarificationChoices(content: string): string[] {
   try {
     const trimmed = content.trim();
@@ -101,6 +106,7 @@ export class MasterCoordinator {
   private fileLocks = new FileLockManager();
   private sharedSummary = '';
   private basePolicy = getToolPolicy();
+  private llmTracingEnabled = false;
 
   constructor(
     baseUrlOrConfig: string | BackendConfig,
@@ -121,6 +127,18 @@ export class MasterCoordinator {
   subscribe(listener: EventListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  getBackendConfig(): BackendConfig {
+    return { ...this.backend, requestOptions: this.backend.requestOptions ? { ...this.backend.requestOptions } : undefined };
+  }
+
+  setBackendConfig(config: BackendConfig): void {
+    this.backend = config;
+  }
+
+  setLlmTracingEnabled(enabled: boolean): void {
+    this.llmTracingEnabled = enabled;
   }
 
   private emit(event: MasterEvent): void {
@@ -145,6 +163,11 @@ export class MasterCoordinator {
       plan: [...task.plan],
       phaseEvents: [...task.phaseEvents],
       messages: task.messages ? [...task.messages] : undefined,
+      llmTrace: task.llmTrace ? task.llmTrace.map((entry) => ({
+        ...entry,
+        messages: entry.messages.map((message) => ({ ...message })),
+        toolCalls: entry.toolCalls ? [...entry.toolCalls] : undefined,
+      })) : undefined,
       pendingClarifications: task.pendingClarifications ? [...task.pendingClarifications] : undefined,
     };
   }
@@ -166,6 +189,38 @@ export class MasterCoordinator {
     const line = `${task.taskId.slice(0, 8)} [${task.status}] ${excerpt(task.summary ?? task.prompt, 120)}${task.result ? ` => ${excerpt(task.result, 140)}` : ''}`;
     const lines = [line, ...this.sharedSummary.split('\n').filter(Boolean)];
     this.sharedSummary = lines.slice(0, 8).join('\n');
+  }
+
+  private appendLlmTrace(
+    taskId: string | undefined,
+    label: string,
+    systemPrompt: string,
+    messages: OllamaMsg[],
+    response: string,
+    toolCalls?: OllamaMsg['tool_calls'],
+    cached = false,
+  ): void {
+    if (!this.llmTracingEnabled) return;
+    if (!taskId) return;
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    task.llmTrace = [
+      ...(task.llmTrace ?? []),
+      {
+        ts: now(),
+        label,
+        systemPrompt,
+        messages: messages.map((message) => ({
+          ...message,
+          tool_calls: message.tool_calls ? [...message.tool_calls] : undefined,
+        })),
+        response,
+        toolCalls: toolCalls ? [...toolCalls] : undefined,
+        cached,
+      },
+    ].slice(-50);
+    void this.persist(task);
+    this.emitTaskUpdate(task);
   }
 
   private buildSharedSnapshot(excludeTaskId?: string): SharedContextSnapshot {
@@ -425,7 +480,13 @@ export class MasterCoordinator {
       let result = '';
       for (let turn = 0; turn < 20; turn += 1) {
         if (Date.now() - startedAt > timeoutMs) throw new Error('subagent timeout');
-        const { text, toolCalls } = await this.callModelWithTools(SUBAGENT_SYSTEM_PROMPT, messages, tools);
+        const { text, toolCalls } = await this.callModelWithTools(
+          SUBAGENT_SYSTEM_PROMPT,
+          messages,
+          tools,
+          sub.parentTaskId || sub.taskId,
+          'subagent',
+        );
         const message: OllamaMsg = { role: 'assistant', content: text || null };
         if (toolCalls?.length) message.tool_calls = toolCalls;
         messages.push(message);
@@ -549,7 +610,7 @@ export class MasterCoordinator {
         '- Choices must be specific and useful, not yes/no or generic.',
         '- Keep labels short and distinct.',
       ].filter(Boolean).join('\n');
-      const content = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, []);
+      const content = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, [], task, 'clarification_choices');
       finalChoices = parseClarificationChoices(content);
       if (finalChoices.length === 0) {
         finalChoices = [question];
@@ -590,11 +651,16 @@ export class MasterCoordinator {
   ): AsyncGenerator<StreamChunk> {
     try {
       task.sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
+      this.markPhase(task, 'plan', 'in_progress', 'Planning next steps…');
+      yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Planning next steps…' };
       const planner = await this.planTask(task, conversationHistory);
       task.planner = planner;
       task.summary = planner.summary;
       task.readOnly = planner.readOnly;
+      task.plan = planner.steps;
       await this.persist(task);
+      this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
+      yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
 
       if (planner.questions[0]) {
         const answer = await this.requestClarification(task.taskId, planner.questions[0]);
@@ -603,161 +669,18 @@ export class MasterCoordinator {
         await this.persist(task);
       }
 
-      if (task.mode !== 'plan' && planner.subtasks.length > 0) {
-        void this.dispatchPlannerSubtasks(task, planner);
-      }
-
       if (task.mode === 'plan') {
-        this.markPhase(task, 'plan', 'in_progress', 'Generating execution plan…');
-        yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Generating execution plan…' };
-        const content = await this.callModelText(
-          `${task.sharedContext}\n\nUser request:\n${task.prompt}`,
-          PLAN_SYSTEM_PROMPT,
-          conversationHistory,
-        );
-        task.plan = await this.parsePlanWithRetry(content, task.prompt);
         task.status = 'blocked';
-        const planText = task.plan.map((step, index) => `**${index + 1}. ${step.title}**\n${step.detail}`).join('\n\n');
+        const planText = this.renderPlanMarkdown(planner.steps);
         task.result = planText;
         await this.persist(task);
-        this.markPhase(task, 'plan', 'done', `${task.plan.length} steps`);
-        yield { type: 'phase', phase: 'plan', status: 'done', note: `${task.plan.length} steps` };
         yield { type: 'token', text: planText };
         yield { type: 'done', result: planText };
         return;
       }
 
-      const route = (await this.callModelText(task.prompt, ROUTER_SYSTEM_PROMPT, conversationHistory)).trim().toUpperCase();
-      const treatAsRepoAnalysis = task.readOnly || isRepoScopedPrompt(task.prompt);
-
-      if (route === 'CHAT' && !treatAsRepoAnalysis) {
-        this.markPhase(task, 'finalize', 'in_progress', 'Answering directly…');
-        yield { type: 'phase', phase: 'finalize', status: 'in_progress', note: 'Answering directly…' };
-        const quick = await this.callModelText(task.prompt, CHAT_SYSTEM_PROMPT, conversationHistory);
-        task.result = quick;
-        task.status = 'completed';
-        task.completedAt = now();
-        await this.persist(task);
-        this.markPhase(task, 'finalize', 'done');
-        yield { type: 'token', text: quick };
-        yield { type: 'phase', phase: 'finalize', status: 'done' };
-        yield { type: 'done', result: quick };
-        return;
-      }
-
       const toolCtx = this.createToolContext(task);
-
-      if (task.mode === 'react') {
-        yield* this.streamReactFlow(task, conversationHistory, toolCtx);
-        return;
-      }
-
-      if (task.readOnly) {
-        yield* this.streamReadOnlyFlow(task, conversationHistory, toolCtx);
-        return;
-      }
-
-      const contextualPrompt = `${task.sharedContext}\n\nUser request:\n${task.prompt}`;
-      const messages: OllamaMsg[] = [
-        ...conversationHistory.map((entry) => ({ role: entry.role, content: entry.content })),
-        { role: 'user', content: contextualPrompt },
-      ];
-      let fullResult = '';
-      const maxTurns = 20;
-
-      this.markPhase(task, 'design', 'in_progress', 'Exploring codebase and designing…');
-      yield { type: 'phase', phase: 'design', status: 'in_progress', note: 'Exploring codebase and designing…' };
-      yield { type: 'token', text: '## Design\n' };
-      let designResult = '';
-      for await (const chunk of this.runToolLoopStream(
-        [...messages, { role: 'user', content: DESIGN_TOOLS_PROMPT }],
-        maxTurns,
-        toolCtx,
-        task.readOnly ?? false,
-        (text) => {
-          designResult += text;
-        },
-      )) {
-        yield chunk;
-      }
-      designResult = designResult.trim();
-      messages.push({ role: 'assistant', content: `## Design\n${designResult}` });
-      task.designDoc = designResult;
-      fullResult += `## Design\n${designResult}\n\n`;
-      await this.persist(task);
-      this.markPhase(task, 'design', 'done');
-      yield { type: 'token', text: '\n\n' };
-      yield { type: 'phase', phase: 'design', status: 'done' };
-
-      this.markPhase(task, 'write_code', 'in_progress', 'Writing implementation…');
-      yield { type: 'phase', phase: 'write_code', status: 'in_progress', note: 'Writing implementation…' };
-      yield { type: 'token', text: '## Implementation\n' };
-      let filesWritten = false;
-      let implementationResult = '';
-      for await (const chunk of this.runToolLoopStream(
-        messages,
-        maxTurns,
-        toolCtx,
-        task.readOnly ?? false,
-        (text) => {
-          implementationResult += text;
-        },
-        (toolName) => {
-          if (toolName === 'write_file' || toolName === 'edit_file') {
-            filesWritten = true;
-          }
-        },
-      )) {
-        yield chunk;
-      }
-      implementationResult = implementationResult.trim();
-      fullResult += implementationResult;
-      task.messages = [...messages];
-      await this.persist(task);
-      this.markPhase(task, 'write_code', 'done');
-      yield { type: 'token', text: '\n\n' };
-      yield { type: 'phase', phase: 'write_code', status: 'done' };
-
-      if (filesWritten) {
-        for (let attempt = 0; attempt < 3; attempt += 1) {
-          this.markPhase(task, 'verify', 'in_progress', `Verifying (attempt ${attempt + 1})…`);
-          yield { type: 'phase', phase: 'verify', status: 'in_progress', note: `Verifying (attempt ${attempt + 1})…` };
-          yield { type: 'token', text: `## Verification attempt ${attempt + 1}\n` };
-          let verifyResult = '';
-          for await (const chunk of this.runToolLoopStream(
-            [...messages, { role: 'user', content: VERIFY_SELFIE_PROMPT }],
-            maxTurns,
-            toolCtx,
-            false,
-            (text) => {
-              verifyResult += text;
-            },
-          )) {
-            yield chunk;
-          }
-          verifyResult = verifyResult.trim();
-          messages.push({ role: 'assistant', content: verifyResult || null });
-          fullResult += `\n${verifyResult}`;
-          task.messages = [...messages];
-          await this.persist(task);
-          yield { type: 'token', text: '\n\n' };
-
-          const lower = verifyResult.toLowerCase();
-          const passed = !/fail|error|traceback|exited with code/i.test(lower)
-            && (lower.includes('ok') || lower.includes('passed') || lower.includes('✓'));
-          if (passed) {
-            this.markPhase(task, 'verify', 'done', 'All checks passed');
-            yield { type: 'phase', phase: 'verify', status: 'done', note: 'All checks passed' };
-            break;
-          }
-          if (attempt === 2) {
-            this.markPhase(task, 'verify', 'done', 'Max retries reached');
-            yield { type: 'phase', phase: 'verify', status: 'done', note: 'Max retries reached' };
-          }
-        }
-      }
-
-      task.messages = messages;
+      const fullResult = yield* this.streamPlannerDrivenFlow(task, conversationHistory, toolCtx, planner.steps);
       task.result = fullResult;
       task.status = 'completed';
       task.completedAt = now();
@@ -787,7 +710,7 @@ export class MasterCoordinator {
       },
     ];
     let result = '';
-    for await (const chunk of this.runToolLoopStream(messages, 20, toolCtx, true, (text) => {
+    for await (const chunk of this.runToolLoopStream(messages, 20, toolCtx, true, 'read_only', (text) => {
       result += text;
     })) {
       yield chunk;
@@ -803,6 +726,133 @@ export class MasterCoordinator {
     yield { type: 'done', result };
   }
 
+  private async *streamPlannerDrivenFlow(
+    task: PromptTask,
+    conversationHistory: ConversationEntry[],
+    toolCtx: ToolContext,
+    steps: PlanStep[],
+  ): AsyncGenerator<StreamChunk, string> {
+    const results: string[] = [];
+    for (let index = 0; index < steps.length; index += 1) {
+      const step = steps[index]!;
+      const phase = this.phaseForStep(step);
+      const note = `${index + 1}/${steps.length}: ${step.title}`;
+      this.markPhase(task, phase, 'in_progress', note);
+      yield { type: 'phase', phase, status: 'in_progress', note };
+      const heading = `## ${step.title}\n`;
+      yield { type: 'token', text: heading };
+
+      const result = yield* this.executePlannerStep(task, conversationHistory, toolCtx, step, index);
+      const trimmed = result.trim();
+      if (trimmed) {
+        results.push(`## ${step.title}\n${trimmed}`);
+        if (step.intent === 'answer' || step.intent === 'ask_user') {
+          yield { type: 'token', text: `${trimmed}\n\n` };
+        } else {
+          yield { type: 'token', text: '\n\n' };
+        }
+      }
+      this.markPhase(task, phase, 'done', step.title);
+      yield { type: 'phase', phase, status: 'done', note: step.title };
+    }
+    return results.join('\n\n').trim();
+  }
+
+  private async *executePlannerStep(
+    task: PromptTask,
+    conversationHistory: ConversationEntry[],
+    toolCtx: ToolContext,
+    step: PlanStep,
+    index: number,
+  ): AsyncGenerator<StreamChunk, string> {
+    const intent = step.intent ?? 'answer';
+    const instruction = step.instruction || step.detail || step.title;
+    if (intent === 'ask_user') {
+      return this.requestClarification(task.taskId, instruction);
+    }
+
+    if (intent === 'answer') {
+      return await this.callModelText(
+        [
+          task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
+          `User request:\n${task.prompt}`,
+          `Current step:\n${instruction}`,
+          'Answer this step directly and concisely.',
+        ].filter(Boolean).join('\n\n'),
+        CHAT_SYSTEM_PROMPT,
+        conversationHistory,
+        task,
+        `step_${index + 1}_answer`,
+      );
+    }
+
+    const messages: OllamaMsg[] = [
+      ...conversationHistory.map((entry) => ({ role: entry.role, content: entry.content })),
+      {
+        role: 'user',
+        content: [
+          task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
+          `User request:\n${task.prompt}`,
+          `Current planner step: ${step.title}`,
+          `Intent: ${intent}`,
+          `Instruction:\n${instruction}`,
+          '',
+          'Execute only this planner step. Return a concise result for this step.',
+        ].filter(Boolean).join('\n\n'),
+      },
+    ];
+    let result = '';
+    for await (const chunk of this.runToolLoopStream(
+      messages,
+      10,
+      toolCtx,
+      step.toolPolicy === 'read_only' || step.toolPolicy === 'safe',
+      `step_${index + 1}_${intent}`,
+      (text) => {
+        result += text;
+      },
+      undefined,
+      this.getToolsForStep(step),
+      STEP_EXECUTOR_SYSTEM_PROMPT,
+    )) {
+      yield chunk;
+    }
+    return result;
+  }
+
+  private renderPlanMarkdown(steps: PlanStep[]): string {
+    return steps.map((step, index) => {
+      const intent = step.intent ? ` (${step.intent})` : '';
+      return `**${index + 1}. ${step.title}${intent}**\n${step.instruction || step.detail}`;
+    }).join('\n\n');
+  }
+
+  private phaseForStep(step: PlanStep): TaskPhase {
+    if (step.intent === 'code_change') return 'write_code';
+    if (step.intent === 'verify') return 'verify';
+    if (step.intent === 'answer') return 'finalize';
+    return 'execute';
+  }
+
+  private getToolsForStep(step: PlanStep) {
+    const names = (() => {
+      switch (step.toolPolicy) {
+        case 'none':
+          return new Set<string>();
+        case 'read_only':
+          return new Set(['repo_map', 'read_file', 'list_dir', 'bash', 'load_skill', 'request_clarification']);
+        case 'code_write':
+          return new Set(WORKER_TOOLS.map((tool) => tool.function.name));
+        case 'verify':
+          return new Set(['read_file', 'edit_file', 'write_file', 'bash', 'request_clarification']);
+        case 'safe':
+        default:
+          return new Set(['bash', 'request_clarification']);
+      }
+    })();
+    return WORKER_TOOLS.filter((tool) => names.has(tool.function.name));
+  }
+
   private async planTask(
     task: PromptTask,
     conversationHistory: ConversationEntry[],
@@ -810,7 +860,7 @@ export class MasterCoordinator {
     const sharedContext = renderSharedContext(this.buildSharedSnapshot(task.taskId));
     const prompt = `${sharedContext}\n\nUser request:\n${task.prompt}`;
     try {
-      const content = await this.callModelText(prompt, PLANNER_SYSTEM_PROMPT, conversationHistory);
+      const content = await this.callModelText(prompt, PLANNER_SYSTEM_PROMPT, conversationHistory, task, 'planner');
       return parsePlannerDecision(content, task.prompt);
     } catch {
       return fallbackPlannerDecision(task.prompt);
@@ -855,6 +905,8 @@ export class MasterCoordinator {
         `${originalPrompt}\n\nYour previous output was invalid JSON. Return ONLY a JSON array with {"title","detail"}.`,
         PLAN_SYSTEM_PROMPT,
         [],
+        undefined,
+        'plan_repair',
       );
       return parsePlan(repaired);
     }
@@ -867,7 +919,7 @@ export class MasterCoordinator {
   ): AsyncGenerator<StreamChunk> {
     this.markPhase(task, 'plan', 'in_progress', 'Building plan…');
     yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Building plan…' };
-    const planContent = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, []);
+    const planContent = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, [], task, 'react_plan');
     task.plan = await this.parsePlanWithRetry(planContent, task.prompt);
     this.markPhase(task, 'plan', 'done', `${task.plan.length} steps`);
     yield { type: 'phase', phase: 'plan', status: 'done', note: `${task.plan.length} steps` };
@@ -882,7 +934,7 @@ export class MasterCoordinator {
       { role: 'user', content: `Shared context:\n${task.sharedContext ?? ''}\n\nPlan:\n${planMarkdown}\n\n${DESIGN_TOOLS_PROMPT}` },
     ];
     let designText = '';
-    for await (const _chunk of this.agenticStreamRaw(designMessages, toolCtx, task.readOnly ?? false, (text) => {
+    for await (const _chunk of this.agenticStreamRaw(designMessages, toolCtx, task.readOnly ?? false, 'react_design', (text) => {
       designText += text;
     })) {
       // tokens already captured through callback
@@ -897,7 +949,7 @@ export class MasterCoordinator {
     yield { type: 'phase', phase: 'inspect_code', status: 'in_progress', note: 'Analyzing codebase…' };
     yield { type: 'token', text: '## Analysis\n' };
     let inspectResult = '';
-    yield* this.agenticStream(REACT_INSPECT_PROMPT(planMarkdown), history, toolCtx, task.readOnly ?? false, (text) => {
+    yield* this.agenticStream(REACT_INSPECT_PROMPT(planMarkdown), history, toolCtx, task.readOnly ?? false, 'react_inspect', (text) => {
       inspectResult += text;
     });
     this.markPhase(task, 'inspect_code', 'done');
@@ -912,6 +964,7 @@ export class MasterCoordinator {
       history,
       toolCtx,
       task.readOnly ?? false,
+      'react_implementation',
       (text) => {
         implementation += text;
       },
@@ -923,7 +976,7 @@ export class MasterCoordinator {
     yield { type: 'phase', phase: 'verify', status: 'in_progress', note: 'Verifying…' };
     yield { type: 'token', text: '\n\n## Verification\n' };
     let verify = '';
-    yield* this.agenticStream(REACT_VERIFY_PROMPT(implementation), history, toolCtx, false, (text) => {
+    yield* this.agenticStream(REACT_VERIFY_PROMPT(implementation), history, toolCtx, false, 'react_verify', (text) => {
       verify += text;
     });
     this.markPhase(task, 'verify', 'done');
@@ -941,6 +994,7 @@ export class MasterCoordinator {
     messages: OllamaMsg[],
     toolCtx: ToolContext,
     readOnly: boolean,
+    label: string,
     onText: (text: string) => void,
   ): AsyncGenerator<StreamChunk> {
     const tools = this.getToolsForTask(readOnly);
@@ -958,6 +1012,8 @@ export class MasterCoordinator {
           toolCalls = chunk.message.tool_calls;
         }
       }
+
+      this.appendLlmTrace(toolCtx.taskId, label, EXECUTE_SYSTEM_PROMPT, messages, assistantText.trim(), toolCalls);
 
       const message: OllamaMsg = { role: 'assistant', content: assistantText || null };
       if (toolCalls?.length) message.tool_calls = toolCalls;
@@ -987,13 +1043,14 @@ export class MasterCoordinator {
     baseHistory: ConversationEntry[],
     toolCtx: ToolContext,
     readOnly: boolean,
+    label: string,
     onText: (text: string) => void,
   ): AsyncGenerator<StreamChunk> {
     const messages: OllamaMsg[] = [
       ...baseHistory.map((entry) => ({ role: entry.role, content: entry.content })),
       { role: 'user', content: userPrompt },
     ];
-    yield* this.agenticStreamRaw(messages, toolCtx, readOnly, onText);
+    yield* this.agenticStreamRaw(messages, toolCtx, readOnly, label, onText);
   }
 
   private async *runToolLoopStream(
@@ -1001,15 +1058,18 @@ export class MasterCoordinator {
     maxTurns: number,
     toolCtx: ToolContext,
     readOnly: boolean,
+    label: string,
     onText?: (text: string) => void,
     onToolCall?: (tool: string) => void,
+    toolsOverride?: typeof WORKER_TOOLS,
+    systemPrompt = EXECUTE_SYSTEM_PROMPT,
   ): AsyncGenerator<StreamChunk> {
-    const tools = this.getToolsForTask(readOnly);
+    const tools = toolsOverride ?? this.getToolsForTask(readOnly);
     for (let turn = 0; turn < maxTurns; turn += 1) {
       let assistantText = '';
       let toolCalls: OllamaMsg['tool_calls'];
 
-      for await (const chunk of this.streamModelWithTools(EXECUTE_SYSTEM_PROMPT, messages, tools)) {
+      for await (const chunk of this.streamModelWithTools(systemPrompt, messages, tools)) {
         if (chunk.message?.content) {
           assistantText += chunk.message.content;
           onText?.(chunk.message.content);
@@ -1017,6 +1077,8 @@ export class MasterCoordinator {
         }
         if (chunk.message?.tool_calls?.length) toolCalls = chunk.message.tool_calls;
       }
+
+      this.appendLlmTrace(toolCtx.taskId, label, systemPrompt, messages, assistantText.trim(), toolCalls);
 
       const message: OllamaMsg = { role: 'assistant', content: assistantText || null };
       if (toolCalls?.length) message.tool_calls = toolCalls;
@@ -1064,6 +1126,8 @@ export class MasterCoordinator {
     systemPrompt: string,
     messages: OllamaMsg[],
     tools = WORKER_TOOLS,
+    taskId?: string,
+    label = 'model_tools',
   ): Promise<{ text: string; toolCalls: OllamaMsg['tool_calls'] }> {
     const cacheKey = JSON.stringify({
       systemPrompt,
@@ -1071,7 +1135,11 @@ export class MasterCoordinator {
       tools: tools.map((tool) => tool.function.name),
     });
     const cached = this.cache.get(this.backend.model, systemPrompt, cacheKey);
-    if (cached) return JSON.parse(cached) as { text: string; toolCalls: OllamaMsg['tool_calls'] };
+    if (cached) {
+      const result = JSON.parse(cached) as { text: string; toolCalls: OllamaMsg['tool_calls'] };
+      this.appendLlmTrace(taskId, label, systemPrompt, messages, result.text, result.toolCalls, true);
+      return result;
+    }
 
     let text = '';
     let toolCalls: OllamaMsg['tool_calls'];
@@ -1081,6 +1149,7 @@ export class MasterCoordinator {
     }
 
     const result = { text: text.trim(), toolCalls };
+    this.appendLlmTrace(taskId, label, systemPrompt, messages, result.text, toolCalls);
     this.cache.set(this.backend.model, systemPrompt, cacheKey, JSON.stringify(result));
     return result;
   }
@@ -1099,6 +1168,8 @@ export class MasterCoordinator {
     userPrompt: string,
     systemPrompt: string,
     history: ConversationEntry[],
+    task?: PromptTask,
+    label = 'model_text',
   ): Promise<string> {
     const messages: OllamaMsg[] = [
       ...history.map((entry) => ({ role: entry.role, content: entry.content })),
@@ -1107,13 +1178,17 @@ export class MasterCoordinator {
 
     const cacheKey = JSON.stringify(messages);
     const cached = this.cache.get(this.backend.model, systemPrompt, cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      this.appendLlmTrace(task?.taskId, label, systemPrompt, messages, cached, undefined, true);
+      return cached;
+    }
 
     let full = '';
     for await (const chunk of this.streamModelText(systemPrompt, messages)) {
       full += chunk;
     }
     const result = full.trim();
+    this.appendLlmTrace(task?.taskId, label, systemPrompt, messages, result);
     this.cache.set(this.backend.model, systemPrompt, cacheKey, result);
     return result;
   }
