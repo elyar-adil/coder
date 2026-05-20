@@ -407,7 +407,28 @@ export class MasterCoordinator {
     void this.persist(task);
     this.emit({ type: 'task_created', task: this.cloneTask(task), ts: now() });
     this.emitTaskUpdate(task);
+    // Asynchronously generate a short human-readable name for the task.
+    void this.generateTaskName(task);
     return task;
+  }
+
+  private async generateTaskName(task: PromptTask): Promise<void> {
+    try {
+      const name = await this.callModelText(
+        task.prompt,
+        'You are a task naming assistant. Given a user task description, respond with ONLY a short 3-6 word action phrase (e.g. "Fix auth error handling", "Refactor payment service"). No punctuation at the end, no quotes, no explanation.',
+        [],
+        undefined,
+        'task_name',
+      );
+      const cleaned = name.replace(/^["']|["']$/g, '').trim();
+      if (cleaned && cleaned.length < 80) {
+        task.summary = cleaned;
+        this.emitTaskUpdate(task);
+      }
+    } catch {
+      // Non-critical: fall back to truncated prompt as title
+    }
   }
 
   async acceptPrompt(
