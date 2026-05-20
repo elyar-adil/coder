@@ -6,7 +6,6 @@
 
 import * as readline from 'node:readline';
 import chalk from 'chalk';
-import stripAnsi from 'strip-ansi';
 
 import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
@@ -159,6 +158,7 @@ export async function runTui(
   let activeClarification: ClarificationRequest | undefined;
   let exiting = false;
   let streamBuffers = new Map<string, string>(); // taskId -> pending stream text
+  const lastTaskHeadline = new Map<string, string>();
 
   // ── readline setup ────────────────────────────────────────────────────────
 
@@ -174,9 +174,8 @@ export async function runTui(
   function renderPrompt(): void {
     const modeCol = chalk.hex(modeColor(mode))(mode);
     const clarification = activeClarification ? chalk.hex(THEME.warning)(' [answering question]') : '';
-    const summaryBar = renderSummaryBar(tasks, taskOrder);
     const promptLine = `${chalk.hex(THEME.textMuted)('[')}${modeCol}${chalk.hex(THEME.textMuted)(']')}${clarification} ${chalk.hex(THEME.accent)('›')} `;
-    rl.setPrompt(summaryBar ? `${summaryBar}\n${promptLine}` : promptLine);
+    rl.setPrompt(promptLine);
     rl.prompt(true);
   }
 
@@ -223,7 +222,7 @@ export async function runTui(
 
   const taskPrefix = (view: TaskView): string => {
     const icon = chalk.hex(statusColor(view.status))(STATUS_ICON[view.status] ?? '·');
-    const title = chalk.bold.hex(THEME.accent)(simplifyText(view.title, 40));
+    const title = chalk.bold.hex(THEME.accent)(simplifyText(view.title, 72));
     return `${icon} ${title}`;
   };
 
@@ -451,25 +450,27 @@ export async function runTui(
     renderPrompt();
   };
 
+
+  const maybeLogTaskHeadline = (task: PromptTask): void => {
+    const view = ensureTaskView(task);
+    const status = `${STATUS_ICON[view.status] ?? '·'} ${view.status}`;
+    const headline = `${status}  ${simplifyText(view.title, 96)}`;
+    if (lastTaskHeadline.get(task.taskId) === headline) return;
+    lastTaskHeadline.set(task.taskId, headline);
+    log(`${chalk.hex(THEME.textMuted)('task')} ${chalk.hex(statusColor(view.status))(status)}  ${chalk.bold.hex(THEME.textSoft)(simplifyText(view.title, 96))}`);
+  };
+
   // ── Event subscription ────────────────────────────────────────────────────
 
   const unsubscribe = master.subscribe((event) => {
     if (event.type === 'task_created') {
-      const view = ensureTaskView(event.task);
-      log(`${chalk.hex(THEME.textMuted)('  new task')}  ${chalk.bold.hex(THEME.accent)(view.title)}`);
+      maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
 
     if (event.type === 'task_updated') {
-      const prev = tasks.get(event.task.taskId);
-      const prevTitle = prev?.title;
-      ensureTaskView(event.task);
-      const view = tasks.get(event.task.taskId)!;
-      // If title just got generated (summary arrived), print the rename
-      if (prevTitle && prevTitle !== view.title && prevTitle === simplifyText(event.task.prompt, 72)) {
-        log(`${chalk.hex(THEME.textMuted)('  →')} ${chalk.bold.hex(THEME.accent)(view.title)}`);
-      }
+      maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
