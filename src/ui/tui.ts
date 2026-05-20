@@ -6,7 +6,6 @@
 
 import * as readline from 'node:readline';
 import chalk from 'chalk';
-import stripAnsi from 'strip-ansi';
 
 import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
@@ -115,35 +114,6 @@ const STATUS_ICON: Record<string, string> = {
 
 // ── Stdout helpers ──────────────────────────────────────────────────────────
 
-/** Print a line above the input bar without disturbing it. */
-function printLine(rl: readline.Interface, line: string): void {
-  // readline.clearLine moves cursor; we use the low-level approach instead
-  (rl as any).output?.write(`\r\x1b[K${line}\n`);
-  (rl as any)._refreshLine?.();
-}
-
-// ── Summary bar ─────────────────────────────────────────────────────────────
-
-function renderSummaryBar(tasks: Map<string, TaskView>, taskOrder: string[]): string {
-  const cols = process.stdout.columns ?? 80;
-  const userTaskIds = taskOrder.filter((id) => id !== '__system__');
-  if (userTaskIds.length === 0) return '';
-
-  const parts = userTaskIds.map((id) => {
-    const view = tasks.get(id);
-    if (!view) return '';
-    const icon = STATUS_ICON[view.status] ?? '·';
-    const colored = chalk.hex(statusColor(view.status))(icon);
-    const title = chalk.hex(THEME.textSoft)(simplifyText(view.title, 18));
-    return `${colored} ${title}`;
-  }).filter(Boolean);
-
-  const bar = parts.join(chalk.hex(THEME.textMuted)('  ·  '));
-  const label = chalk.hex(THEME.textMuted)('tasks: ');
-  const raw = stripAnsi(label + bar);
-  return raw.length > cols ? label + bar.slice(0, cols - 4) + '…' : label + bar;
-}
-
 export async function runTui(
   master: MasterCoordinator,
   modelName: string,
@@ -163,8 +133,8 @@ export async function runTui(
   let activeModelName = modelName;
   let activeClarification: ClarificationRequest | undefined;
   let exiting = false;
-  let inputBuffer = '';
   let streamBuffers = new Map<string, string>(); // taskId -> pending stream text
+  const lastTaskHeadline = new Map<string, string>();
 
   // ── readline setup ────────────────────────────────────────────────────────
 
@@ -180,9 +150,8 @@ export async function runTui(
   function renderPrompt(): void {
     const modeCol = chalk.hex(modeColor(mode))(mode);
     const clarification = activeClarification ? chalk.hex(THEME.warning)(' [answering question]') : '';
-    const summaryBar = renderSummaryBar(tasks, taskOrder);
     const promptLine = `${chalk.hex(THEME.textMuted)('[')}${modeCol}${chalk.hex(THEME.textMuted)(']')}${clarification} ${chalk.hex(THEME.accent)('›')} `;
-    rl.setPrompt(summaryBar ? `${summaryBar}\n${promptLine}` : promptLine);
+    rl.setPrompt(promptLine);
     rl.prompt(true);
   }
 
@@ -190,14 +159,6 @@ export async function runTui(
     readline.clearLine(out, 0);
     readline.cursorTo(out, 0);
     out.write(`${line}\n`);
-    renderPrompt();
-  }
-
-  function logRaw(text: string): void {
-    // For streaming: don't re-render prompt on every chunk, just write
-    readline.clearLine(out, 0);
-    readline.cursorTo(out, 0);
-    out.write(text);
     renderPrompt();
   }
 
@@ -237,7 +198,7 @@ export async function runTui(
 
   const taskPrefix = (view: TaskView): string => {
     const icon = chalk.hex(statusColor(view.status))(STATUS_ICON[view.status] ?? '·');
-    const title = chalk.bold.hex(THEME.accent)(simplifyText(view.title, 40));
+    const title = chalk.bold.hex(THEME.accent)(simplifyText(view.title, 72));
     return `${icon} ${title}`;
   };
 
@@ -342,6 +303,13 @@ export async function runTui(
       process.exit(0);
     }
 
+    if (cmd === 'plan') {
+      mode = mode === 'plan' ? 'execute' : 'plan';
+      log(chalk.hex(THEME.textMuted)(`Mode: ${mode}`));
+      renderPrompt();
+      return;
+    }
+
     if (cmd === 'mode') {
       const next = args[0] as TaskMode | undefined;
       if (next === 'execute' || next === 'plan' || next === 'react') {
@@ -417,6 +385,7 @@ export async function runTui(
       log([
         chalk.bold.hex(THEME.accentStrong)('Commands'),
         `  ${chalk.hex(THEME.accent)('/mode')} execute|plan|react`,
+        `  ${chalk.hex(THEME.accent)('/plan')}           — toggle plan/execute`,
         `  ${chalk.hex(THEME.accent)('/model')} [name]  — list or switch model`,
         `  ${chalk.hex(THEME.accent)('/tasks')}          — show all tasks`,
         `  ${chalk.hex(THEME.accent)('/clear')}          — clear session`,
@@ -457,25 +426,27 @@ export async function runTui(
     renderPrompt();
   };
 
+
+  const maybeLogTaskHeadline = (task: PromptTask): void => {
+    const view = ensureTaskView(task);
+    const status = `${STATUS_ICON[view.status] ?? '·'} ${view.status}`;
+    const headline = `${status}  ${simplifyText(view.title, 96)}`;
+    if (lastTaskHeadline.get(task.taskId) === headline) return;
+    lastTaskHeadline.set(task.taskId, headline);
+    log(`${chalk.hex(THEME.textMuted)('task')} ${chalk.hex(statusColor(view.status))(status)}  ${chalk.bold.hex(THEME.textSoft)(simplifyText(view.title, 96))}`);
+  };
+
   // ── Event subscription ────────────────────────────────────────────────────
 
   const unsubscribe = master.subscribe((event) => {
     if (event.type === 'task_created') {
-      const view = ensureTaskView(event.task);
-      log(`${chalk.hex(THEME.textMuted)('  new task')}  ${chalk.bold.hex(THEME.accent)(view.title)}`);
+      maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
 
     if (event.type === 'task_updated') {
-      const prev = tasks.get(event.task.taskId);
-      const prevTitle = prev?.title;
-      ensureTaskView(event.task);
-      const view = tasks.get(event.task.taskId)!;
-      // If title just got generated (summary arrived), print the rename
-      if (prevTitle && prevTitle !== view.title && prevTitle === simplifyText(event.task.prompt, 72)) {
-        log(`${chalk.hex(THEME.textMuted)('  →')} ${chalk.bold.hex(THEME.accent)(view.title)}`);
-      }
+      maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
@@ -572,7 +543,17 @@ export async function runTui(
 
   // ── Input handling ────────────────────────────────────────────────────────
 
-  process.stdin.setRawMode?.(true);
+  readline.emitKeypressEvents(process.stdin);
+  if (process.stdin.isTTY) process.stdin.setRawMode(true);
+
+  process.stdin.on('keypress', (_str, key) => {
+    if (!key) return;
+    if (key.name === 'tab' && key.shift) {
+      mode = mode === 'plan' ? 'execute' : 'plan';
+      log(chalk.hex(THEME.textMuted)(`Mode: ${mode}`));
+      return;
+    }
+  });
 
   // Handle Ctrl+C manually for graceful double-tap exit
   process.on('SIGINT', () => {
