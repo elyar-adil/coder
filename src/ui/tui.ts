@@ -114,6 +114,30 @@ const STATUS_ICON: Record<string, string> = {
 
 // ── Stdout helpers ──────────────────────────────────────────────────────────
 
+// ── Summary bar ─────────────────────────────────────────────────────────────
+
+function renderSummaryBar(tasks: Map<string, TaskView>, taskOrder: string[]): string {
+  const cols = process.stdout.columns ?? 80;
+  const userTaskIds = taskOrder.filter((id) => id !== '__system__');
+  if (userTaskIds.length === 0) return '';
+
+  const parts = userTaskIds.map((id) => {
+    const view = tasks.get(id);
+    if (!view) return '';
+    const icon = STATUS_ICON[view.status] ?? '·';
+    const colored = chalk.hex(statusColor(view.status))(icon);
+    const title = chalk.hex(THEME.textSoft)(simplifyText(view.title, 18));
+    return `${colored} ${title}`;
+  }).filter(Boolean);
+
+  const bar = parts.join(chalk.hex(THEME.textMuted)('  ·  '));
+  const label = chalk.hex(THEME.textMuted)('tasks: ');
+  const raw = stripAnsi(label + bar);
+  if (raw.length <= cols) return label + bar;
+  // Avoid slicing ANSI-colored text, which can break terminal escape sequences.
+  return `${label}${chalk.hex(THEME.textMuted)('…')}`;
+}
+
 export async function runTui(
   master: MasterCoordinator,
   modelName: string,
@@ -433,6 +457,7 @@ export async function runTui(
     const headline = `${status}  ${simplifyText(view.title, 96)}`;
     if (lastTaskHeadline.get(task.taskId) === headline) return;
     lastTaskHeadline.set(task.taskId, headline);
+    log(`${chalk.hex(THEME.textMuted)('task')} ${chalk.hex(statusColor(view.status))(status)}  ${chalk.bold.hex(THEME.textSoft)(simplifyText(view.title, 96))}`);
   };
 
   // ── Event subscription ────────────────────────────────────────────────────
