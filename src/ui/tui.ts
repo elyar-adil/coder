@@ -486,64 +486,28 @@ export async function runTui(
     }
 
     if (event.type === 'task_mailbox_updated') {
-      const view = tasks.get(event.taskId);
-      const prefix = view ? taskPrefix(view) : event.taskId;
-      log(`${prefix}  ${chalk.hex(THEME.warning)(`update queued: ${simplifyText(event.message.text, 100)}`)}`);
-      renderPrompt();
       return;
     }
 
     if (event.type === 'task_phase') {
-      const view = tasks.get(event.taskId);
-      const prefix = view ? taskPrefix(view) : event.taskId;
-      log(`${prefix}  ${chalk.bold.hex(THEME.warning)(phaseText(event.phase, event.note))}`);
-      renderPrompt();
       return;
     }
 
     if (event.type === 'task_output') {
-      appendStream(event.taskId, event.text);
       return;
     }
 
     if (event.type === 'tool_call') {
-      flushStream(event.taskId);
-      const view = tasks.get(event.taskId);
-      const prefix = view ? taskPrefix(view) : event.taskId;
-      if (event.tool === 'write_file' || event.tool === 'edit_file') {
-        log(`${prefix}  ${chalk.hex(THEME.accent)(`editing: ${simplifyText(event.input, 80)}`)}`);
-      } else if (event.tool === 'bash') {
-        log(`${prefix}  ${chalk.hex(THEME.textMuted)(`$ ${simplifyText(event.input, 100)}`)}`);
-      } else if (event.tool !== 'read_file' && event.tool !== 'list_dir') {
-        log(`${prefix}  ${chalk.hex(THEME.textMuted)(`${event.tool}`)}`);
-      }
-      renderPrompt();
       return;
     }
 
     if (event.type === 'tool_result') {
-      if (event.tool === 'write_file' || event.tool === 'edit_file') {
-        log(renderMarkdown(event.output, 96));
-      } else if (event.tool === 'bash') {
-        const firstLine = event.output.split('\n')[0] ?? '';
-        if (firstLine.trim()) {
-          log(chalk.hex(THEME.textMuted)(`  ${simplifyText(firstLine, 140)}`));
-        }
-      }
-      renderPrompt();
       return;
     }
 
     if (event.type === 'clarification_requested') {
       activeClarification = event.clarification;
-      const view = tasks.get(event.taskId);
-      const prefix = view ? taskPrefix(view) : event.taskId;
-      log(`${prefix}  ${chalk.bold.hex(THEME.warning)(`? ${event.clarification.question}`)}`);
-      if (event.clarification.choices.length > 0) {
-        for (const choice of event.clarification.choices) {
-          log(`  ${chalk.hex(THEME.accent)('•')} ${choice}`);
-        }
-      }
+      log(chalk.hex(THEME.warning)('Need your input to continue. Please answer the prompt.'));
       renderPrompt();
       return;
     }
@@ -555,11 +519,10 @@ export async function runTui(
       const view = tasks.get(event.taskId);
       const prefix = view ? taskPrefix(view) : event.taskId;
       if (event.status === 'completed') {
-        log(`${prefix}  ${chalk.bold.hex(THEME.success)('Done.')}`);
         history.push({ role: 'assistant', content: event.result });
         void saveHistory();
       } else {
-        log(`${prefix}  ${chalk.bold.hex(THEME.danger)(`Failed: ${event.result}`)}`);
+        log(chalk.hex(THEME.danger)(`Task failed: ${event.result}`));
       }
       renderPrompt();
     }

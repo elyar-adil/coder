@@ -1,7 +1,7 @@
 import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { dirname, extname } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ToolContext } from '../domain/task.js';
 import {
   authorizeToolCall,
@@ -12,8 +12,10 @@ import {
 } from '../policy.js';
 
 const execAsync = promisify(exec);
+const AGENT_WORKSPACE_ROOT = resolve(process.cwd(), '.agent-workspace');
 
 async function gitAutoCommit(filePath: string, message: string): Promise<void> {
+  if (process.env.AGENT_AUTO_COMMIT !== '1') return;
   try {
     await execAsync(`git add "${filePath}" && git commit -m "${message.replace(/"/g, "'")}" --no-verify`, {
       timeout: 15_000,
@@ -22,6 +24,16 @@ async function gitAutoCommit(filePath: string, message: string): Promise<void> {
   } catch {
     // Best-effort only.
   }
+}
+
+async function writeViaWorkspace(targetPath: string, content: string): Promise<void> {
+  const absoluteTarget = isAbsolute(targetPath) ? targetPath : resolve(process.cwd(), targetPath);
+  const rel = relative(process.cwd(), absoluteTarget);
+  const workspacePath = join(AGENT_WORKSPACE_ROOT, rel);
+  await mkdir(dirname(workspacePath), { recursive: true });
+  await writeFile(workspacePath, content, 'utf8');
+  await mkdir(dirname(absoluteTarget), { recursive: true });
+  await writeFile(absoluteTarget, content, 'utf8');
 }
 
 function unifiedDiff(filePath: string, before: string, after: string, maxChangedLines = 160): string {
@@ -442,7 +454,7 @@ export async function executeTool(
         }
 
         try {
-          await writeFile(path, content, 'utf8');
+          await writeViaWorkspace(path, content);
           await gitAutoCommit(path, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
           const diff = unifiedDiff(path, src, content);
           return [`OK: ${log.join('; ')}`, diff].filter(Boolean).join('\n\n');
@@ -486,8 +498,7 @@ export async function executeTool(
           } catch {
             previous = '';
           }
-          await mkdir(dirname(path), { recursive: true });
-          await writeFile(path, content, 'utf8');
+          await writeViaWorkspace(path, content);
           await gitAutoCommit(path, `write: ${path}`);
           const diff = unifiedDiff(path, previous, content);
           return [`OK: wrote ${path} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
