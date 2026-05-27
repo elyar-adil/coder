@@ -927,6 +927,12 @@ function renderDiffLines(text) {
     return `<span class="diff-line ${cls}">${escHtml(line) || ' '}</span>`;
   }).join('');
 }
+function patchDiffMarkdown(patch) {
+  return (patch?.files || [])
+    .map(file => file.diff || (file.path ? `Changed ${file.path}` : ''))
+    .filter(Boolean)
+    .join('\n\n');
+}
 function looksLikeDiff(text) {
   return /(^|\n)(diff --git|@@ |--- |\+\+\+ |[+-][^\n]*)/.test(String(text ?? ''));
 }
@@ -1726,12 +1732,20 @@ function handleEvent(msg) {
       const els = taskEls.get(event.taskId);
       if (els) {
         const patch = event.patch || {};
-        const item = document.createElement('div');
-        item.className = 'mailbox-msg';
+        let item = null;
+        if (patch.patchId) {
+          item = Array.from(els.card.querySelectorAll('[data-patch-id]')).find(el => el.dataset.patchId === patch.patchId);
+        }
+        if (!item) {
+          item = document.createElement('div');
+          item.className = 'mailbox-msg';
+          if (patch.patchId) item.dataset.patchId = patch.patchId;
+          els.card.insertBefore(item, els.streamEl);
+        }
         const label = event.type.replace('writer_', '').replaceAll('_', ' ');
         const detail = event.error || patch.result || patch.summary || '';
-        item.innerHTML = `<div class="mailbox-from">writer ${escHtml(label)}</div><div class="msg-text md">${renderMarkdown(detail)}</div>`;
-        els.card.insertBefore(item, els.streamEl);
+        const diff = patchDiffMarkdown(patch);
+        item.innerHTML = `<div class="mailbox-from">writer ${escHtml(label)}</div><div class="msg-text md">${renderMarkdown([detail, diff].filter(Boolean).join('\n\n'))}</div>`;
         scrollToBottom();
       }
       break;

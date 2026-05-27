@@ -8,11 +8,12 @@ import * as readline from 'node:readline';
 import chalk from 'chalk';
 import stripAnsi from 'strip-ansi';
 
+import { unifiedDiff } from '../diff.js';
 import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
 import type { BackendConfig } from '../backend.js';
 import type { MasterCoordinator } from '../runtime/coordinator.js';
-import type { ClarificationRequest, LlmTraceEntry, PromptTask, TaskMode, TaskPhase, TaskStatus } from '../domain/task.js';
+import type { ClarificationRequest, LlmTraceEntry, PatchSet, PromptTask, TaskMode, TaskPhase, TaskStatus } from '../domain/task.js';
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
   plan: 'Planning',
@@ -113,6 +114,32 @@ const STATUS_ICON: Record<string, string> = {
   queued: '·',
 };
 
+const TASK_MODES: TaskMode[] = ['execute', 'plan', 'react'];
+
+function nextMode(current: TaskMode): TaskMode {
+  return TASK_MODES[(TASK_MODES.indexOf(current) + 1) % TASK_MODES.length] ?? 'execute';
+}
+
+function formatDateTime(value?: string): string {
+  if (!value) return 'unknown';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat(undefined, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+}
+
+function patchDiffMarkdown(patch?: PatchSet): string {
+  const files = patch?.files ?? [];
+  const sections = files
+    .map((file) => file.diff || (file.before !== undefined ? unifiedDiff(file.path, file.before, file.after) : `Changed ${file.path}`))
+    .filter(Boolean);
+  return sections.join('\n\n');
+}
+
 // ── Stdout helpers ──────────────────────────────────────────────────────────
 
 // ── Summary bar ─────────────────────────────────────────────────────────────
@@ -150,7 +177,7 @@ export async function runTui(
   const convStore = new ConversationStore();
   await convStore.init();
 
-  const sessionId = `session-${Date.now()}`;
+  let sessionId = `session-${Date.now()}`;
   const history: ConversationEntry[] = [];
   const tasks = new Map<string, TaskView>();
   const taskOrder: string[] = [];
@@ -160,6 +187,7 @@ export async function runTui(
   let exiting = false;
   let streamBuffers = new Map<string, string>(); // taskId -> pending stream text
   const lastTaskHeadline = new Map<string, string>();
+  const shownPatchDiffs = new Set<string>();
 
   // ── readline setup ────────────────────────────────────────────────────────
 
@@ -291,6 +319,57 @@ export async function runTui(
     await convStore.save(sessionId, history);
   };
 
+  const currentTasks = (): PromptTask[] => master.listTasks({ sessionId });
+
+  const hydrateTasksForSession = (): void => {
+    tasks.clear();
+    taskOrder.length = 0;
+    streamBuffers = new Map<string, string>();
+    lastTaskHeadline.clear();
+    shownPatchDiffs.clear();
+    activeClarification = undefined;
+    for (const task of currentTasks().sort((left, right) => (left.updatedAt ?? '').localeCompare(right.updatedAt ?? ''))) {
+      ensureTaskView(task);
+    }
+  };
+
+  const resolveSessionTaskId = (requested: string | undefined): string | undefined => {
+    const needle = requested?.trim();
+    if (!needle) return undefined;
+    const candidates = currentTasks();
+    const exact = candidates.find((task) => task.taskId === needle);
+    if (exact) return exact.taskId;
+    const matches = candidates.filter((task) => task.taskId.startsWith(needle));
+    return matches.length === 1 ? matches[0]!.taskId : undefined;
+  };
+
+  const formatTaskDetail = (task: PromptTask): string => {
+    const phases = task.phaseEvents.slice(-8)
+      .map((phase) => `- ${phase.phase}: ${phase.status}${phase.note ? ` (${phase.note})` : ''}`)
+      .join('\n');
+    const plan = task.plan.length > 0
+      ? task.plan.map((step, index) => `${index + 1}. **${step.title}** - ${step.detail}`).join('\n')
+      : '';
+    const patches = (task.patchSets ?? [])
+      .map((patch) => `- ${patch.patchId.slice(0, 8)} ${patch.status}: ${patch.summary}`)
+      .join('\n');
+    return [
+      `## ${titleForTask(task) || task.taskId}`,
+      `- id: ${task.taskId}`,
+      `- status: ${task.status}`,
+      `- mode: ${task.mode}`,
+      task.kind ? `- kind: ${task.kind}` : '',
+      task.updatedAt ? `- updated: ${formatDateTime(task.updatedAt)}` : '',
+      '',
+      `**Prompt**`,
+      task.prompt,
+      phases ? `\n**Recent Phases**\n${phases}` : '',
+      plan ? `\n**Plan**\n${plan}` : '',
+      patches ? `\n**Patches**\n${patches}` : '',
+      task.result ? `\n**Result**\n${task.result}` : '',
+    ].filter(Boolean).join('\n');
+  };
+
   const applyModelSelection = async (requested: string): Promise<void> => {
     if (!resolveModel) {
       logSystem('/model switching is not configured for this session.');
@@ -383,6 +462,7 @@ export async function runTui(
     }
 
     if (cmd === 'tasks') {
+      hydrateTasksForSession();
       const userTasks = taskOrder.filter((id) => id !== '__system__');
       if (userTasks.length === 0) {
         logSystem('No tasks yet.');
@@ -397,6 +477,98 @@ export async function runTui(
         const time = chalk.hex(THEME.textMuted)(formatTimestamp(view.updatedAt));
         log(`  ${icon}  ${title}  ${chalk.hex(THEME.textMuted)(id.slice(0, 8))}  ${time}`);
       }
+      return;
+    }
+
+    if (cmd === 'view') {
+      const taskId = resolveSessionTaskId(args[0]);
+      if (!taskId) {
+        logSystem('Usage: /view <taskId>');
+        return;
+      }
+      const task = master.getTask(taskId);
+      if (!task || task.sessionId !== sessionId) {
+        logSystem(`Task not found in this session: ${args[0]}`);
+        return;
+      }
+      log(renderMarkdown(formatTaskDetail(task), 96));
+      for (const patch of task.patchSets ?? []) {
+        const diff = patchDiffMarkdown(patch);
+        if (diff) log(renderMarkdown(`### Patch ${patch.patchId.slice(0, 8)} Diff\n${diff}`, 96));
+      }
+      return;
+    }
+
+    if (cmd === 'approve') {
+      const taskId = resolveSessionTaskId(args[0]);
+      if (!taskId) {
+        logSystem('Usage: /approve <taskId>');
+        return;
+      }
+      const task = master.getTask(taskId);
+      if (!task || task.sessionId !== sessionId) {
+        logSystem(`Task not found in this session: ${args[0]}`);
+        return;
+      }
+      if (task.mode !== 'plan') {
+        logSystem('Only plan-mode tasks can be approved.');
+        return;
+      }
+      const accepted = await master.executePlan(taskId);
+      log(accepted
+        ? chalk.hex(THEME.success)(`Approved plan task ${taskId.slice(0, 8)}.`)
+        : chalk.hex(THEME.warning)(`Plan task ${taskId.slice(0, 8)} is not ready to execute.`));
+      renderPrompt();
+      return;
+    }
+
+    if (cmd === 'resume') {
+      const taskId = resolveSessionTaskId(args[0]);
+      if (!taskId) {
+        logSystem('Usage: /resume <taskId>');
+        return;
+      }
+      const task = master.getTask(taskId);
+      if (!task || task.sessionId !== sessionId) {
+        logSystem(`Task not found in this session: ${args[0]}`);
+        return;
+      }
+      const accepted = await master.resolveTask(taskId);
+      log(accepted
+        ? chalk.hex(THEME.success)(`Resumed task ${taskId.slice(0, 8)}.`)
+        : chalk.hex(THEME.warning)(`Task ${taskId.slice(0, 8)} cannot be resumed from status ${task.status}.`));
+      renderPrompt();
+      return;
+    }
+
+    if (cmd === 'sessions') {
+      const sessions = await convStore.list();
+      if (sessions.length === 0) {
+        logSystem('No saved sessions yet.');
+        return;
+      }
+      log(chalk.bold.hex(THEME.accentStrong)('Saved sessions:'));
+      for (const session of sessions.slice(0, 20)) {
+        const marker = session.id === sessionId ? chalk.hex(THEME.success)('*') : ' ';
+        log(`  ${marker} ${chalk.hex(THEME.text)(session.id)}  ${chalk.hex(THEME.textMuted)(`${session.entries} entries  ${formatDateTime(session.modified)}`)}`);
+      }
+      logSystem('Use /load <sessionId> to switch sessions.');
+      return;
+    }
+
+    if (cmd === 'load') {
+      const requestedSessionId = args[0]?.trim();
+      if (!requestedSessionId) {
+        logSystem('Usage: /load <sessionId>');
+        return;
+      }
+      const loaded = await convStore.load(requestedSessionId);
+      sessionId = requestedSessionId;
+      history.length = 0;
+      history.push(...loaded);
+      hydrateTasksForSession();
+      log(chalk.hex(THEME.success)(`Loaded ${sessionId}: ${history.length} history entries, ${taskOrder.length} task snapshots.`));
+      renderPrompt();
       return;
     }
 
@@ -428,6 +600,11 @@ export async function runTui(
         `  ${chalk.hex(THEME.accent)('/plan')}           — toggle plan/execute`,
         `  ${chalk.hex(THEME.accent)('/model')} [name]  — list or switch model`,
         `  ${chalk.hex(THEME.accent)('/tasks')}          — show all tasks`,
+        `  ${chalk.hex(THEME.accent)('/view')} <taskId>  — inspect task details and diffs`,
+        `  ${chalk.hex(THEME.accent)('/approve')} <id>   — execute an approved plan task`,
+        `  ${chalk.hex(THEME.accent)('/resume')} <id>    — resume a queued/running task`,
+        `  ${chalk.hex(THEME.accent)('/sessions')}       — list saved sessions`,
+        `  ${chalk.hex(THEME.accent)('/load')} <id>      — load a saved session`,
         `  ${chalk.hex(THEME.accent)('/clear')}          — clear session`,
         `  ${chalk.hex(THEME.accent)('/history')}        — conversation history`,
         `  ${chalk.hex(THEME.accent)('/exit')}           — quit`,
@@ -531,6 +708,10 @@ export async function runTui(
     }
 
     if (event.type === 'tool_result') {
+      if (event.tool === 'submit_patch' || /```(?:diff|patch)\b/i.test(event.output)) {
+        flushStream(event.taskId);
+        appendLine(event.taskId, renderMarkdown(event.output, 96));
+      }
       return;
     }
 
@@ -559,6 +740,27 @@ export async function runTui(
         log(chalk.hex(THEME.danger)(`Task failed: ${event.result}`));
       }
       renderPrompt();
+      return;
+    }
+
+    if (
+      event.type === 'writer_patch_submitted' ||
+      event.type === 'writer_patch_applied' ||
+      event.type === 'writer_patch_verified' ||
+      event.type === 'writer_conflict' ||
+      event.type === 'writer_failed'
+    ) {
+      const task = master.getTask(event.taskId);
+      if (task) ensureTaskView(task);
+      const label = event.type.replace('writer_', '').replaceAll('_', ' ');
+      const detail = ('error' in event ? event.error : undefined) || event.patch.result || event.patch.summary || label;
+      appendLine(event.taskId, chalk.hex(THEME.textMuted)(`writer ${label}: ${simplifyText(detail, 120)}`));
+      const diff = patchDiffMarkdown(event.patch);
+      if (diff && event.patch.patchId && !shownPatchDiffs.has(event.patch.patchId)) {
+        shownPatchDiffs.add(event.patch.patchId);
+        appendLine(event.taskId, renderMarkdown(diff, 96));
+      }
+      renderPrompt();
     }
   });
 
@@ -570,7 +772,7 @@ export async function runTui(
   process.stdin.on('keypress', (_str, key) => {
     if (!key) return;
     if (key.name === 'tab' && key.shift) {
-      mode = mode === 'plan' ? 'execute' : 'plan';
+      mode = nextMode(mode);
       log(chalk.hex(THEME.textMuted)(`Mode: ${mode}`));
       return;
     }

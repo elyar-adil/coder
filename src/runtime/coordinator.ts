@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 
 import type { BackendConfig } from '../backend.js';
 import { chatStream } from '../backend.js';
+import { unifiedDiff } from '../diff.js';
 import type {
   ClarificationRequest,
   MasterEvent,
@@ -183,6 +184,10 @@ export class MasterCoordinator {
   private subagentManager = new SubagentManager(2);
   private fileLocks = new FileLockManager();
   private sessionTaskIds = new Set<string>();
+  private pendingRouteTasks = new Set<string>();
+  private routingTasks = new Set<string>();
+  private scheduledTaskRuns = new Set<string>();
+  private runningTasks = new Set<string>();
   private sharedSummary = '';
   private basePolicy = getToolPolicy();
   private llmTracingEnabled = false;
@@ -273,6 +278,15 @@ export class MasterCoordinator {
 
   private emitTaskUpdate(task: PromptTask): void {
     this.emit({ type: 'task_updated', task: this.cloneTask(task), ts: now() });
+  }
+
+  private enqueueTaskRun(taskId: string): void {
+    if (this.pendingRouteTasks.has(taskId) || this.routingTasks.has(taskId) || this.runningTasks.has(taskId) || this.scheduledTaskRuns.has(taskId)) return;
+    this.scheduledTaskRuns.add(taskId);
+    setTimeout(() => {
+      this.scheduledTaskRuns.delete(taskId);
+      void this.runTask(taskId);
+    }, 0);
   }
 
   private rememberTask(task: PromptTask): void {
@@ -572,6 +586,9 @@ export class MasterCoordinator {
   ): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
+    this.pendingRouteTasks.delete(taskId);
+    if (this.routingTasks.has(taskId)) return;
+    this.routingTasks.add(taskId);
 
     try {
       const decision = await this.routePrompt(originalPrompt, conversationHistory, {
@@ -607,9 +624,7 @@ export class MasterCoordinator {
           target.status = 'queued';
           await this.persist(target);
           this.emitTaskUpdate(target);
-          setTimeout(() => {
-            void this.runTask(targetId);
-          }, 0);
+          this.enqueueTaskRun(targetId);
         }
         await this.completeInquiryTask(task, `Queued update for task ${targetId.slice(0, 8)}.`, [targetId]);
         return;
@@ -651,9 +666,7 @@ export class MasterCoordinator {
           target.status = 'queued';
           await this.persist(target);
           this.emitTaskUpdate(target);
-          setTimeout(() => {
-            void this.runTask(targetId);
-          }, 0);
+          this.enqueueTaskRun(targetId);
         }
         await this.completeInquiryTask(task, `Queued update for task ${targetId.slice(0, 8)}.`, [targetId]);
         return;
@@ -677,6 +690,8 @@ export class MasterCoordinator {
       this.emitTaskUpdate(task);
       this.emit({ type: 'task_done', taskId: task.taskId, result: task.result, status: 'failed', ts: now() });
       await this.emitUserVisibleMessage(task, task.result);
+    } finally {
+      this.routingTasks.delete(taskId);
     }
   }
 
@@ -694,6 +709,7 @@ export class MasterCoordinator {
       artifactDir: options.artifactDir,
     });
     this.taskHistory.set(task.taskId, [...conversationHistory]);
+    this.pendingRouteTasks.add(task.taskId);
     setTimeout(() => {
       void this.routeAndRunAcceptedTask(task.taskId, prompt, conversationHistory);
     }, 0);
@@ -769,12 +785,13 @@ export class MasterCoordinator {
   async executePlan(taskId: string): Promise<boolean> {
     const task = this.tasks.get(taskId);
     if (!task || task.mode !== 'plan' || task.plan.length === 0) return false;
+    if (this.pendingRouteTasks.has(taskId) || this.routingTasks.has(taskId) || this.runningTasks.has(taskId) || this.scheduledTaskRuns.has(taskId)) return true;
     task.mode = 'execute';
     task.prompt = `Execute this approved plan:\n${task.plan.map((step) => `- ${step.title}: ${step.detail}`).join('\n')}`;
     task.status = 'queued';
     await this.persist(task);
     this.emitTaskUpdate(task);
-    void this.runTask(taskId);
+    this.enqueueTaskRun(taskId);
     return true;
   }
 
@@ -782,12 +799,11 @@ export class MasterCoordinator {
     const task = this.tasks.get(taskId);
     if (!task) return false;
     if (task.status === 'completed' || task.status === 'failed') return false;
+    if (this.pendingRouteTasks.has(taskId) || this.routingTasks.has(taskId) || this.runningTasks.has(taskId) || this.scheduledTaskRuns.has(taskId)) return true;
     task.status = 'queued';
     await this.persist(task);
     this.emitTaskUpdate(task);
-    setTimeout(() => {
-      void this.runTask(taskId);
-    }, 0);
+    this.enqueueTaskRun(taskId);
     return true;
   }
 
@@ -863,6 +879,22 @@ export class MasterCoordinator {
     };
   }
 
+  private async fillPatchDiffs(patch: PatchSet): Promise<void> {
+    await Promise.all(patch.files.map(async (file) => {
+      if (file.diff) return;
+      let before = file.before;
+      if (before === undefined) {
+        const absolutePath = isAbsolute(file.path) ? file.path : resolve(process.cwd(), file.path);
+        try {
+          before = await readFile(absolutePath, 'utf8');
+        } catch {
+          before = '';
+        }
+      }
+      file.diff = unifiedDiff(file.path, before, file.after);
+    }));
+  }
+
   private async persistPatch(task: PromptTask, patch: PatchSet): Promise<void> {
     patch.updatedAt = now();
     const existing = task.patchSets ?? [];
@@ -894,6 +926,8 @@ export class MasterCoordinator {
       createdAt: now(),
       updatedAt: now(),
     };
+
+    await this.fillPatchDiffs(patch);
 
     await this.persistPatch(task, patch);
     this.emit({ type: 'writer_patch_submitted', taskId, patch: this.clonePatch(patch), ts: now() });
@@ -1128,9 +1162,7 @@ export class MasterCoordinator {
         target.status = 'queued';
         await this.persist(target);
         this.emitTaskUpdate(target);
-        setTimeout(() => {
-          void this.runTask(targetId);
-        }, 0);
+        this.enqueueTaskRun(targetId);
       }
       const result = `Queued update for task ${targetId.slice(0, 8)}.`;
       await this.completeInquiryTask(task, result, [targetId]);
@@ -1180,9 +1212,7 @@ export class MasterCoordinator {
         target.status = 'queued';
         await this.persist(target);
         this.emitTaskUpdate(target);
-        setTimeout(() => {
-          void this.runTask(targetId);
-        }, 0);
+        this.enqueueTaskRun(targetId);
       }
       const result = `Queued update for task ${targetId.slice(0, 8)}.`;
       await this.completeInquiryTask(task, result, [targetId]);
@@ -1208,6 +1238,8 @@ export class MasterCoordinator {
   private async runTask(taskId: string): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
+    if (this.runningTasks.has(taskId)) return;
+    this.runningTasks.add(taskId);
 
     const conversationHistory = this.taskHistory.get(taskId) ?? [];
     task.status = 'running';
@@ -1250,6 +1282,7 @@ export class MasterCoordinator {
         }
       }
     } finally {
+      this.runningTasks.delete(taskId);
       if (['completed', 'failed'].includes(task.status)) {
         this.rememberTask(task);
       }

@@ -32,4 +32,11 @@ describe('web static assets', () => {
     assertBalancedCss(extractSingleBlock(html, 'style'));
     assert.doesNotThrow(() => new Function(extractSingleBlock(html, 'script')));
   });
+
+  it('updates writer patch cards by patch id instead of appending duplicates', async () => {
+    const html = await readFile(resolve('src/ui/public/index.html'), 'utf8');
+    const script = extractSingleBlock(html, 'script');
+    assert.match(script, /data-patch-id/);
+    assert.match(script, /patchDiffMarkdown/);
+  });
 });

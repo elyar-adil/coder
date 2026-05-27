@@ -383,6 +383,33 @@ describe('MasterCoordinator', () => {
     });
   });
 
+  describe('resolveTask', () => {
+    test('does not bypass routing for a newly accepted queued task', async () => {
+      const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+      const taskId = await coordinator.acceptPrompt('u', 'p', 'execute', [], { sessionId: 'resume' });
+
+      const accepted = await coordinator.resolveTask(taskId);
+      assert.equal(accepted, true);
+      assert.equal(coordinator.getTask(taskId)?.status, 'queued');
+    });
+
+    test('does not start a second runner for an already running task', async () => {
+      const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+      const taskId = await coordinator.acceptPrompt('u', 'p', 'execute', [], { sessionId: 'resume' });
+      const task = coordinator.getTask(taskId);
+      assert.ok(task);
+      task!.status = 'running';
+
+      const runningTasks = (coordinator as unknown as { runningTasks: Set<string> }).runningTasks;
+      runningTasks.add(taskId);
+
+      const accepted = await coordinator.resolveTask(taskId);
+      assert.equal(accepted, true);
+      assert.equal(runningTasks.size, 1);
+      assert.equal(coordinator.getTask(taskId)?.status, 'running');
+    });
+  });
+
   describe('parsePlan', () => {
     test('parses valid JSON array', () => {
       const input = '[{"title":"Step 1","detail":"Do X"},{"title":"Step 2","detail":"Do Y"}]';
