@@ -11,7 +11,8 @@
  *    "model": "gemma4:31b-cloud",
  *    "backend": "openai",
  *    "apiKey": "sk-...",
- *    "defaultMode": "execute"
+ *    "defaultMode": "execute",
+ *    "artifactsDir": ".agent-workspace/artifacts",
  *    "models": {
  *      "fast": {
  *        "model": "provider-model-id",
@@ -37,6 +38,7 @@ export interface AgentConfig {
   apiKey?: string;
   defaultMode?: 'execute' | 'plan' | 'react';
   policyLevel?: 'strict' | 'moderate' | 'off';
+  artifactsDir?: string;
   models?: Record<string, AgentModelConfig>;
 }
 
@@ -68,6 +70,9 @@ function parseConfig(raw: string): AgentConfig {
   }
   if (parsed.defaultMode && !['execute', 'plan', 'react'].includes(parsed.defaultMode)) {
     throw new Error(`Invalid defaultMode "${parsed.defaultMode}" in config. Use "execute", "plan", or "react".`);
+  }
+  if (parsed.artifactsDir !== undefined && typeof parsed.artifactsDir !== 'string') {
+    throw new Error('Invalid artifactsDir in config. Use a string path.');
   }
   if (parsed.models) {
     for (const [name, modelConfig] of Object.entries(parsed.models)) {
@@ -116,12 +121,16 @@ export async function loadConfigWithPath(): Promise<LoadedConfig> {
 
 export async function saveSelectedModel(model: string): Promise<string> {
   const loaded = await loadConfigWithPath();
-  const path = loaded.path ?? join(process.cwd(), '.agentrc');
   const nextConfig: AgentConfig = {
     ...loaded.config,
     model,
   };
 
-  await writeFile(path, `${JSON.stringify(nextConfig, null, 2)}\n`, 'utf8');
+  return saveConfig(nextConfig, loaded.path);
+}
+
+export async function saveConfig(config: AgentConfig, existingPath?: string): Promise<string> {
+  const path = existingPath ?? (await loadConfigWithPath()).path ?? join(process.cwd(), '.agentrc');
+  await writeFile(path, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
   return path;
 }

@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import { MasterCoordinator } from './master.js';
 import { runTui } from './tui.js';
+import { runWeb } from './web.js';
 import { loadConfig, saveSelectedModel } from './config.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
@@ -77,6 +78,36 @@ async function main(): Promise<void> {
           };
         },
         { verbose: Boolean(globalOpts.verbose) },
+      );
+    });
+
+  program
+    .command('web')
+    .description('Launch the Web UI — multi-agent dashboard served at http://127.0.0.1:3131')
+    .option('--port <port>', 'HTTP port (default 3131)', '3131')
+    .option('--host <host>', 'Bind host (default 127.0.0.1)', '127.0.0.1')
+    .action(async (cmdOpts: { port: string; host: string }) => {
+      const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
+      resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
+      master.setBackendConfig(resolvedModel.config);
+      master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
+      await runWeb(
+        master,
+        resolvedModel.name,
+        (name?: string) => resolveModelConfig(fileConfig, name),
+        Array.from(new Set([
+          ...(fileConfig.model ? [fileConfig.model] : []),
+          ...Object.keys(fileConfig.models ?? {}),
+        ])),
+        async (name: string) => {
+          await saveSelectedModel(name);
+          fileConfig = { ...fileConfig, model: name };
+        },
+        {
+          port: Number(cmdOpts.port) || 3131,
+          host: cmdOpts.host ?? '127.0.0.1',
+          verbose: Boolean(globalOpts.verbose),
+        },
       );
     });
 

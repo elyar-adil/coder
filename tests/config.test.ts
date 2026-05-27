@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { loadConfig, saveSelectedModel } from '../src/config.js';
+import { loadConfig, saveConfig, saveSelectedModel } from '../src/config.js';
 
 describe('loadConfig', () => {
   it('returns empty config when no .agentrc exists', async () => {
@@ -31,6 +31,39 @@ describe('loadConfig', () => {
       const raw = await readFile(path, 'utf8');
       const parsed = JSON.parse(raw) as { model?: string };
       assert.equal(parsed.model, 'gemmaLocal');
+    } finally {
+      process.chdir(cwd);
+    }
+  });
+
+  it('persists model aliases and artifact directory', async () => {
+    const cwd = process.cwd();
+    const dir = await mkdtemp(join(tmpdir(), 'coder-config-models-'));
+    process.chdir(dir);
+
+    try {
+      const path = await saveConfig({
+        model: 'fast',
+        artifactsDir: '.agent-workspace/artifacts',
+        models: {
+          fast: {
+            backend: 'openai',
+            model: 'gpt-test',
+            contextWindow: 128000,
+            requestOptions: { temperature: 0.2 },
+          },
+        },
+      });
+      const raw = await readFile(path, 'utf8');
+      const parsed = JSON.parse(raw) as {
+        model?: string;
+        artifactsDir?: string;
+        models?: { fast?: { model?: string; requestOptions?: { temperature?: number } } };
+      };
+      assert.equal(parsed.model, 'fast');
+      assert.equal(parsed.artifactsDir, '.agent-workspace/artifacts');
+      assert.equal(parsed.models?.fast?.model, 'gpt-test');
+      assert.equal(parsed.models?.fast?.requestOptions?.temperature, 0.2);
     } finally {
       process.chdir(cwd);
     }

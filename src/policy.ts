@@ -53,20 +53,20 @@ function withinRoots(target: string, roots: string[]): boolean {
   });
 }
 
-export function authorizeToolCall(policy: ToolPolicy, name: string, args: Record<string, string>): PolicyDecision {
+export function authorizeToolCall(policy: ToolPolicy, name: string, args: Record<string, unknown>): PolicyDecision {
   if (policy.level === 'off') return { ok: true };
 
-  if (name === 'read_file' || name === 'write_file' || name === 'list_dir') {
-    const path = args['path'] ?? '.';
+  if (name === 'read_file' || name === 'write_file' || name === 'edit_file' || name === 'list_dir') {
+    const path = typeof args['path'] === 'string' ? args['path'] : '.';
     const target = isAbsolute(path) ? path : resolve(policy.workspaceRoot, path);
-    const roots = name === 'write_file' ? policy.allowedWriteRoots : policy.allowedReadRoots;
+    const roots = name === 'write_file' || name === 'edit_file' ? policy.allowedWriteRoots : policy.allowedReadRoots;
     if (!withinRoots(target, roots)) {
       return { ok: false, ruleId: 'path_outside_workspace', reason: `Path not allowed: ${path}` };
     }
   }
 
   if (name === 'bash') {
-    const cmd = args['command'] ?? '';
+    const cmd = typeof args['command'] === 'string' ? args['command'] : '';
     if (!cmd) return { ok: false, ruleId: 'missing_command', reason: 'bash command is required' };
     if (policy.bashDenylist.some((bad) => cmd.includes(bad))) {
       return { ok: false, ruleId: 'bash_denylist', reason: `Command blocked by denylist: ${cmd}` };

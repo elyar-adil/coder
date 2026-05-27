@@ -1,0 +1,1839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Coder — Multi-Agent Web UI</title>
+<style>
+/* ── Reset + base ───────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg:           #0b1117;
+  --surface:      #111921;
+  --surface2:     #18232f;
+  --surface3:     #1e2e3e;
+  --border:       #243040;
+  --border-soft:  #1c2a38;
+  --text:         #d7e0ea;
+  --text-muted:   #6b8099;
+  --text-soft:    #95aabf;
+  --accent:       #5ba3c9;
+  --accent-hi:    #79bfe0;
+  --plan-accent:  #c87dc0;
+  --success:      #6daa7f;
+  --warning:      #c9a050;
+  --danger:       #c07070;
+  --running:      #5ba3c9;
+  --tool-bg:      #0d1a26;
+  --radius:       6px;
+  --radius-lg:    8px;
+  --font-mono:    'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, monospace;
+  --font-sans:    'Inter', system-ui, sans-serif;
+  --sidebar-w:    260px;
+}
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 13.5px;
+  line-height: 1.55;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+a { color: var(--accent); text-decoration: none; }
+button { cursor: pointer; border: none; background: none; color: inherit; font: inherit; }
+input, textarea, select {
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  font: inherit;
+  outline: none;
+  transition: border-color .15s;
+}
+input:focus, textarea:focus, select:focus { border-color: var(--accent); }
+code, pre { font-family: var(--font-mono); }
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 99px; }
+
+/* ── Layout ─────────────────────────────────────────────────────────────── */
+#app { display: flex; flex: 1; overflow: hidden; }
+
+/* ── Sidebar ────────────────────────────────────────────────────────────── */
+#sidebar {
+  width: var(--sidebar-w);
+  min-width: var(--sidebar-w);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+#sidebar-header {
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid var(--border-soft);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+#sidebar-header .logo { font-size: 17px; font-weight: 700; letter-spacing: -.3px; color: var(--text); }
+#sidebar-header .ver { font-size: 11px; color: var(--text-muted); margin-left: auto; }
+
+.section-label {
+  padding: 10px 16px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+#task-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+
+.task-item {
+  padding: 7px 16px;
+  cursor: pointer;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border-left: 2px solid transparent;
+  transition: background .1s, border-color .1s;
+  user-select: none;
+}
+.task-item:hover { background: var(--surface2); }
+.task-item.active { background: var(--surface2); border-left-color: var(--accent); }
+.task-item .task-icon { flex-shrink: 0; margin-top: 1px; font-size: 12px; }
+.task-item .task-meta { min-width: 0; flex: 1; }
+.task-item .task-title { font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--text-soft); }
+.task-item.active .task-title { color: var(--text); }
+.task-item .task-status { font-size: 10.5px; color: var(--text-muted); }
+.task-item .task-time { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
+
+.mode-row {
+  display: flex; gap: 4px;
+}
+.mode-btn {
+  flex: 1;
+  padding: 4px 0;
+  border-radius: var(--radius);
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  transition: all .15s;
+  text-align: center;
+}
+.mode-btn.active { background: var(--surface3); border-color: var(--accent); color: var(--accent-hi); }
+.mode-btn:hover:not(.active) { border-color: var(--border); color: var(--text-soft); }
+
+.model-row {
+  display: flex; align-items: center; gap: 6px;
+}
+.model-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+#model-select {
+  flex: 1;
+  padding: 3px 6px;
+  font-size: 11.5px;
+  border-radius: var(--radius);
+  height: 26px;
+  min-width: 0;
+}
+#model-config-btn {
+  height: 26px;
+  padding: 0 8px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-soft);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+#model-config-btn:hover { border-color: var(--accent); color: var(--accent-hi); }
+
+/* ── Main panel ─────────────────────────────────────────────────────────── */
+#main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
+}
+
+/* ── Feed / timeline ────────────────────────────────────────────────────── */
+#feed {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 0;
+}
+
+/* ── Message row ────────────────────────────────────────────────────────── */
+.msg-row {
+  display: flex;
+  gap: 10px;
+  padding: 6px 20px 6px 16px;
+  align-items: flex-start;
+  animation: fadeIn .18s ease;
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+.msg-row:hover { background: rgba(255,255,255,.015); }
+
+.msg-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.msg-avatar.user    { background: #2a3f55; color: var(--accent-hi); }
+.msg-avatar.master  { background: #2e1e42; color: #b88ee0; }
+.msg-avatar.task    { background: #1b2e3f; color: var(--accent); }
+.msg-avatar.system  { background: var(--surface2); color: var(--text-muted); }
+.msg-avatar.tool    { background: #1b2b1e; color: var(--success); }
+.msg-avatar.warn    { background: #2e2210; color: var(--warning); }
+
+.msg-body { flex: 1; min-width: 0; }
+.msg-header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 2px;
+}
+.msg-from { font-size: 12px; font-weight: 600; color: var(--text-soft); }
+.msg-from.master-label { color: #b88ee0; }
+.msg-from.user-label { color: var(--accent); }
+.msg-ts { font-size: 10.5px; color: var(--text-muted); }
+
+.msg-text {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.6;
+  word-break: break-word;
+  white-space: pre-wrap;
+}
+.msg-text.md { white-space: normal; }
+.msg-text.md p,
+.stream-block.md p { margin: 0 0 8px; }
+.msg-text.md p:last-child,
+.stream-block.md p:last-child { margin-bottom: 0; }
+.msg-text.md h1,
+.msg-text.md h2,
+.msg-text.md h3,
+.stream-block.md h1,
+.stream-block.md h2,
+.stream-block.md h3 {
+  margin: 10px 0 5px;
+  line-height: 1.25;
+  color: var(--text);
+  font-weight: 700;
+}
+.msg-text.md h1,
+.stream-block.md h1 { font-size: 16px; }
+.msg-text.md h2,
+.stream-block.md h2 { font-size: 14.5px; }
+.msg-text.md h3,
+.stream-block.md h3 { font-size: 13.5px; }
+.msg-text.md ul,
+.msg-text.md ol,
+.stream-block.md ul,
+.stream-block.md ol {
+  padding-left: 22px;
+  margin: 4px 0 8px;
+}
+.msg-text.md li,
+.stream-block.md li { margin: 2px 0; }
+.msg-text.md blockquote,
+.stream-block.md blockquote {
+  margin: 6px 0 8px;
+  padding: 4px 0 4px 10px;
+  border-left: 2px solid var(--border);
+  color: var(--text-soft);
+}
+.msg-text.md pre,
+.stream-block.md pre {
+  margin: 6px 0 8px;
+  padding: 8px 10px;
+  overflow-x: auto;
+  white-space: pre;
+  background: var(--tool-bg);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+}
+.msg-text.md code,
+.stream-block.md code {
+  font-family: var(--font-mono);
+  font-size: .92em;
+  background: rgba(255,255,255,.055);
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.msg-text.md pre code,
+.stream-block.md pre code {
+  display: block;
+  padding: 0;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: var(--code-text, var(--text));
+}
+.diff-line {
+  display: block;
+  min-height: 1.45em;
+  padding: 0 6px;
+  margin: 0 -4px;
+  white-space: pre;
+}
+.diff-add {
+  color: #9fcca7;
+  background: rgba(109,170,127,.09);
+}
+.diff-del {
+  color: #d58a8a;
+  background: rgba(192,112,112,.1);
+}
+.diff-hunk {
+  color: var(--accent-hi);
+  background: rgba(91,163,201,.08);
+}
+.diff-file {
+  color: var(--text-soft);
+  font-weight: 600;
+}
+.msg-text.md a,
+.stream-block.md a { color: var(--accent-hi); text-decoration: underline; text-underline-offset: 2px; }
+.msg-text.md a.file-link,
+.stream-block.md a.file-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 1px 7px;
+  border: 1px solid rgba(91,163,201,.35);
+  border-radius: 999px;
+  background: rgba(91,163,201,.09);
+  text-decoration: none;
+  vertical-align: baseline;
+}
+.msg-text.md a.file-link code,
+.stream-block.md a.file-link code {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: transparent;
+  border: none;
+  padding: 0;
+}
+
+/* ── Task header card ───────────────────────────────────────────────────── */
+.task-card {
+  margin: 10px 16px 0;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+.task-card-header {
+  padding: 10px 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  border-bottom: 1px solid var(--border-soft);
+  background: var(--surface2);
+}
+.task-card-header .task-badge {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  padding: 2px 7px;
+  border-radius: 99px;
+  text-transform: uppercase;
+}
+.task-card-header .task-badge.worker { background: #1a2e44; color: var(--accent); }
+.task-card-header .task-badge.derived_worker,
+.task-card-header .task-badge.sync_worker { background: #1f2f26; color: var(--success); }
+.task-card-header .task-badge.inquiry { background: #2a1e38; color: #b88ee0; }
+.task-card-header .task-badge.plan-mode { background: #251635; color: #d090d8; }
+.task-card-id { font-size: 10.5px; color: var(--text-muted); font-family: var(--font-mono); }
+.task-card-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-status-pill {
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: .03em;
+  flex-shrink: 0;
+}
+
+/* ── Phase bar ──────────────────────────────────────────────────────────── */
+.phase-bar {
+  padding: 6px 14px;
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  background: var(--surface);
+}
+.phase-dot {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 10.5px;
+  font-weight: 500;
+  background: var(--surface3);
+  color: var(--text-muted);
+  border: 1px solid transparent;
+}
+.phase-dot.active { background: #162640; border-color: var(--accent); color: var(--accent-hi); }
+.phase-dot.done   { background: #112218; border-color: var(--success); color: var(--success); }
+.phase-dot.failed { background: #250f0f; border-color: var(--danger);  color: var(--danger);  }
+.phase-dot .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.phase-dot.active .dot { animation: pulse .9s ease-in-out infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
+
+/* ── Stream / output block ──────────────────────────────────────────────── */
+.stream-block {
+  margin: 0 14px 0;
+  padding: 8px 10px;
+  background: var(--tool-bg);
+  border-left: 2px solid var(--border);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.stream-block.md {
+  font-family: var(--font-sans);
+  white-space: normal;
+  word-break: break-word;
+}
+
+/* ── Tool call collapsible ──────────────────────────────────────────────── */
+.tool-call {
+  margin: 4px 14px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--tool-bg);
+  overflow: hidden;
+}
+.tool-call-header {
+  padding: 6px 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-size: 12px;
+  user-select: none;
+}
+.tool-call-header:hover { background: rgba(255,255,255,.03); }
+.tool-name { font-family: var(--font-mono); font-size: 11.5px; color: var(--success); font-weight: 600; }
+.tool-chevron { margin-left: auto; font-size: 10px; color: var(--text-muted); transition: transform .15s; }
+.tool-call.open .tool-chevron { transform: rotate(90deg); }
+.tool-body { display: none; }
+.tool-call.open .tool-body { display: block; }
+.tool-io {
+  padding: 6px 10px 8px;
+  border-top: 1px solid var(--border-soft);
+}
+.tool-io-label { font-size: 10px; font-weight: 700; color: var(--text-muted); text-transform: uppercase; letter-spacing: .07em; margin-bottom: 3px; }
+.tool-io pre {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 160px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+.tool-output-body {
+  font-size: 11.5px;
+  color: var(--text-soft);
+  max-height: 220px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+.tool-output-body pre {
+  margin: 0;
+  max-height: none;
+}
+
+/* ── Mailbox message ────────────────────────────────────────────────────── */
+.mailbox-msg {
+  margin: 4px 14px;
+  padding: 5px 10px;
+  border-left: 2px solid var(--plan-accent);
+  background: rgba(200,125,192,.06);
+  font-size: 12px;
+  color: var(--text-soft);
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
+.mailbox-from { font-size: 10.5px; color: var(--plan-accent); margin-bottom: 2px; }
+
+/* ── Clarification panel ────────────────────────────────────────────────── */
+#clarification-bar {
+  display: none;
+  background: #1e1410;
+  border-top: 1px solid var(--warning);
+  padding: 10px 16px;
+  gap: 10px;
+  align-items: flex-start;
+}
+#clarification-bar.visible { display: flex; }
+.clarify-question { flex: 1; font-size: 13px; color: var(--warning); line-height: 1.5; }
+.clarify-question .cq-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; margin-bottom: 4px; opacity: .7; }
+.clarify-choices { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.clarify-choice-btn {
+  padding: 4px 10px;
+  border-radius: 99px;
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-size: 12px;
+  background: transparent;
+  cursor: pointer;
+  transition: background .1s;
+}
+.clarify-choice-btn:hover { background: rgba(201,160,80,.12); }
+
+/* ── Input bar ──────────────────────────────────────────────────────────── */
+#input-bar {
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding: 10px 16px 12px;
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+#composer-controls {
+  width: 268px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  justify-content: flex-end;
+}
+#composer-controls .mode-btn {
+  height: 26px;
+  padding: 0;
+}
+#composer-controls .model-row {
+  height: 26px;
+}
+#prompt-input {
+  flex: 1;
+  resize: none;
+  padding: 9px 12px;
+  font-size: 13.5px;
+  border-radius: var(--radius-lg);
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  min-height: 40px;
+  max-height: 160px;
+  overflow-y: auto;
+  line-height: 1.5;
+}
+#send-btn {
+  padding: 9px 18px;
+  background: var(--accent);
+  color: #05111d;
+  font-weight: 700;
+  font-size: 13px;
+  border-radius: var(--radius-lg);
+  border: none;
+  cursor: pointer;
+  transition: background .15s;
+  flex-shrink: 0;
+  height: 40px;
+  display: flex; align-items: center;
+}
+#send-btn:hover { background: var(--accent-hi); }
+#send-btn:disabled { opacity: .5; cursor: default; }
+
+/* ── Model configuration ───────────────────────────────────────────────── */
+#model-config-modal {
+  position: fixed;
+  inset: 0;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0,0,0,.5);
+  z-index: 50;
+}
+#model-config-modal.visible { display: flex; }
+#model-config-panel {
+  width: min(760px, 100%);
+  max-height: min(760px, calc(100vh - 36px));
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 18px 50px rgba(0,0,0,.35);
+}
+.config-head,
+.config-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.config-actions {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: none;
+}
+.config-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--text);
+}
+#model-config-close {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-muted);
+}
+#model-config-close:hover { color: var(--text); border-color: var(--accent); }
+#model-config-form {
+  padding: 14px;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.field.full { grid-column: 1 / -1; }
+.field label,
+.check-row {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  padding: 7px 8px;
+  font-size: 12px;
+}
+.field textarea {
+  min-height: 86px;
+  resize: vertical;
+  font-family: var(--font-mono);
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.check-row input { width: auto; }
+.config-btn {
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text-soft);
+}
+.config-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #05111d;
+  font-weight: 700;
+}
+.config-error {
+  margin-right: auto;
+  color: var(--danger);
+  font-size: 12px;
+}
+
+/* ── Status chips ───────────────────────────────────────────────────────── */
+.s-completed { background: rgba(109,170,127,.15); color: var(--success); }
+.s-failed     { background: rgba(192,112,112,.15); color: var(--danger);  }
+.s-running    { background: rgba(91,163,201,.15);  color: var(--running); }
+.s-queued     { background: rgba(107,128,153,.12); color: var(--text-muted); }
+.s-blocked    { background: rgba(201,160,80,.12);  color: var(--warning); }
+.s-waiting_user { background: rgba(201,160,80,.18); color: var(--warning); }
+
+/* ── Empty state ────────────────────────────────────────────────────────── */
+#empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  gap: 10px;
+  opacity: .35;
+  pointer-events: none;
+}
+#empty-state .big { font-size: 36px; }
+#empty-state .label { font-size: 14px; color: var(--text-muted); }
+
+/* ── Connection pill ────────────────────────────────────────────────────── */
+#conn-status {
+  position: fixed;
+  bottom: 62px;
+  right: 14px;
+  font-size: 11px;
+  padding: 3px 10px;
+  border-radius: 99px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  display: flex; align-items: center; gap: 5px;
+  transition: opacity .3s;
+  z-index: 10;
+}
+#conn-status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
+#conn-status.connected .dot { background: var(--success); }
+#conn-status.disconnected .dot { background: var(--danger); }
+
+/* ── Scrolled-to-bottom indicator ───────────────────────────────────────── */
+#scroll-btn {
+  display: none;
+  position: fixed;
+  bottom: 70px;
+  right: 90px;
+  background: var(--surface3);
+  border: 1px solid var(--border);
+  border-radius: 99px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+  z-index: 9;
+  transition: opacity .2s;
+}
+@media (max-width: 760px) {
+  #input-bar { flex-direction: column; }
+  #composer-controls { width: 100%; }
+  #model-config-form { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div id="app">
+  <!-- ── Sidebar ── -->
+  <aside id="sidebar">
+    <div id="sidebar-header">
+      <span class="logo">⬡ Coder</span>
+      <span class="ver" id="model-label">—</span>
+    </div>
+    <div class="section-label">Tasks</div>
+    <div id="task-list">
+      <div id="empty-sidebar" style="padding:12px 16px;font-size:12px;color:var(--text-muted);">No tasks yet.</div>
+    </div>
+  </aside>
+
+  <!-- ── Main ── -->
+  <main id="main">
+    <div id="feed">
+      <div id="empty-state">
+        <div class="big">⬡</div>
+        <div class="label">Start a conversation to see the agent flow.</div>
+      </div>
+    </div>
+    <div id="clarification-bar">
+      <div class="clarify-question">
+        <div class="cq-label">Agent needs your input</div>
+        <div id="clarify-text"></div>
+        <div class="clarify-choices" id="clarify-choices"></div>
+      </div>
+    </div>
+    <div id="input-bar">
+      <div id="composer-controls">
+        <div class="mode-row" role="group" aria-label="Mode">
+          <button class="mode-btn active" data-mode="execute" title="Execute">Execute</button>
+          <button class="mode-btn" data-mode="plan" title="Plan">Plan</button>
+          <button class="mode-btn" data-mode="react" title="React">React</button>
+        </div>
+        <div class="model-row">
+          <span class="model-label">Model</span>
+          <select id="model-select"><option>—</option></select>
+          <button id="model-config-btn" type="button" title="Configure model">Config</button>
+        </div>
+      </div>
+      <textarea id="prompt-input" rows="1" placeholder="Message Coder…"></textarea>
+      <button id="send-btn">Send</button>
+    </div>
+  </main>
+</div>
+
+<div id="model-config-modal" aria-hidden="true">
+  <div id="model-config-panel" role="dialog" aria-modal="true" aria-labelledby="model-config-title">
+    <div class="config-head">
+      <div class="config-title" id="model-config-title">Model</div>
+      <button id="model-config-close" type="button" title="Close">x</button>
+    </div>
+    <form id="model-config-form">
+      <div class="field">
+        <label for="cfg-alias">Alias</label>
+        <input id="cfg-alias" name="alias" autocomplete="off" required />
+      </div>
+      <div class="field">
+        <label for="cfg-model">Provider model</label>
+        <input id="cfg-model" name="model" autocomplete="off" required />
+      </div>
+      <div class="field">
+        <label for="cfg-backend">Backend</label>
+        <select id="cfg-backend" name="backend">
+          <option value="">Auto</option>
+          <option value="ollama">Ollama</option>
+          <option value="openai">OpenAI</option>
+          <option value="anthropic">Anthropic</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="cfg-base-url">Base URL</label>
+        <input id="cfg-base-url" name="baseUrl" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="cfg-api-key">API key</label>
+        <input id="cfg-api-key" name="apiKey" type="password" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="cfg-context-window">Context window</label>
+        <input id="cfg-context-window" name="contextWindow" type="number" min="1" step="1" />
+      </div>
+      <div class="field">
+        <label for="cfg-temperature">Temperature</label>
+        <input id="cfg-temperature" name="temperature" type="number" min="0" max="2" step="0.01" />
+      </div>
+      <div class="field">
+        <label for="cfg-top-p">Top P</label>
+        <input id="cfg-top-p" name="topP" type="number" min="0" max="1" step="0.01" />
+      </div>
+      <div class="field">
+        <label for="cfg-max-tokens">Max tokens</label>
+        <input id="cfg-max-tokens" name="maxTokens" type="number" min="1" step="1" />
+      </div>
+      <div class="field">
+        <label for="cfg-artifacts-dir">Artifacts directory</label>
+        <input id="cfg-artifacts-dir" name="artifactsDir" autocomplete="off" />
+      </div>
+      <div class="field full">
+        <label for="cfg-extra-body">Extra body JSON</label>
+        <textarea id="cfg-extra-body" name="extraBody" spellcheck="false"></textarea>
+      </div>
+      <div class="field full">
+        <label class="check-row"><input id="cfg-select" name="select" type="checkbox" checked /> Select after save</label>
+      </div>
+    </form>
+    <div class="config-actions">
+      <div class="config-error" id="model-config-error"></div>
+      <button class="config-btn" id="model-config-cancel" type="button">Cancel</button>
+      <button class="config-btn primary" id="model-config-save" type="button">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="conn-status" class="disconnected">
+  <span class="dot"></span>
+  <span id="conn-label">connecting…</span>
+</div>
+<button id="scroll-btn">↓ new messages</button>
+
+<script>
+// ── State ─────────────────────────────────────────────────────────────────
+const state = {
+  tasks: new Map(),        // taskId → task object
+  taskOrder: [],           // ordered list of taskIds (excluding __system__)
+  activeTaskId: null,
+  mode: 'execute',
+  model: '—',
+  modelAliases: [],
+  modelConfig: null,
+  configPath: '',
+  artifactDir: '',
+  pendingClarification: null, // { taskId, clarificationId, question, choices }
+  atBottom: true,
+};
+
+// Tool call state per taskId: Map<taskId, Map<toolKey, {input,output}>>
+const toolState = new Map();
+
+// Phase state per taskId
+const phaseState = new Map();
+
+// DOM element refs per task for live updates
+const taskEls = new Map(); // taskId → { card, statusPill, phaseBar, streamEl, streamText }
+
+// ── DOM refs ─────────────────────────────────────────────────────────────
+const feed           = document.getElementById('feed');
+const taskList       = document.getElementById('task-list');
+const emptySidebar   = document.getElementById('empty-sidebar');
+const emptyState     = document.getElementById('empty-state');
+const connStatus     = document.getElementById('conn-status');
+const connLabel      = document.getElementById('conn-label');
+const modelLabel     = document.getElementById('model-label');
+const modelSelect    = document.getElementById('model-select');
+const modelConfigBtn = document.getElementById('model-config-btn');
+const modelConfigModal = document.getElementById('model-config-modal');
+const modelConfigForm = document.getElementById('model-config-form');
+const modelConfigClose = document.getElementById('model-config-close');
+const modelConfigCancel = document.getElementById('model-config-cancel');
+const modelConfigSave = document.getElementById('model-config-save');
+const modelConfigError = document.getElementById('model-config-error');
+const modeButtons    = document.querySelectorAll('.mode-btn');
+const promptInput    = document.getElementById('prompt-input');
+const sendBtn        = document.getElementById('send-btn');
+const clarBar        = document.getElementById('clarification-bar');
+const clarText       = document.getElementById('clarify-text');
+const clarChoices    = document.getElementById('clarify-choices');
+const scrollBtn      = document.getElementById('scroll-btn');
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+function fmtTime(ts) {
+  if (!ts) return '';
+  const d = new Date(ts);
+  return isNaN(d) ? '' : d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+}
+function truncate(s, n=80) { return s && s.length > n ? s.slice(0,n-1)+'…' : (s||''); }
+function escHtml(s) {
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function escAttr(s) {
+  return escHtml(s).replace(/'/g,'&#39;');
+}
+function diffClass(line) {
+  if (/^(diff --git|index |--- |\+\+\+ )/.test(line)) return 'diff-file';
+  if (line.startsWith('@@')) return 'diff-hunk';
+  if (line.startsWith('+') && !line.startsWith('+++')) return 'diff-add';
+  if (line.startsWith('-') && !line.startsWith('---')) return 'diff-del';
+  return '';
+}
+function renderDiffLines(text) {
+  return String(text ?? '').split('\n').map(line => {
+    const cls = diffClass(line);
+    return `<span class="diff-line ${cls}">${escHtml(line) || ' '}</span>`;
+  }).join('');
+}
+function looksLikeDiff(text) {
+  return /(^|\n)(diff --git|@@ |--- |\+\+\+ |[+-][^\n]*)/.test(String(text ?? ''));
+}
+function displayFileName(filePath) {
+  const normalized = normalizeLocalFilePath(filePath).replace(/[?#].*$/, '');
+  const parts = normalized.split(/[\\/]+/).filter(Boolean);
+  return parts.at(-1) || 'download';
+}
+const FILE_EXT_PATTERN = '(?:pptx?|pdf|docx?|xlsx?|csv|zip|tar\\.gz|png|jpe?g|gif|webp|svg|html?|md|txt|json)';
+const FILE_EXT_RE = new RegExp('\\.(' + FILE_EXT_PATTERN + ')$', 'i');
+const AUTO_FILE_RE = new RegExp('(^|[\\s([{\'"])((?:file://)?(?:~/|/|\\.{1,2}/)?[A-Za-z0-9_@%+./~-]+\\.' + FILE_EXT_PATTERN + ')(?![A-Za-z0-9_@%+.-])', 'gi');
+function normalizeLocalFilePath(value) {
+  const raw = String(value || '').trim().replace(/^<|>$/g, '');
+  if (!raw) return '';
+  if (raw.startsWith('file://')) {
+    try { return decodeURIComponent(raw.slice('file://'.length)); } catch { return raw.slice('file://'.length); }
+  }
+  return raw;
+}
+function looksLikeDownloadableFile(value) {
+  const path = normalizeLocalFilePath(value);
+  return Boolean(path) && FILE_EXT_RE.test(path) && !/^[a-z][a-z0-9+.-]*:/i.test(path);
+}
+function downloadHref(filePath) {
+  return '/api/download?path=' + encodeURIComponent(normalizeLocalFilePath(filePath));
+}
+function fileLinkHtml(filePath, label) {
+  const path = normalizeLocalFilePath(filePath);
+  const text = displayFileName(path || label);
+  return `<a class="file-link" href="${escAttr(downloadHref(path))}" download title="${escAttr(path)}"><span>Download</span><code>${escHtml(text)}</code></a>`;
+}
+function renderInlineMarkdown(raw) {
+  const tokens = [];
+  const stash = (html) => {
+    const id = tokens.push(html) - 1;
+    return `\uE000${id}\uE001`;
+  };
+  let text = String(raw ?? '');
+
+  text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
+    const trimmed = code.trim();
+    if (looksLikeDownloadableFile(trimmed)) return stash(fileLinkHtml(trimmed, trimmed));
+    return stash(`<code>${escHtml(code)}</code>`);
+  });
+
+  text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, hrefRaw) => {
+    const href = String(hrefRaw).trim().replace(/^<|>$/g, '').replace(/\s+["'][\s\S]*$/, '');
+    if (looksLikeDownloadableFile(href)) return stash(fileLinkHtml(href, label));
+    if (/^(https?:\/\/|mailto:)/i.test(href)) {
+      return stash(`<a href="${escAttr(href)}" target="_blank" rel="noreferrer">${renderInlineMarkdown(label)}</a>`);
+    }
+    return match;
+  });
+
+  let html = escHtml(text);
+  html = html.replace(/https?:\/\/[^\s<)]+/g, (url) => stash(`<a href="${escAttr(url)}" target="_blank" rel="noreferrer">${escHtml(url)}</a>`));
+  html = html.replace(AUTO_FILE_RE, (_m, prefix, filePath) => `${prefix}${stash(fileLinkHtml(filePath, filePath))}`);
+  html = html
+    .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/_([^_]+)_/g, '<em>$1</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  return html.replace(/\uE000(\d+)\uE001/g, (_m, id) => tokens[Number(id)] || '');
+}
+function renderMarkdown(text) {
+  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
+  const out = [];
+  let paragraph = [];
+  let listType = null;
+  let inCode = false;
+  let codeLang = '';
+  let codeLines = [];
+
+  const closeParagraph = () => {
+    if (!paragraph.length) return;
+    out.push(`<p>${renderInlineMarkdown(paragraph.join('\n')).replace(/\n/g, '<br>')}</p>`);
+    paragraph = [];
+  };
+  const closeList = () => {
+    if (!listType) return;
+    out.push(`</${listType}>`);
+    listType = null;
+  };
+  const openList = (type) => {
+    if (listType === type) return;
+    closeParagraph();
+    closeList();
+    out.push(`<${type}>`);
+    listType = type;
+  };
+  const closeCode = () => {
+    const langClass = codeLang ? ` class="language-${escAttr(codeLang)}"` : '';
+    const rawCode = codeLines.join('\n');
+    const codeHtml = codeLang.toLowerCase() === 'diff' || codeLang.toLowerCase() === 'patch'
+      ? renderDiffLines(rawCode)
+      : escHtml(rawCode);
+    out.push(`<pre><code${langClass}>${codeHtml}</code></pre>`);
+    inCode = false;
+    codeLang = '';
+    codeLines = [];
+  };
+
+  for (const rawLine of lines) {
+    const fence = rawLine.match(/^```([A-Za-z0-9_-]*)\s*$/);
+    if (fence) {
+      if (inCode) {
+        closeCode();
+      } else {
+        closeParagraph();
+        closeList();
+        inCode = true;
+        codeLang = fence[1] || '';
+        codeLines = [];
+      }
+      continue;
+    }
+    if (inCode) {
+      codeLines.push(rawLine);
+      continue;
+    }
+
+    if (!rawLine.trim()) {
+      closeParagraph();
+      closeList();
+      continue;
+    }
+
+    const heading = rawLine.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      closeParagraph();
+      closeList();
+      const level = heading[1].length;
+      out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+      continue;
+    }
+
+    if (/^\s*(---|\*\*\*)\s*$/.test(rawLine)) {
+      closeParagraph();
+      closeList();
+      out.push('<hr>');
+      continue;
+    }
+
+    const bullet = rawLine.match(/^\s*[-*+]\s+(.+)$/);
+    if (bullet) {
+      openList('ul');
+      out.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
+      continue;
+    }
+
+    const numbered = rawLine.match(/^\s*\d+\.\s+(.+)$/);
+    if (numbered) {
+      openList('ol');
+      out.push(`<li>${renderInlineMarkdown(numbered[1])}</li>`);
+      continue;
+    }
+
+    const quote = rawLine.match(/^\s*>\s?(.+)$/);
+    if (quote) {
+      closeParagraph();
+      closeList();
+      out.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
+      continue;
+    }
+
+    paragraph.push(rawLine);
+  }
+
+  if (inCode) closeCode();
+  closeParagraph();
+  closeList();
+  return out.join('');
+}
+function statusClass(s) { return 's-'+(s||'queued'); }
+function statusIcon(s) {
+  return {completed:'✓',failed:'✗',running:'⟳',waiting_user:'?',blocked:'⚠',queued:'·'}[s] || '·';
+}
+const PHASES = ['plan','design','inspect_code','write_code','verify','finalize','execute'];
+const PHASE_LABEL = {plan:'Plan',design:'Design',inspect_code:'Inspect',write_code:'Write',verify:'Verify',finalize:'Finalize',execute:'Execute'};
+
+// ── Feed helpers ──────────────────────────────────────────────────────────
+function scrollToBottom(force=false) {
+  if (force || state.atBottom) {
+    feed.scrollTop = feed.scrollHeight;
+  }
+}
+
+feed.addEventListener('scroll', () => {
+  const atB = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  state.atBottom = atB;
+  scrollBtn.style.display = atB ? 'none' : 'block';
+});
+scrollBtn.addEventListener('click', () => { state.atBottom = true; scrollToBottom(true); });
+
+function appendToFeed(el) {
+  const wasEmpty = feed.querySelector('#empty-state');
+  if (wasEmpty) wasEmpty.style.display = 'none';
+  feed.appendChild(el);
+  scrollToBottom();
+}
+
+function makeMsgRow(avatarClass, avatarChar, fromLabel, fromClass, ts, bodyHtml) {
+  const row = document.createElement('div');
+  row.className = 'msg-row';
+  row.innerHTML = `
+    <div class="msg-avatar ${avatarClass}">${avatarChar}</div>
+    <div class="msg-body">
+      <div class="msg-header">
+        <span class="msg-from ${fromClass}">${escHtml(fromLabel)}</span>
+        <span class="msg-ts">${fmtTime(ts)}</span>
+      </div>
+      <div class="msg-text md">${bodyHtml}</div>
+    </div>`;
+  return row;
+}
+function appendSystemMessage(text, warn=false) {
+  const row = makeMsgRow(warn ? 'warn' : 'system', warn ? '!' : 'i', warn ? 'Download' : 'System', '', new Date().toISOString(), renderMarkdown(text));
+  appendToFeed(row);
+}
+
+function fileNameFromDisposition(disposition, fallback) {
+  const utf8 = disposition?.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8?.[1]) {
+    try { return decodeURIComponent(utf8[1]); } catch {}
+  }
+  const quoted = disposition?.match(/filename="([^"]+)"/i);
+  return quoted?.[1] || fallback || 'download';
+}
+
+document.addEventListener('click', async (event) => {
+  const link = event.target.closest?.('a.file-link');
+  if (!link) return;
+  event.preventDefault();
+  const fallback = displayFileName(link.getAttribute('title') || link.textContent || 'download');
+  try {
+    const response = await fetch(link.href, { cache: 'no-store' });
+    if (!response.ok) {
+      let message = `Download failed (${response.status}).`;
+      try {
+        const data = await response.json();
+        if (data?.error) message = data.error;
+      } catch {
+        const text = await response.text().catch(() => '');
+        if (text) message = text.slice(0, 180);
+      }
+      appendSystemMessage(message, true);
+      return;
+    }
+    const blob = await response.blob();
+    const name = fileNameFromDisposition(response.headers.get('Content-Disposition'), fallback);
+    const objectUrl = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = objectUrl;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+  } catch (error) {
+    appendSystemMessage(String(error), true);
+  }
+});
+
+// ── Task card ──────────────────────────────────────────────────────────────
+function makeTaskCard(task) {
+  const wrap = document.createElement('div');
+  wrap.className = 'task-card';
+  wrap.dataset.taskId = task.taskId;
+
+  const modeLabel = task.mode === 'plan' ? 'plan-mode' : (task.kind || 'worker');
+  const short = task.taskId.slice(0,8);
+
+  wrap.innerHTML = `
+    <div class="task-card-header">
+      <span class="task-badge ${modeLabel}">${escHtml(task.kind || task.mode)}</span>
+      <span class="task-card-id">${short}</span>
+      <span class="task-card-title">${escHtml(task.summary || task.prompt || short)}</span>
+      <span class="task-status-pill ${statusClass(task.status)}">${statusIcon(task.status)} ${escHtml(task.status)}</span>
+    </div>
+    <div class="phase-bar" data-phases=""></div>`;
+
+  const phaseBar = wrap.querySelector('.phase-bar');
+  const statusPill = wrap.querySelector('.task-status-pill');
+
+  // Streaming output block (created lazily)
+  const streamEl = document.createElement('div');
+  streamEl.className = 'stream-block md';
+  streamEl.style.display = 'none';
+  wrap.appendChild(streamEl);
+
+  taskEls.set(task.taskId, { card: wrap, statusPill, phaseBar, streamEl, streamText: '' });
+  return wrap;
+}
+
+function updateTaskCard(taskId, updates) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  if (updates.status !== undefined) {
+    els.statusPill.className = `task-status-pill ${statusClass(updates.status)}`;
+    els.statusPill.textContent = `${statusIcon(updates.status)} ${updates.status}`;
+  }
+  if (updates.title !== undefined) {
+    els.card.querySelector('.task-card-title').textContent = updates.title;
+  }
+}
+
+function updatePhaseBar(taskId, phase, phaseStatus, note) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  const bar = els.phaseBar;
+  // Track phases
+  if (!phaseState.has(taskId)) phaseState.set(taskId, new Map());
+  const ps = phaseState.get(taskId);
+  ps.set(phase, { status: phaseStatus, note });
+
+  // Rebuild bar
+  bar.innerHTML = '';
+  const seen = new Set();
+  for (const [p, info] of ps.entries()) {
+    seen.add(p);
+    const dot = document.createElement('span');
+    let cls = 'phase-dot';
+    if (info.status === 'started' || info.status === 'in_progress') cls += ' active';
+    else if (info.status === 'done') cls += ' done';
+    else if (info.status === 'failed') cls += ' failed';
+    dot.className = cls;
+    dot.title = info.note || '';
+    dot.innerHTML = `<span class="dot"></span>${PHASE_LABEL[p]||p}`;
+    bar.appendChild(dot);
+  }
+}
+
+function appendStreamToCard(taskId, text) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  els.streamEl.style.display = 'block';
+  els.streamText = (els.streamText || '') + text;
+  els.streamEl.innerHTML = renderMarkdown(els.streamText);
+  // auto-scroll stream block
+  els.streamEl.scrollTop = els.streamEl.scrollHeight;
+  scrollToBottom();
+}
+
+function renderToolOutput(output) {
+  const text = String(output ?? '');
+  if (looksLikeDiff(text)) return `<pre><code>${renderDiffLines(text)}</code></pre>`;
+  return `<pre>${escHtml(text)}</pre>`;
+}
+
+// ── Tool call in feed ─────────────────────────────────────────────────────
+function upsertToolCall(taskId, tool, input, output) {
+  if (!toolState.has(taskId)) toolState.set(taskId, new Map());
+  const tm = toolState.get(taskId);
+  const key = `${tool}-${input.slice?.(0,40) || ''}`;
+
+  // Find existing el
+  if (tm.has(key)) {
+    const el = tm.get(key);
+    if (output !== undefined) {
+      let ob = el.querySelector('.tool-output-body');
+      if (ob) ob.innerHTML = renderToolOutput(output);
+      el.dataset.hasOutput = 'true';
+    }
+    return;
+  }
+
+  if (output !== undefined && !input) {
+    const pending = Array.from(tm.values()).reverse().find((el) => el.dataset.tool === tool && el.dataset.hasOutput !== 'true');
+    if (pending) {
+      const ob = pending.querySelector('.tool-output-body');
+      if (ob) ob.innerHTML = renderToolOutput(output);
+      pending.dataset.hasOutput = 'true';
+      return;
+    }
+  }
+
+  // Create new
+  const el = document.createElement('div');
+  el.className = 'tool-call';
+  el.dataset.tool = tool;
+  el.dataset.hasOutput = output !== undefined ? 'true' : 'false';
+  el.innerHTML = `
+    <div class="tool-call-header">
+      <span style="color:var(--success);font-size:13px;">⚙</span>
+      <span class="tool-name">${escHtml(tool)}</span>
+      <span style="font-size:11.5px;color:var(--text-muted);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(truncate(input,60))}</span>
+      <span class="tool-chevron">▶</span>
+    </div>
+    <div class="tool-body">
+      <div class="tool-io">
+        <div class="tool-io-label">Input</div>
+        <pre>${escHtml(input)}</pre>
+      </div>
+      ${output !== undefined ? `<div class="tool-io" style="border-top:1px solid var(--border-soft)">
+        <div class="tool-io-label">Output</div>
+        <div class="tool-output-body">${renderToolOutput(output)}</div>
+      </div>` : `<div class="tool-io" style="border-top:1px solid var(--border-soft)">
+        <div class="tool-io-label">Output</div>
+        <div class="tool-output-body" style="color:var(--text-muted)">waiting…</div>
+      </div>`}
+    </div>`;
+  el.querySelector('.tool-call-header').addEventListener('click', () => {
+    el.classList.toggle('open');
+  });
+  tm.set(key, el);
+
+  // Attach to task card or feed
+  const els = taskEls.get(taskId);
+  if (els) {
+    // Insert before streamEl
+    els.card.insertBefore(el, els.streamEl);
+  } else {
+    appendToFeed(el);
+  }
+  scrollToBottom();
+}
+
+// ── Sidebar task item ─────────────────────────────────────────────────────
+function makeSidebarItem(task) {
+  const li = document.createElement('div');
+  li.className = 'task-item';
+  li.dataset.taskId = task.taskId;
+  li.innerHTML = `
+    <span class="task-icon" style="color:${statusToColor(task.status)}">${statusIcon(task.status)}</span>
+    <div class="task-meta">
+      <div class="task-title">${escHtml(truncate(task.summary || task.prompt || task.taskId, 32))}</div>
+      <div class="task-time">${fmtTime(task.updatedAt || task.ts)}</div>
+    </div>`;
+  li.addEventListener('click', () => {
+    document.querySelectorAll('.task-item').forEach(el => el.classList.remove('active'));
+    li.classList.add('active');
+    state.activeTaskId = task.taskId;
+    // Scroll feed to the task card
+    const card = feed.querySelector(`[data-task-id="${task.taskId}"]`);
+    if (card) card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  });
+  return li;
+}
+
+function updateSidebarItem(taskId, status, ts) {
+  const li = taskList.querySelector(`[data-task-id="${taskId}"]`);
+  if (!li) return;
+  li.querySelector('.task-icon').style.color = statusToColor(status);
+  li.querySelector('.task-icon').textContent = statusIcon(status);
+  if (ts) li.querySelector('.task-time').textContent = fmtTime(ts);
+}
+
+function statusToColor(s) {
+  return {completed:'var(--success)',failed:'var(--danger)',running:'var(--accent)',waiting_user:'var(--warning)',blocked:'var(--warning)',queued:'var(--text-muted)'}[s] || 'var(--text-muted)';
+}
+
+// ── Clarification bar ─────────────────────────────────────────────────────
+function showClarification(clr) {
+  state.pendingClarification = clr;
+  clarText.textContent = clr.question || '';
+  clarChoices.innerHTML = '';
+  (clr.choices || []).forEach(c => {
+    const btn = document.createElement('button');
+    btn.className = 'clarify-choice-btn';
+    btn.textContent = c;
+    btn.addEventListener('click', () => submitClarification(c));
+    clarChoices.appendChild(btn);
+  });
+  clarBar.classList.add('visible');
+}
+
+function hideClarification() {
+  state.pendingClarification = null;
+  clarBar.classList.remove('visible');
+}
+
+async function submitClarification(answer) {
+  if (!state.pendingClarification) return;
+  const { taskId, clarificationId } = state.pendingClarification;
+  hideClarification();
+  await fetch('/api/clarify', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ taskId, clarificationId, answer }),
+  });
+  // Show in feed
+  const row = makeMsgRow('user', 'U', 'You (answer)', 'user-label', new Date().toISOString(), renderMarkdown(answer));
+  appendToFeed(row);
+}
+
+// ── Mode buttons ──────────────────────────────────────────────────────────
+modeButtons.forEach(btn => {
+  btn.addEventListener('click', async () => {
+    const m = btn.dataset.mode;
+    await persistMode(m);
+  });
+});
+
+function setMode(m) {
+  state.mode = m;
+  modeButtons.forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+}
+
+async function persistMode(m) {
+  await fetch('/api/mode', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({mode:m}) });
+  setMode(m);
+}
+
+function cycleMode() {
+  const modes = ['execute', 'plan', 'react'];
+  const next = modes[(modes.indexOf(state.mode) + 1) % modes.length];
+  void persistMode(next);
+  promptInput.focus();
+}
+
+// ── Model select ──────────────────────────────────────────────────────────
+modelSelect.addEventListener('change', async () => {
+  const name = modelSelect.value;
+  if (!name || name === '—') return;
+  try {
+    const r = await fetch('/api/model', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({name}) });
+    const data = await r.json().catch(() => ({}));
+    if (r.ok) applyModelPayload(data);
+    else appendSystemMessage(data?.error || `Model switch failed (${r.status}).`, true);
+  } catch (error) {
+    appendSystemMessage(String(error), true);
+  }
+});
+
+function populateModelSelect(aliases, current) {
+  modelSelect.innerHTML = '';
+  const options = Array.from(new Set([current, ...(aliases || [])].filter(Boolean)));
+  if (!options.length) { modelSelect.innerHTML = '<option>—</option>'; return; }
+  options.forEach(a => {
+    const opt = document.createElement('option');
+    opt.value = a; opt.textContent = a;
+    if (a === current) opt.selected = true;
+    modelSelect.appendChild(opt);
+  });
+}
+
+function applyModelPayload(data) {
+  if (!data) return;
+  if (data.model) { state.model = data.model; modelLabel.textContent = data.model; }
+  if (data.modelAliases) { state.modelAliases = data.modelAliases; populateModelSelect(data.modelAliases, data.model || state.model); }
+  const cfg = data.modelConfig || data.config;
+  if (cfg) state.modelConfig = cfg;
+  if (data.configPath) state.configPath = data.configPath;
+  if (data.artifactDir) state.artifactDir = data.artifactDir;
+  if (!data.modelAliases && data.model) populateModelSelect(state.modelAliases, data.model);
+  populateModelForm(state.model);
+}
+
+function currentModelEntry(alias) {
+  return state.modelConfig?.models?.[alias] || null;
+}
+
+function requestOption(entry, key) {
+  return entry?.requestOptions?.[key] ?? '';
+}
+
+function setField(name, value) {
+  const el = modelConfigForm.elements[name];
+  if (!el) return;
+  el.value = value ?? '';
+}
+
+function populateModelForm(alias = state.model) {
+  const entry = currentModelEntry(alias);
+  setField('alias', alias && alias !== '—' ? alias : '');
+  setField('model', entry?.model || (alias && alias !== '—' ? alias : ''));
+  setField('backend', entry?.backend || '');
+  setField('baseUrl', entry?.baseUrl || '');
+  setField('apiKey', '');
+  setField('contextWindow', entry?.contextWindow || '');
+  setField('temperature', requestOption(entry, 'temperature'));
+  setField('topP', requestOption(entry, 'topP'));
+  setField('maxTokens', requestOption(entry, 'maxTokens'));
+  setField('artifactsDir', state.modelConfig?.artifactsDir || '');
+  setField('extraBody', entry?.requestOptions?.extraBody ? JSON.stringify(entry.requestOptions.extraBody, null, 2) : '');
+  modelConfigForm.elements.select.checked = true;
+  modelConfigError.textContent = '';
+}
+
+function openModelConfig() {
+  populateModelForm(modelSelect.value || state.model);
+  modelConfigModal.classList.add('visible');
+  modelConfigModal.setAttribute('aria-hidden', 'false');
+  setTimeout(() => modelConfigForm.elements.alias?.focus(), 0);
+}
+
+function closeModelConfig() {
+  modelConfigModal.classList.remove('visible');
+  modelConfigModal.setAttribute('aria-hidden', 'true');
+  modelConfigError.textContent = '';
+  promptInput.focus();
+}
+
+function readModelForm() {
+  const form = modelConfigForm.elements;
+  return {
+    alias: form.alias.value.trim(),
+    model: form.model.value.trim(),
+    backend: form.backend.value,
+    baseUrl: form.baseUrl.value.trim(),
+    apiKey: form.apiKey.value.trim(),
+    contextWindow: form.contextWindow.value,
+    temperature: form.temperature.value,
+    topP: form.topP.value,
+    maxTokens: form.maxTokens.value,
+    artifactsDir: form.artifactsDir.value.trim(),
+    extraBody: form.extraBody.value.trim(),
+    select: form.select.checked,
+  };
+}
+
+async function saveModelConfig() {
+  modelConfigError.textContent = '';
+  const payload = readModelForm();
+  if (!payload.alias || !payload.model) {
+    modelConfigError.textContent = 'Alias and model are required.';
+    return;
+  }
+  if (payload.extraBody) {
+    try { JSON.parse(payload.extraBody); } catch {
+      modelConfigError.textContent = 'Extra body must be valid JSON.';
+      return;
+    }
+  }
+  modelConfigSave.disabled = true;
+  try {
+    const r = await fetch('/api/models', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await r.json();
+    if (!r.ok) {
+      modelConfigError.textContent = data?.error || `Save failed (${r.status}).`;
+      return;
+    }
+    applyModelPayload(data);
+    closeModelConfig();
+  } catch (error) {
+    modelConfigError.textContent = String(error);
+  } finally {
+    modelConfigSave.disabled = false;
+  }
+}
+
+modelConfigBtn.addEventListener('click', openModelConfig);
+modelConfigClose.addEventListener('click', closeModelConfig);
+modelConfigCancel.addEventListener('click', closeModelConfig);
+modelConfigSave.addEventListener('click', saveModelConfig);
+modelConfigModal.addEventListener('click', (event) => {
+  if (event.target === modelConfigModal) closeModelConfig();
+});
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && modelConfigModal.classList.contains('visible')) closeModelConfig();
+  if (event.key === 'Tab' && event.shiftKey && !modelConfigModal.classList.contains('visible')) {
+    event.preventDefault();
+    cycleMode();
+  }
+});
+
+// ── Send prompt ───────────────────────────────────────────────────────────
+async function sendPrompt() {
+  const text = promptInput.value.trim();
+  if (!text) return;
+  promptInput.value = '';
+  promptInput.style.height = '';
+  sendBtn.disabled = true;
+
+  // Show in feed immediately
+  const row = makeMsgRow('user','U','You','user-label', new Date().toISOString(), renderMarkdown(text));
+  appendToFeed(row);
+
+  try {
+    const r = await fetch('/api/prompt', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, mode: state.mode }),
+    });
+    if (!r.ok) {
+      const data = await r.json().catch(() => ({}));
+      appendSystemMessage(data?.error || `Prompt failed (${r.status}).`, true);
+    }
+  } finally {
+    sendBtn.disabled = false;
+  }
+}
+
+sendBtn.addEventListener('click', sendPrompt);
+promptInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendPrompt(); }
+});
+promptInput.addEventListener('input', () => {
+  promptInput.style.height = 'auto';
+  promptInput.style.height = Math.min(promptInput.scrollHeight, 160) + 'px';
+});
+
+// ── SSE event handler ─────────────────────────────────────────────────────
+function handleEvent(msg) {
+  const { channel, event, tasks, mode, model, modelAliases } = msg;
+
+  if (channel === 'snapshot') {
+    if (mode) setMode(mode);
+    applyModelPayload(msg);
+    (tasks || []).forEach(t => hydrateTask(t));
+    return;
+  }
+
+  if (channel === 'model_changed') {
+    applyModelPayload({
+      model: msg.model,
+      modelAliases: msg.modelAliases,
+      modelConfig: msg.modelConfig,
+      artifactDir: msg.artifactDir,
+    });
+    return;
+  }
+
+  if (channel === 'mode_changed') {
+    setMode(msg.mode);
+    return;
+  }
+
+  if (channel === 'user_message') {
+    // Already shown optimistically; skip to avoid duplicate
+    return;
+  }
+
+  if (!event) return;
+
+  switch (event.type) {
+    case 'task_created': {
+      const task = event.task;
+      if (task.taskId === '__system__') return;
+      if (state.tasks.has(task.taskId)) break;
+      state.tasks.set(task.taskId, task);
+      state.taskOrder.push(task.taskId);
+      emptySidebar.style.display = 'none';
+      const card = makeTaskCard(task);
+      appendToFeed(card);
+      const li = makeSidebarItem(task);
+      taskList.appendChild(li);
+      break;
+    }
+    case 'task_updated': {
+      const task = event.task;
+      if (task.taskId === '__system__') return;
+      state.tasks.set(task.taskId, task);
+      updateTaskCard(task.taskId, { status: task.status, title: task.summary || task.prompt });
+      updateSidebarItem(task.taskId, task.status, event.ts);
+      break;
+    }
+    case 'master_response': {
+      // Presentation events own the main conversation feed; master_response is
+      // kept for API/TUI compatibility.
+      break;
+    }
+    case 'user_visible_message': {
+      const row = makeMsgRow('master','P','Agent','master-label', event.ts, renderMarkdown(event.text));
+      appendToFeed(row);
+      break;
+    }
+    case 'task_phase': {
+      updatePhaseBar(event.taskId, event.phase, event.status, event.note);
+      break;
+    }
+    case 'task_output': {
+      appendStreamToCard(event.taskId, event.text);
+      break;
+    }
+    case 'tool_call': {
+      upsertToolCall(event.taskId, event.tool, event.input, undefined);
+      break;
+    }
+    case 'tool_result': {
+      upsertToolCall(event.taskId, event.tool, '', event.output);
+      break;
+    }
+    case 'task_mailbox_updated': {
+      const mb = event.message;
+      const els = taskEls.get(event.taskId);
+      if (els) {
+        const mbox = document.createElement('div');
+        mbox.className = 'mailbox-msg';
+        mbox.innerHTML = `<div class="mailbox-from">mailbox from ${escHtml(mb.sourceTaskId||'master')}</div><div class="msg-text md">${renderMarkdown(mb.text||'')}</div>`;
+        els.card.insertBefore(mbox, els.streamEl);
+        scrollToBottom();
+      }
+      break;
+    }
+    case 'writer_patch_submitted':
+    case 'writer_patch_applied':
+    case 'writer_patch_verified':
+    case 'writer_conflict':
+    case 'writer_failed': {
+      const els = taskEls.get(event.taskId);
+      if (els) {
+        const patch = event.patch || {};
+        const item = document.createElement('div');
+        item.className = 'mailbox-msg';
+        const label = event.type.replace('writer_', '').replaceAll('_', ' ');
+        const detail = event.error || patch.result || patch.summary || '';
+        item.innerHTML = `<div class="mailbox-from">writer ${escHtml(label)}</div><div class="msg-text md">${renderMarkdown(detail)}</div>`;
+        els.card.insertBefore(item, els.streamEl);
+        scrollToBottom();
+      }
+      break;
+    }
+    case 'subagent_created':
+    case 'subagent_updated': {
+      const sub = event.subagent;
+      // Show a small note under the parent task card
+      const els = taskEls.get(sub.parentTaskId);
+      if (els) {
+        const subId = sub.subagentId || sub.taskId;
+        const id = `subagent-${subId}`;
+        let subEl = els.card.querySelector(`#${id}`);
+        if (!subEl) {
+          subEl = document.createElement('div');
+          subEl.id = id;
+          subEl.style.cssText = 'margin:3px 14px;padding:4px 10px;border-left:2px solid var(--accent);border-radius:0 4px 4px 0;font-size:11.5px;color:var(--text-muted);background:rgba(91,163,201,.05)';
+          subEl.textContent = `subagent ${subId.slice(0,8)} - ${sub.status}`;
+          els.card.insertBefore(subEl, els.streamEl);
+          scrollToBottom();
+        }
+        subEl.textContent = `subagent ${subId.slice(0,8)} - ${sub.status}`;
+      }
+      break;
+    }
+    case 'subagent_output': {
+      const els = taskEls.get(event.parentTaskId);
+      if (els) appendStreamToCard(event.parentTaskId, event.text);
+      break;
+    }
+    case 'clarification_requested': {
+      showClarification({
+        taskId: event.taskId,
+        clarificationId: event.clarification.clarificationId,
+        question: event.clarification.question,
+        choices: event.clarification.choices || [],
+      });
+      break;
+    }
+    case 'clarification_answered': {
+      hideClarification();
+      break;
+    }
+    case 'task_done': {
+      updateTaskCard(event.taskId, { status: event.status });
+      updateSidebarItem(event.taskId, event.status, event.ts);
+      break;
+    }
+  }
+}
+
+// ── Hydrate snapshot tasks ────────────────────────────────────────────────
+function hydrateTask(task) {
+  if (task.taskId === '__system__') return;
+  if (state.tasks.has(task.taskId)) return;
+  state.tasks.set(task.taskId, task);
+  state.taskOrder.push(task.taskId);
+  emptySidebar.style.display = 'none';
+  const card = makeTaskCard(task);
+  appendToFeed(card);
+  const li = makeSidebarItem(task);
+  taskList.appendChild(li);
+  (task.visibleMessages || []).forEach(message => {
+    const row = makeMsgRow('master','P','Agent','master-label', message.ts, renderMarkdown(message.text));
+    appendToFeed(row);
+  });
+}
+
+// ── SSE connection ────────────────────────────────────────────────────────
+let sse = null;
+let reconnectTimer = null;
+
+function connect() {
+  if (sse) { try { sse.close(); } catch {} }
+  sse = new EventSource('/api/events');
+  sse.onopen = () => {
+    connStatus.className = 'connected';
+    connLabel.textContent = 'connected';
+    clearTimeout(reconnectTimer);
+  };
+  sse.onmessage = (e) => {
+    try { handleEvent(JSON.parse(e.data)); } catch {}
+  };
+  sse.onerror = () => {
+    connStatus.className = 'disconnected';
+    connLabel.textContent = 'reconnecting…';
+    sse.close();
+    reconnectTimer = setTimeout(connect, 2500);
+  };
+}
+
+// ── Init ──────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    const r = await fetch('/api/state');
+    const data = await r.json();
+    if (data.mode) setMode(data.mode);
+    applyModelPayload(data);
+    (data.tasks || []).forEach(hydrateTask);
+  } catch {}
+  connect();
+})();
+</script>
+</body>
+</html>

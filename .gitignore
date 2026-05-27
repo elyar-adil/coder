@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 .agentrc
 .agentrc.json
+.agent-workspace/

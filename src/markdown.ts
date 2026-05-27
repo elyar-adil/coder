@@ -19,6 +19,40 @@ const MARKDOWN_THEME = {
   codeRed: '#c97c7c',
 } as const;
 
+export type DiffKind = 'add' | 'del' | 'hunk' | 'file' | 'context';
+
+function isDiffLanguage(lang: string): boolean {
+  return lang.toLowerCase() === 'diff' || lang.toLowerCase() === 'patch';
+}
+
+export function diffKind(line: string): DiffKind {
+  if (/^(diff --git|index |--- |\+\+\+ )/.test(line)) return 'file';
+  if (line.startsWith('@@')) return 'hunk';
+  if (line.startsWith('+') && !line.startsWith('+++')) return 'add';
+  if (line.startsWith('-') && !line.startsWith('---')) return 'del';
+  return 'context';
+}
+
+export function renderDiffLine(line: string): string {
+  switch (diffKind(line)) {
+    case 'add':
+      return chalk.hex(MARKDOWN_THEME.codeGreen)(line);
+    case 'del':
+      return chalk.hex(MARKDOWN_THEME.codeRed)(line);
+    case 'hunk':
+      return chalk.hex(MARKDOWN_THEME.accent)(line);
+    case 'file':
+      return chalk.bold.hex(MARKDOWN_THEME.text)(line);
+    case 'context':
+    default:
+      return chalk.hex(MARKDOWN_THEME.muted)(line);
+  }
+}
+
+function renderCodeLine(lang: string, line: string): string {
+  return isDiffLanguage(lang) ? renderDiffLine(line) : chalk.hex(MARKDOWN_THEME.codeText)(line);
+}
+
 export function inlineMarkdown(text: string): string {
   return text
     .replace(/\*\*\*(.+?)\*\*\*/g, (_m, t: string) => chalk.bold.italic(t))
@@ -49,15 +83,7 @@ export function renderMarkdown(text: string, cols = 80): string {
         const langLabel = codeLang ? chalk.hex(MARKDOWN_THEME.muted).italic(` ${codeLang}`) : '';
         out.push(chalk.hex(MARKDOWN_THEME.codeFence)('┌' + '─'.repeat(Math.max(2, cols - 2))) + langLabel);
         for (const cl of codeLines) {
-          if (codeLang === 'diff') {
-            const color = cl.startsWith('+') ? chalk.hex(MARKDOWN_THEME.codeGreen)
-              : cl.startsWith('-') ? chalk.hex(MARKDOWN_THEME.codeRed)
-              : cl.startsWith('@') ? chalk.hex(MARKDOWN_THEME.accent)
-              : chalk.hex(MARKDOWN_THEME.muted);
-            out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + color(cl));
-          } else {
-            out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + chalk.hex(MARKDOWN_THEME.codeText)(cl));
-          }
+          out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + renderCodeLine(codeLang, cl));
         }
         out.push(chalk.hex(MARKDOWN_THEME.codeFence)('└' + '─'.repeat(Math.max(2, cols - 2))));
         codeLang = '';
@@ -104,7 +130,9 @@ export function renderMarkdown(text: string, cols = 80): string {
 
   if (inCodeBlock && codeLines.length > 0) {
     out.push(chalk.hex(MARKDOWN_THEME.codeFence)('┌─'));
-    for (const cl of codeLines) out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + (codeLang === 'diff' ? (cl.startsWith('+') ? chalk.hex(MARKDOWN_THEME.codeGreen)(cl) : cl.startsWith('-') ? chalk.hex(MARKDOWN_THEME.codeRed)(cl) : chalk.hex(MARKDOWN_THEME.muted)(cl)) : chalk.hex(MARKDOWN_THEME.codeText)(cl)));
+    for (const cl of codeLines) {
+      out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + renderCodeLine(codeLang, cl));
+    }
     out.push(chalk.hex(MARKDOWN_THEME.codeFence)('└─'));
   }
 

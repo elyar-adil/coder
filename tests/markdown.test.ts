@@ -9,7 +9,7 @@ process.env.FORCE_COLOR = '1';
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { inlineMarkdown, renderMarkdown } from '../src/markdown.js';
+import { diffKind, inlineMarkdown, renderMarkdown } from '../src/markdown.js';
 
 describe('inlineMarkdown', () => {
   test('bold with **', () => {
@@ -119,6 +119,21 @@ describe('renderMarkdown', () => {
     assert.ok(result.includes('-old'));
     assert.ok(result.includes('+new'));
     assert.ok(result.includes('@@'));
+  });
+
+  test('renders patch code block as highlighted diff', () => {
+    const result = renderMarkdown('```patch\n--- a.ts\n+++ a.ts\n-old\n+new\n@@ -1 +1 @@\n```', 80);
+    assert.ok(result.includes('-old'));
+    assert.ok(result.includes('+new'));
+    assert.ok(result.includes('@@ -1 +1 @@'));
+  });
+
+  test('classifies diff line categories for highlighting', () => {
+    assert.equal(diffKind('+new'), 'add');
+    assert.equal(diffKind('-old'), 'del');
+    assert.equal(diffKind('@@ -1 +1 @@'), 'hunk');
+    assert.equal(diffKind('--- a/file.ts'), 'file');
+    assert.equal(diffKind(' context'), 'context');
   });
 
   test('handles multiple paragraphs', () => {

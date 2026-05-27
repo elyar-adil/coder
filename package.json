@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "postbuild": "node -e \"const{cpSync,mkdirSync}=require('fs');mkdirSync('dist/ui/public',{recursive:true});cpSync('src/ui/public','dist/ui/public',{recursive:true});\"",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "test": "node --import tsx/esm --test tests/*.test.ts tests/**/*.test.ts",

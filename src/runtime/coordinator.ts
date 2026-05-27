@@ -1,4 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { exec } from 'node:child_process';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, isAbsolute, resolve } from 'node:path';
+import { promisify } from 'node:util';
 
 import type { BackendConfig } from '../backend.js';
 import { chatStream } from '../backend.js';
@@ -6,6 +10,7 @@ import type {
   ClarificationRequest,
   MasterEvent,
   OllamaMsg,
+  PatchSet,
   PlanStep,
   PlannerDecision,
   PromptTask,
@@ -17,7 +22,7 @@ import type {
   TaskPhase,
   ToolContext,
 } from '../domain/task.js';
-import { readOnlyPolicy } from '../policy.js';
+import { clonePolicy, readOnlyPolicy } from '../policy.js';
 import type { PhaseEvent } from '../types.js';
 import {
   CHAT_SYSTEM_PROMPT,
@@ -26,6 +31,7 @@ import {
   MASTER_QUERY_SYSTEM_PROMPT,
   MASTER_ROUTER_SYSTEM_PROMPT,
   MASTER_SYSTEM_PROMPT,
+  PRESENTATION_SYSTEM_PROMPT,
   PLAN_SYSTEM_PROMPT,
   PLANNER_SYSTEM_PROMPT,
   REACT_IMPLEMENT_PROMPT,
@@ -68,13 +74,38 @@ type RouteDecision = {
   prompt: string;
 };
 
+type PromptDispatchOptions = {
+  sessionId?: string;
+  artifactDir?: string;
+};
+
+type ListTaskOptions = {
+  sessionId?: string;
+};
+
+const execAsync = promisify(exec);
+
 function now(): string {
   return new Date().toISOString();
+}
+
+function contentHash(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 function excerpt(value: string | undefined, max = 200): string {
   if (!value) return '';
   return value.length > max ? `${value.slice(0, max - 1)}…` : value;
+}
+
+function artifactContext(artifactDir?: string): string {
+  if (!artifactDir) return '';
+  return [
+    'Artifact workspace:',
+    `- Default session artifact directory: ${artifactDir}`,
+    '- Save temporary deliverables there unless the user explicitly asks for another path or the task is editing repository code.',
+    '- When reporting a generated file, mention only the file name or exact path once; the UI will expose a download link.',
+  ].join('\n');
 }
 
 function parseClarificationChoices(content: string): string[] {
@@ -93,6 +124,27 @@ function parseClarificationChoices(content: string): string[] {
   } catch {
     return [];
   }
+}
+
+function normalizeClarificationChoices(question: string, choices: string[] = []): string[] {
+  const normalized: string[] = [];
+  for (const choice of choices) {
+    const text = choice.trim().replace(/\s+/g, ' ');
+    if (text && !normalized.includes(text)) normalized.push(text);
+  }
+
+  const fallback = [
+    'Proceed with the safest reasonable default',
+    'Use the simplest implementation',
+    'Stop this task and report what is missing',
+    'Keep this task waiting for more context',
+  ];
+  for (const choice of fallback) {
+    if (normalized.length >= 2) break;
+    if (!normalized.includes(choice) && choice !== question.trim()) normalized.push(choice);
+  }
+
+  return normalized.slice(0, 4);
 }
 
 function isRouteAction(value: unknown): value is RouteAction {
@@ -198,6 +250,15 @@ export class MasterCoordinator {
         toolCalls: entry.toolCalls ? [...entry.toolCalls] : undefined,
       })) : undefined,
       pendingClarifications: task.pendingClarifications ? [...task.pendingClarifications] : undefined,
+      artifactDir: task.artifactDir,
+      visibleMessages: task.visibleMessages ? task.visibleMessages.map((message) => ({ ...message })) : undefined,
+      debugEvents: task.debugEvents ? task.debugEvents.map((event) => ({ ...event })) : undefined,
+      patchSets: task.patchSets ? task.patchSets.map((patch) => ({
+        ...patch,
+        files: patch.files.map((file) => ({ ...file })),
+        verificationCommands: [...patch.verificationCommands],
+        conflicts: patch.conflicts ? patch.conflicts.map((conflict) => ({ ...conflict })) : undefined,
+      })) : undefined,
     };
   }
 
@@ -283,17 +344,23 @@ export class MasterCoordinator {
     ].join('\n');
   }
 
-  private routeCandidates(): TaskContextSnapshot[] {
+  private routeCandidates(sessionId?: string, excludeTaskIds: string[] = []): TaskContextSnapshot[] {
+    const excluded = new Set(excludeTaskIds);
     return [...this.tasks.values()]
-      .filter((task) => this.sessionTaskIds.has(task.taskId))
+      .filter((task) => !excluded.has(task.taskId))
+      .filter((task) => sessionId ? task.sessionId === sessionId : this.sessionTaskIds.has(task.taskId))
       .filter((task) => task.kind !== 'clarification')
       .sort((left, right) => (right.updatedAt ?? '').localeCompare(left.updatedAt ?? ''))
       .slice(0, 12)
       .map((task) => this.buildTaskContextSnapshot(task));
   }
 
-  private async routePrompt(prompt: string, conversationHistory: ConversationEntry[] = []): Promise<RouteDecision> {
-    const candidates = this.routeCandidates();
+  private async routePrompt(
+    prompt: string,
+    conversationHistory: ConversationEntry[] = [],
+    options: PromptDispatchOptions & { excludeTaskIds?: string[] } = {},
+  ): Promise<RouteDecision> {
+    const candidates = this.routeCandidates(options.sessionId, options.excludeTaskIds ?? []);
     if (candidates.length === 0) {
       return { action: 'new_task', targetTaskIds: [], reason: 'No existing tasks.', prompt };
     }
@@ -378,15 +445,25 @@ export class MasterCoordinator {
     mode: TaskMode,
     options: {
       kind?: TaskKind;
+      sessionId?: string;
+      agentRole?: PromptTask['agentRole'];
       relatedTaskIds?: string[];
       sharedContext?: string;
       contextSnapshot?: string;
       readOnly?: boolean;
+      artifactDir?: string;
     } = {},
   ): PromptTask {
+    const artifactInfo = artifactContext(options.artifactDir);
+    const sharedContext = [
+      options.sharedContext,
+      artifactInfo,
+    ].filter(Boolean).join('\n\n') || undefined;
     const task: PromptTask = {
       traceId: telemetry.newTraceId(),
       taskId: randomUUID(),
+      sessionId: options.sessionId,
+      agentRole: options.agentRole ?? 'worker',
       userId,
       prompt,
       kind: options.kind ?? 'worker',
@@ -397,8 +474,9 @@ export class MasterCoordinator {
       messages: [],
       pendingClarifications: [],
       relatedTaskIds: options.relatedTaskIds,
-      sharedContext: options.sharedContext,
+      sharedContext,
       contextSnapshot: options.contextSnapshot,
+      artifactDir: options.artifactDir,
       readOnly: options.readOnly,
       updatedAt: now(),
     };
@@ -431,51 +509,193 @@ export class MasterCoordinator {
     }
   }
 
+  private kindForRouteAction(action: RouteAction): TaskKind {
+    if (action === 'derived_task') return 'derived_worker';
+    if (action === 'sync_task') return 'sync_worker';
+    if (action === 'clarify_target') return 'clarification';
+    if (action === 'query_task' || action === 'update_task') return 'inquiry';
+    return 'worker';
+  }
+
+  private async emitUserVisibleMessage(task: PromptTask | undefined, sourceText: string, label = 'presentation'): Promise<string> {
+    const fallback = sourceText.trim();
+    if (!fallback) return '';
+
+    let text = fallback;
+    if (task) {
+      try {
+        const prompt = [
+          `Original user request:\n${task.prompt}`,
+          task.relatedTaskIds?.length ? `Related tasks: ${task.relatedTaskIds.join(', ')}` : '',
+          `Worker/writer result:\n${fallback}`,
+        ].filter(Boolean).join('\n\n');
+        const presented = await this.callModelText(prompt, PRESENTATION_SYSTEM_PROMPT, [], task, label);
+        if (presented.trim()) text = presented.trim();
+      } catch {
+        text = fallback;
+      }
+
+      const message = { messageId: randomUUID(), text, ts: now() };
+      task.visibleMessages = [...(task.visibleMessages ?? []), message].slice(-20);
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+    }
+
+    this.emit({
+      type: 'user_visible_message',
+      taskId: task?.taskId,
+      sessionId: task?.sessionId,
+      role: 'assistant',
+      text,
+      ts: now(),
+    });
+    return text;
+  }
+
+  private async completeInquiryTask(task: PromptTask, result: string, relatedTaskIds: string[] = []): Promise<void> {
+    task.kind = 'inquiry';
+    task.agentRole = 'presentation';
+    task.relatedTaskIds = relatedTaskIds.length ? relatedTaskIds : task.relatedTaskIds;
+    task.status = 'completed';
+    task.result = result;
+    task.completedAt = now();
+    await this.persist(task);
+    this.emitTaskUpdate(task);
+    this.emit({ type: 'task_done', taskId: task.taskId, result, status: 'completed', ts: now() });
+    await this.emitUserVisibleMessage(task, result);
+  }
+
+  private async routeAndRunAcceptedTask(
+    taskId: string,
+    originalPrompt: string,
+    conversationHistory: ConversationEntry[],
+  ): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+
+    try {
+      const decision = await this.routePrompt(originalPrompt, conversationHistory, {
+        sessionId: task.sessionId,
+        excludeTaskIds: [task.taskId],
+      });
+
+      if (decision.action === 'query_task') {
+        task.status = 'running';
+        task.kind = 'inquiry';
+        task.agentRole = 'master';
+        task.relatedTaskIds = decision.targetTaskIds;
+        await this.persist(task);
+        this.emitTaskUpdate(task);
+        const answer = await this.answerTaskQuery(decision.prompt || originalPrompt, decision.targetTaskIds, conversationHistory);
+        this.emit({ type: 'master_response', text: answer, relatedTaskIds: decision.targetTaskIds, ts: now() });
+        await this.completeInquiryTask(task, answer, decision.targetTaskIds);
+        return;
+      }
+
+      if (decision.action === 'update_task') {
+        const targetId = decision.targetTaskIds[0]!;
+        task.status = 'running';
+        task.kind = 'inquiry';
+        task.agentRole = 'master';
+        task.relatedTaskIds = [targetId];
+        await this.persist(task);
+        this.emitTaskUpdate(task);
+
+        await this.appendTaskMailboxUpdate(targetId, decision.prompt || originalPrompt);
+        const target = this.tasks.get(targetId);
+        if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
+          target.status = 'queued';
+          await this.persist(target);
+          this.emitTaskUpdate(target);
+          setTimeout(() => {
+            void this.runTask(targetId);
+          }, 0);
+        }
+        await this.completeInquiryTask(task, `Queued update for task ${targetId.slice(0, 8)}.`, [targetId]);
+        return;
+      }
+
+      if (decision.action === 'clarify_target') {
+        task.status = 'running';
+        task.kind = 'inquiry';
+        task.agentRole = 'master';
+        task.relatedTaskIds = decision.targetTaskIds;
+        await this.persist(task);
+        this.emitTaskUpdate(task);
+
+        const choices = decision.targetTaskIds
+          .map((targetId) => this.tasks.get(targetId))
+          .filter((target): target is PromptTask => Boolean(target))
+          .map((target) => `${target.taskId.slice(0, 8)} - ${target.summary ?? excerpt(target.prompt, 56)}`);
+        const selected = await this.requestClarification(
+          task.taskId,
+          decision.reason || 'Which existing task should this prompt apply to?',
+          choices,
+        );
+        const targetId = decision.targetTaskIds[choices.indexOf(selected)];
+        if (!targetId) {
+          await this.completeInquiryTask(task, 'No matching task was selected.', decision.targetTaskIds);
+          return;
+        }
+
+        if (/\?|^(how|what|where|when|why|which|status|progress)\b/i.test(originalPrompt.trim())) {
+          const answer = await this.answerTaskQuery(decision.prompt || originalPrompt, [targetId], conversationHistory);
+          this.emit({ type: 'master_response', text: answer, relatedTaskIds: [targetId], ts: now() });
+          await this.completeInquiryTask(task, answer, [targetId]);
+          return;
+        }
+
+        await this.appendTaskMailboxUpdate(targetId, decision.prompt || originalPrompt, task.taskId);
+        const target = this.tasks.get(targetId);
+        if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
+          target.status = 'queued';
+          await this.persist(target);
+          this.emitTaskUpdate(target);
+          setTimeout(() => {
+            void this.runTask(targetId);
+          }, 0);
+        }
+        await this.completeInquiryTask(task, `Queued update for task ${targetId.slice(0, 8)}.`, [targetId]);
+        return;
+      }
+
+      const targetContext = this.renderTaskContextBundle(decision.targetTaskIds);
+      task.kind = this.kindForRouteAction(decision.action);
+      task.agentRole = 'worker';
+      task.prompt = decision.prompt || originalPrompt;
+      task.relatedTaskIds = decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined;
+      task.sharedContext = [targetContext, artifactContext(task.artifactDir)].filter(Boolean).join('\n\n') || undefined;
+      task.contextSnapshot = targetContext || undefined;
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+      await this.runTask(task.taskId);
+    } catch (error) {
+      task.status = 'failed';
+      task.result = `Error: ${String(error)}`;
+      task.completedAt = now();
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+      this.emit({ type: 'task_done', taskId: task.taskId, result: task.result, status: 'failed', ts: now() });
+      await this.emitUserVisibleMessage(task, task.result);
+    }
+  }
+
   async acceptPrompt(
     userId: string,
     prompt: string,
     mode: TaskMode = 'execute',
     conversationHistory: ConversationEntry[] = [],
+    options: PromptDispatchOptions = {},
   ): Promise<string> {
-    const decision = await this.routePrompt(prompt, conversationHistory);
-    if (decision.action === 'query_task') {
-      const answer = await this.answerTaskQuery(decision.prompt || prompt, decision.targetTaskIds, conversationHistory);
-      this.emit({ type: 'master_response', text: answer, relatedTaskIds: decision.targetTaskIds, ts: now() });
-      return '';
-    }
-    if (decision.action === 'update_task') {
-      const targetId = decision.targetTaskIds[0]!;
-      await this.appendTaskMailboxUpdate(targetId, decision.prompt || prompt);
-      const target = this.tasks.get(targetId);
-      if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
-        target.status = 'queued';
-        await this.persist(target);
-        this.emitTaskUpdate(target);
-        setTimeout(() => {
-          void this.runTask(targetId);
-        }, 0);
-      }
-      return targetId;
-    }
-
-    const targetContext = this.renderTaskContextBundle(decision.targetTaskIds);
-    const kind: TaskKind = decision.action === 'derived_task'
-        ? 'derived_worker'
-        : decision.action === 'sync_task'
-          ? 'sync_worker'
-          : decision.action === 'clarify_target'
-            ? 'clarification'
-            : 'worker';
-    const taskPrompt = decision.prompt || prompt;
-    const task = this.createTask(userId, taskPrompt, mode, {
-      kind,
-      relatedTaskIds: decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined,
-      sharedContext: targetContext || undefined,
-      contextSnapshot: targetContext || undefined,
+    const task = this.createTask(userId, prompt, mode, {
+      kind: 'worker',
+      sessionId: options.sessionId,
+      agentRole: 'master',
+      artifactDir: options.artifactDir,
     });
     this.taskHistory.set(task.taskId, [...conversationHistory]);
     setTimeout(() => {
-      void this.runTask(task.taskId);
+      void this.routeAndRunAcceptedTask(task.taskId, prompt, conversationHistory);
     }, 0);
     return task.taskId;
   }
@@ -484,8 +704,10 @@ export class MasterCoordinator {
     return this.tasks.get(taskId);
   }
 
-  listTasks(): PromptTask[] {
-    return [...this.tasks.values()];
+  listTasks(options: ListTaskOptions = {}): PromptTask[] {
+    const tasks = [...this.tasks.values()];
+    if (!options.sessionId) return tasks;
+    return tasks.filter((task) => task.sessionId === options.sessionId);
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -516,21 +738,23 @@ export class MasterCoordinator {
 
     const request = task.pendingClarifications?.find((item) => item.clarificationId === clarificationId);
     if (!request) return false;
+    const selectedAnswer = request.choices.find((choice) => choice === answer.trim());
+    if (!selectedAnswer) return false;
 
     request.status = 'answered';
-    request.answer = answer;
+    request.answer = selectedAnswer;
     task.status = 'running';
     void this.persist(task);
     this.emit({
       type: 'clarification_answered',
       taskId,
       clarificationId,
-      answer,
+      answer: selectedAnswer,
       ts: now(),
     });
     this.emitTaskUpdate(task);
 
-    pending.resolve(answer);
+    pending.resolve(selectedAnswer);
     this.clarifications.delete(clarificationId);
     return true;
   }
@@ -630,6 +854,144 @@ export class MasterCoordinator {
     return sub.result ?? `Subagent ${subId.slice(0, 8)} completed with no result`;
   }
 
+  private clonePatch(patch: PatchSet): PatchSet {
+    return {
+      ...patch,
+      files: patch.files.map((file) => ({ ...file })),
+      verificationCommands: [...patch.verificationCommands],
+      conflicts: patch.conflicts ? patch.conflicts.map((conflict) => ({ ...conflict })) : undefined,
+    };
+  }
+
+  private async persistPatch(task: PromptTask, patch: PatchSet): Promise<void> {
+    patch.updatedAt = now();
+    const existing = task.patchSets ?? [];
+    const index = existing.findIndex((item) => item.patchId === patch.patchId);
+    if (index >= 0) {
+      existing[index] = patch;
+      task.patchSets = existing;
+    } else {
+      task.patchSets = [...existing, patch];
+    }
+    await this.persist(task);
+    this.emitTaskUpdate(task);
+  }
+
+  private async submitPatch(
+    taskId: string,
+    input: Omit<PatchSet, 'patchId' | 'taskId' | 'status' | 'createdAt' | 'updatedAt'>,
+  ): Promise<string> {
+    const task = this.tasks.get(taskId);
+    if (!task) return `WriterError: task ${taskId} not found`;
+
+    const patch: PatchSet = {
+      patchId: randomUUID(),
+      taskId,
+      summary: input.summary || 'Patch submitted by worker',
+      files: input.files.map((file) => ({ ...file })),
+      verificationCommands: input.verificationCommands.filter(Boolean),
+      status: 'submitted',
+      createdAt: now(),
+      updatedAt: now(),
+    };
+
+    await this.persistPatch(task, patch);
+    this.emit({ type: 'writer_patch_submitted', taskId, patch: this.clonePatch(patch), ts: now() });
+
+    const paths = [...new Set(patch.files.map((file) => file.path))].sort();
+    const releases = [];
+    for (const path of paths) {
+      releases.push(await this.fileLocks.acquire(path));
+    }
+
+    try {
+      const conflicts: NonNullable<PatchSet['conflicts']> = [];
+      for (const file of patch.files) {
+        const absolutePath = isAbsolute(file.path) ? file.path : resolve(process.cwd(), file.path);
+        let current = '';
+        let exists = true;
+        try {
+          current = await readFile(absolutePath, 'utf8');
+        } catch {
+          exists = false;
+          current = '';
+        }
+
+        const actualHash = contentHash(current);
+        const expectedHash = file.baseHash || (file.before !== undefined ? contentHash(file.before) : undefined);
+        const expectedMissing = expectedHash === 'missing' && !exists;
+        if (expectedHash && expectedHash !== actualHash && !expectedMissing) {
+          conflicts.push({
+            path: file.path,
+            expectedHash,
+            actualHash: exists ? actualHash : 'missing',
+          });
+        }
+      }
+
+      if (conflicts.length > 0) {
+        patch.status = 'conflict';
+        patch.conflicts = conflicts;
+        patch.result = `Patch has ${conflicts.length} conflict${conflicts.length === 1 ? '' : 's'}.`;
+        await this.persistPatch(task, patch);
+        this.emit({ type: 'writer_conflict', taskId, patch: this.clonePatch(patch), conflicts, ts: now() });
+        await this.emitUserVisibleMessage(task, patch.result, 'writer_conflict_presentation');
+        return `WriterConflict: ${patch.result}`;
+      }
+
+      for (const file of patch.files) {
+        const absolutePath = isAbsolute(file.path) ? file.path : resolve(process.cwd(), file.path);
+        await mkdir(dirname(absolutePath), { recursive: true });
+        await writeFile(absolutePath, file.after, 'utf8');
+      }
+
+      patch.status = 'applied';
+      patch.result = `Applied patch ${patch.patchId.slice(0, 8)} to ${patch.files.length} file${patch.files.length === 1 ? '' : 's'}.`;
+      await this.persistPatch(task, patch);
+      this.emit({ type: 'writer_patch_applied', taskId, patch: this.clonePatch(patch), ts: now() });
+
+      const verificationOutput: string[] = [];
+      for (const command of patch.verificationCommands) {
+        try {
+          const { stdout, stderr } = await execAsync(command, {
+            cwd: process.cwd(),
+            timeout: 120_000,
+            maxBuffer: 1024 * 1024 * 4,
+          });
+          verificationOutput.push([`$ ${command}`, stdout, stderr].filter(Boolean).join('\n'));
+        } catch (error) {
+          const err = error as { stdout?: string; stderr?: string; message?: string };
+          const output = [err.stdout, err.stderr, err.message].filter(Boolean).join('\n');
+          patch.status = 'failed';
+          patch.result = `Verification failed for "${command}".\n${output}`;
+          await this.persistPatch(task, patch);
+          this.emit({ type: 'writer_failed', taskId, patch: this.clonePatch(patch), error: patch.result, ts: now() });
+          await this.emitUserVisibleMessage(task, patch.result, 'writer_failed_presentation');
+          return `WriterFailed: ${patch.result}`;
+        }
+      }
+
+      patch.status = 'verified';
+      patch.result = verificationOutput.length > 0
+        ? `Patch applied and verified.\n${verificationOutput.join('\n\n')}`
+        : 'Patch applied. No verification commands were provided.';
+      await this.persistPatch(task, patch);
+      this.emit({ type: 'writer_patch_verified', taskId, patch: this.clonePatch(patch), ts: now() });
+      return `WriterApplied: ${patch.result}`;
+    } catch (error) {
+      patch.status = 'failed';
+      patch.result = `Writer failed: ${String(error)}`;
+      await this.persistPatch(task, patch);
+      this.emit({ type: 'writer_failed', taskId, patch: this.clonePatch(patch), error: patch.result, ts: now() });
+      await this.emitUserVisibleMessage(task, patch.result, 'writer_failed_presentation');
+      return `WriterFailed: ${patch.result}`;
+    } finally {
+      for (const release of releases.reverse()) {
+        await release();
+      }
+    }
+  }
+
   private pumpSubagents(): void {
     while (this.subagentManager.canStart()) {
       const id = this.subagentManager.next();
@@ -644,13 +1006,19 @@ export class MasterCoordinator {
     sub.status = 'running';
     sub.startedAt = now();
     this.emitSubagentUpdate(sub);
-    const taskPolicy = sub.readOnly ? readOnlyPolicy(this.basePolicy) : this.basePolicy;
+    const taskPolicy = sub.readOnly ? readOnlyPolicy(this.basePolicy) : clonePolicy(this.basePolicy);
+    const artifactDir = this.tasks.get(sub.parentTaskId)?.artifactDir;
+    if (!sub.readOnly && artifactDir && !taskPolicy.allowedWriteRoots.includes(artifactDir)) {
+      taskPolicy.allowedWriteRoots.push(artifactDir);
+    }
     const toolCtx: ToolContext = {
       spawnSubagent: async () => 'Error: subagents cannot spawn other subagents',
       collectSubagent: async () => 'Error: subagents cannot collect siblings directly',
       requestClarification: (question, choices) => this.requestClarification(sub.parentTaskId || sub.taskId, question, choices),
+      submitPatch: (patch) => this.submitPatch(sub.parentTaskId || sub.taskId, patch),
       acquireWriteLock: (path) => this.fileLocks.acquire(path),
       policy: taskPolicy,
+      artifactDir,
       taskId: sub.parentTaskId || sub.taskId,
     };
 
@@ -717,17 +1085,43 @@ export class MasterCoordinator {
     prompt: string,
     mode: TaskMode = 'execute',
     conversationHistory: ConversationEntry[] = [],
+    options: PromptDispatchOptions = {},
   ): AsyncGenerator<StreamChunk> {
-    const decision = await this.routePrompt(prompt, conversationHistory);
+    const task = this.createTask(userId, prompt, mode, {
+      kind: 'worker',
+      sessionId: options.sessionId,
+      agentRole: 'master',
+      artifactDir: options.artifactDir,
+    });
+    this.taskHistory.set(task.taskId, [...conversationHistory]);
+    yield { type: 'task_id', taskId: task.taskId };
+
+    const decision = await this.routePrompt(prompt, conversationHistory, {
+      sessionId: task.sessionId,
+      excludeTaskIds: [task.taskId],
+    });
     if (decision.action === 'query_task') {
+      task.status = 'running';
+      task.kind = 'inquiry';
+      task.agentRole = 'master';
+      task.relatedTaskIds = decision.targetTaskIds;
+      await this.persist(task);
+      this.emitTaskUpdate(task);
       const answer = await this.answerTaskQuery(decision.prompt || prompt, decision.targetTaskIds, conversationHistory);
       this.emit({ type: 'master_response', text: answer, relatedTaskIds: decision.targetTaskIds, ts: now() });
+      await this.completeInquiryTask(task, answer, decision.targetTaskIds);
       yield { type: 'token', text: answer };
       yield { type: 'done', result: answer };
       return;
     }
     if (decision.action === 'update_task') {
       const targetId = decision.targetTaskIds[0]!;
+      task.status = 'running';
+      task.kind = 'inquiry';
+      task.agentRole = 'master';
+      task.relatedTaskIds = [targetId];
+      await this.persist(task);
+      this.emitTaskUpdate(task);
       await this.appendTaskMailboxUpdate(targetId, decision.prompt || prompt);
       const target = this.tasks.get(targetId);
       if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
@@ -738,29 +1132,76 @@ export class MasterCoordinator {
           void this.runTask(targetId);
         }, 0);
       }
-      yield { type: 'task_id', taskId: targetId };
       const result = `Queued update for task ${targetId.slice(0, 8)}.`;
+      await this.completeInquiryTask(task, result, [targetId]);
+      yield { type: 'token', text: result };
+      yield { type: 'done', result };
+      return;
+    }
+
+    if (decision.action === 'clarify_target') {
+      task.status = 'running';
+      task.kind = 'inquiry';
+      task.agentRole = 'master';
+      task.relatedTaskIds = decision.targetTaskIds;
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+
+      const choices = decision.targetTaskIds
+        .map((targetId) => this.tasks.get(targetId))
+        .filter((target): target is PromptTask => Boolean(target))
+        .map((target) => `${target.taskId.slice(0, 8)} - ${target.summary ?? excerpt(target.prompt, 56)}`);
+      const selected = await this.requestClarification(
+        task.taskId,
+        decision.reason || 'Which existing task should this prompt apply to?',
+        choices,
+      );
+      const targetId = decision.targetTaskIds[choices.indexOf(selected)];
+      if (!targetId) {
+        const result = 'No matching task was selected.';
+        await this.completeInquiryTask(task, result, decision.targetTaskIds);
+        yield { type: 'token', text: result };
+        yield { type: 'done', result };
+        return;
+      }
+
+      if (/\?|^(how|what|where|when|why|which|status|progress)\b/i.test(prompt.trim())) {
+        const answer = await this.answerTaskQuery(decision.prompt || prompt, [targetId], conversationHistory);
+        this.emit({ type: 'master_response', text: answer, relatedTaskIds: [targetId], ts: now() });
+        await this.completeInquiryTask(task, answer, [targetId]);
+        yield { type: 'token', text: answer };
+        yield { type: 'done', result: answer };
+        return;
+      }
+
+      await this.appendTaskMailboxUpdate(targetId, decision.prompt || prompt, task.taskId);
+      const target = this.tasks.get(targetId);
+      if (target && (target.status === 'completed' || target.status === 'failed' || target.status === 'blocked')) {
+        target.status = 'queued';
+        await this.persist(target);
+        this.emitTaskUpdate(target);
+        setTimeout(() => {
+          void this.runTask(targetId);
+        }, 0);
+      }
+      const result = `Queued update for task ${targetId.slice(0, 8)}.`;
+      await this.completeInquiryTask(task, result, [targetId]);
       yield { type: 'token', text: result };
       yield { type: 'done', result };
       return;
     }
 
     const targetContext = this.renderTaskContextBundle(decision.targetTaskIds);
-    const kind: TaskKind = decision.action === 'derived_task'
-        ? 'derived_worker'
-        : decision.action === 'sync_task'
-          ? 'sync_worker'
-          : decision.action === 'clarify_target'
-            ? 'clarification'
-            : 'worker';
-    const task = this.createTask(userId, decision.prompt || prompt, mode, {
-      kind,
-      relatedTaskIds: decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined,
-      sharedContext: targetContext || undefined,
-      contextSnapshot: targetContext || undefined,
-    });
-    this.taskHistory.set(task.taskId, [...conversationHistory]);
-    yield { type: 'task_id', taskId: task.taskId };
+    task.kind = this.kindForRouteAction(decision.action);
+    task.agentRole = 'worker';
+    task.prompt = decision.prompt || prompt;
+    task.relatedTaskIds = decision.targetTaskIds.length > 0 ? decision.targetTaskIds : undefined;
+    task.sharedContext = [targetContext, artifactContext(task.artifactDir)].filter(Boolean).join('\n\n') || undefined;
+    task.contextSnapshot = targetContext || undefined;
+    task.status = 'running';
+    task.startedAt ??= now();
+    await this.persist(task);
+    this.emitTaskUpdate(task);
     yield* this.runTaskStream(task, conversationHistory);
   }
 
@@ -798,9 +1239,11 @@ export class MasterCoordinator {
             break;
           case 'done':
             this.emit({ type: 'task_done', taskId: task.taskId, result: chunk.result, status: 'completed', ts: now() });
+            await this.emitUserVisibleMessage(task, chunk.result);
             break;
           case 'error':
             this.emit({ type: 'task_done', taskId: task.taskId, result: chunk.message, status: 'failed', ts: now() });
+            await this.emitUserVisibleMessage(task, chunk.message);
             break;
           default:
             break;
@@ -819,11 +1262,12 @@ export class MasterCoordinator {
     if (!task) return '';
 
     const clarificationId = randomUUID();
-    let finalChoices = choices.slice(0, 4);
-    if (finalChoices.length === 0) {
+    const normalizedQuestion = question.trim() || 'Choose how this task should continue.';
+    let finalChoices = choices.length > 0 ? normalizeClarificationChoices(normalizedQuestion, choices) : [];
+    if (finalChoices.length < 2) {
       const prompt = [
         `Task: ${task.prompt}`,
-        `Question: ${question}`,
+        `Question: ${normalizedQuestion}`,
         task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
         '',
         'Generate 2 to 4 concrete answer choices for the user.',
@@ -833,20 +1277,29 @@ export class MasterCoordinator {
         '- Choices must be specific and useful, not yes/no or generic.',
         '- Keep labels short and distinct.',
       ].filter(Boolean).join('\n');
-      const content = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, [], task, 'clarification_choices');
-      finalChoices = parseClarificationChoices(content);
-      if (finalChoices.length === 0) {
-        finalChoices = [question];
+      try {
+        const content = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, [], task, 'clarification_choices');
+        finalChoices = normalizeClarificationChoices(normalizedQuestion, parseClarificationChoices(content));
+      } catch {
+        finalChoices = normalizeClarificationChoices(normalizedQuestion);
       }
     }
     const request: ClarificationRequest = {
       clarificationId,
       taskId,
-      question,
+      question: normalizedQuestion,
       choices: finalChoices,
       createdAt: now(),
       status: 'pending',
     };
+    const response = new Promise<string>((resolve) => {
+      this.clarifications.set(clarificationId, {
+        taskId,
+        resolve: (answer) => {
+          resolve(answer);
+        },
+      });
+    });
     task.pendingClarifications = [...(task.pendingClarifications ?? []), request];
     task.status = 'waiting_user';
     await this.persist(task);
@@ -858,14 +1311,7 @@ export class MasterCoordinator {
     });
     this.emitTaskUpdate(task);
 
-    return new Promise((resolve) => {
-      this.clarifications.set(clarificationId, {
-        taskId,
-        resolve: (answer) => {
-          resolve(answer);
-        },
-      });
-    });
+    return response;
   }
 
   private async *runTaskStream(
@@ -1088,9 +1534,9 @@ export class MasterCoordinator {
         case 'read_only':
           return new Set(['repo_map', 'read_file', 'list_dir', 'bash', 'load_skill', 'request_clarification']);
         case 'code_write':
-          return new Set(WORKER_TOOLS.map((tool) => tool.function.name));
+          return new Set(['repo_map', 'read_file', 'list_dir', 'bash', 'load_skill', 'spawn_subagent', 'collect_subagent', 'submit_patch', 'request_clarification']);
         case 'verify':
-          return new Set(['read_file', 'edit_file', 'write_file', 'bash', 'request_clarification']);
+          return new Set(['read_file', 'list_dir', 'bash', 'submit_patch', 'request_clarification']);
         case 'safe':
         default:
           return new Set(['bash', 'request_clarification']);
@@ -1116,21 +1562,29 @@ export class MasterCoordinator {
   }
 
   private createToolContext(task: PromptTask): ToolContext {
-    const policy = task.readOnly ? readOnlyPolicy(this.basePolicy) : this.basePolicy;
+    const policy = task.readOnly ? readOnlyPolicy(this.basePolicy) : clonePolicy(this.basePolicy);
+    if (!task.readOnly && task.artifactDir && !policy.allowedWriteRoots.includes(task.artifactDir)) {
+      policy.allowedWriteRoots.push(task.artifactDir);
+    }
     return {
       spawnSubagent: (prompt) => this.spawnSubagent(prompt, task.taskId, Boolean(task.readOnly)),
       collectSubagent: (id) => this.collectSubagent(id),
       requestClarification: (question, choices) => this.requestClarification(task.taskId, question, choices),
+      submitPatch: (patch) => this.submitPatch(task.taskId, patch),
       acquireWriteLock: (path) => this.fileLocks.acquire(path),
       policy,
       sharedContext: task.sharedContext,
+      artifactDir: task.artifactDir,
       taskId: task.taskId,
     };
   }
 
   private getToolsForTask(readOnly: boolean) {
-    if (!readOnly) return WORKER_TOOLS;
-    const blocked = new Set(['write_file', 'edit_file']);
+    if (!readOnly) {
+      const blocked = new Set(['write_file', 'edit_file']);
+      return WORKER_TOOLS.filter((tool) => !blocked.has(tool.function.name));
+    }
+    const blocked = new Set(['write_file', 'edit_file', 'submit_patch']);
     return WORKER_TOOLS.filter((tool) => !blocked.has(tool.function.name));
   }
 

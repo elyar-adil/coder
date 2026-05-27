@@ -26,14 +26,39 @@ async function gitAutoCommit(filePath: string, message: string): Promise<void> {
   }
 }
 
-async function writeViaWorkspace(targetPath: string, content: string): Promise<void> {
-  const absoluteTarget = isAbsolute(targetPath) ? targetPath : resolve(process.cwd(), targetPath);
-  const rel = relative(process.cwd(), absoluteTarget);
+function artifactRelativePath(targetPath: string): string | undefined {
+  const normalized = targetPath.replace(/\\/g, '/');
+  if (!normalized || /^[a-z][a-z0-9+.-]*:/i.test(normalized) || normalized.startsWith('/') || normalized.startsWith('~/') || normalized.startsWith('../')) return undefined;
+  if (/^\.[/\\]/.test(targetPath)) return undefined;
+  if (normalized.includes('/../') || normalized === '..') return undefined;
+  return normalized;
+}
+
+function resolveWriteTarget(targetPath: string, ctx?: ToolContext): string {
+  const artifactDir = ctx?.artifactDir;
+  const artifactRel = artifactDir ? artifactRelativePath(targetPath) : undefined;
+  if (artifactDir && artifactRel) return resolve(artifactDir, artifactRel);
+  return isAbsolute(targetPath) ? targetPath : resolve(process.cwd(), targetPath);
+}
+
+function authorizeWithResolvedPath(policy: ToolPolicy, name: string, path: string, ctx?: ToolContext): string | undefined {
+  const target = resolveWriteTarget(path, ctx);
+  const decision = authorizeToolCall(policy, name, { path: target });
+  return decision.ok ? undefined : formatPolicyError(name, decision);
+}
+
+async function writeViaWorkspace(targetPath: string, content: string, ctx?: ToolContext): Promise<string> {
+  const absoluteTarget = resolveWriteTarget(targetPath, ctx);
+  const cwd = process.cwd();
+  const rel = absoluteTarget.startsWith(cwd)
+    ? relative(cwd, absoluteTarget)
+    : join('__external__', absoluteTarget.replace(/^[/\\]+/, ''));
   const workspacePath = join(AGENT_WORKSPACE_ROOT, rel);
   await mkdir(dirname(workspacePath), { recursive: true });
   await writeFile(workspacePath, content, 'utf8');
   await mkdir(dirname(absoluteTarget), { recursive: true });
   await writeFile(absoluteTarget, content, 'utf8');
+  return absoluteTarget;
 }
 
 function unifiedDiff(filePath: string, before: string, after: string, maxChangedLines = 160): string {
@@ -358,6 +383,28 @@ understand the codebase structure without reading every file. Returns a compact 
   {
     type: 'function',
     function: {
+      name: 'submit_patch',
+      description: 'Submit a structured patch to the writer agent. Workers should use this instead of directly writing files when patch-writer mode is enabled.',
+      parameters: {
+        type: 'object',
+        properties: {
+          summary: { type: 'string', description: 'Concise summary of the change.' },
+          files: {
+            type: 'string',
+            description: 'JSON array of {path, baseHash?, before?, after, diff?}. The writer validates baseHash before applying.',
+          },
+          verificationCommands: {
+            type: 'string',
+            description: 'JSON array of commands the writer should run after applying the patch.',
+          },
+        },
+        required: ['summary', 'files'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'request_clarification',
       description: 'Ask the master coordinator for missing information when the task is blocked. The master may answer directly or ask the user.',
       parameters: {
@@ -399,7 +446,7 @@ export const WORKER_TOOLS = TOOLS.filter((tool) => tool.function.name !== 'ask_u
 
 export async function executeTool(
   name: string,
-  args: Record<string, string>,
+  args: Record<string, unknown>,
   ctx?: ToolContext,
 ): Promise<string> {
   const policy = ctx?.policy ?? getToolPolicy();
@@ -408,7 +455,7 @@ export async function executeTool(
 
   switch (name) {
     case 'read_file': {
-      const path = args['path'];
+      const path = typeof args['path'] === 'string' ? args['path'] : undefined;
       if (!path) return 'Error: read_file requires "path"';
       try {
         return await readFile(path, 'utf8');
@@ -418,10 +465,14 @@ export async function executeTool(
     }
 
     case 'edit_file': {
-      const path = args['path'];
-      const edits = args['edits'];
+      const path = typeof args['path'] === 'string' ? args['path'] : undefined;
+      const edits = typeof args['edits'] === 'string' ? args['edits'] : undefined;
       if (!path) return 'Error: edit_file requires "path"';
       if (!edits) return 'Error: edit_file requires "edits"';
+      const readDecision = authorizeToolCall(policy, 'read_file', { path });
+      if (!readDecision.ok) return formatPolicyError('edit_file', readDecision);
+      const writeDecision = authorizeToolCall(policy, 'edit_file', { path });
+      if (!writeDecision.ok) return formatPolicyError('edit_file', writeDecision);
 
       return withWriteLock(ctx, path, async () => {
         let src: string;
@@ -454,10 +505,10 @@ export async function executeTool(
         }
 
         try {
-          await writeViaWorkspace(path, content);
-          await gitAutoCommit(path, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
+          const writtenPath = await writeViaWorkspace(path, content);
+          await gitAutoCommit(writtenPath, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
           const diff = unifiedDiff(path, src, content);
-          return [`OK: ${log.join('; ')}`, diff].filter(Boolean).join('\n\n');
+          return [`OK: ${log.join('; ')} (${writtenPath})`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing edited file: ${String(error)}`;
         }
@@ -465,8 +516,8 @@ export async function executeTool(
     }
 
     case 'repo_map': {
-      const root = args['root'] ?? '.';
-      const maxDepth = parseInt(args['max_depth'] ?? '6', 10);
+      const root = typeof args['root'] === 'string' ? args['root'] : '.';
+      const maxDepth = parseInt(typeof args['max_depth'] === 'string' ? args['max_depth'] : '6', 10);
       try {
         const files = await walkDir(root, Number.isNaN(maxDepth) ? 6 : maxDepth);
         if (files.length === 0) return '(no supported source files found)';
@@ -485,23 +536,26 @@ export async function executeTool(
     }
 
     case 'write_file': {
-      const path = args['path'];
-      const content = args['content'];
+      const path = typeof args['path'] === 'string' ? args['path'] : undefined;
+      const content = typeof args['content'] === 'string' ? args['content'] : undefined;
       if (!path) return 'Error: write_file requires "path"';
       if (content === undefined) return 'Error: write_file requires "content"';
+      const policyError = authorizeWithResolvedPath(policy, 'write_file', path, ctx);
+      if (policyError) return policyError;
+      const targetPath = resolveWriteTarget(path, ctx);
 
-      return withWriteLock(ctx, path, async () => {
+      return withWriteLock(ctx, targetPath, async () => {
         try {
           let previous = '';
           try {
-            previous = await readFile(path, 'utf8');
+            previous = await readFile(targetPath, 'utf8');
           } catch {
             previous = '';
           }
-          await writeViaWorkspace(path, content);
-          await gitAutoCommit(path, `write: ${path}`);
+          const writtenPath = await writeViaWorkspace(path, content, ctx);
+          await gitAutoCommit(writtenPath, `write: ${path}`);
           const diff = unifiedDiff(path, previous, content);
-          return [`OK: wrote ${path} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
+          return [`OK: wrote ${writtenPath} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing file: ${String(error)}`;
         }
@@ -509,7 +563,7 @@ export async function executeTool(
     }
 
     case 'list_dir': {
-      const dir = args['path'] ?? '.';
+      const dir = typeof args['path'] === 'string' ? args['path'] : '.';
       try {
         const entries = await readdir(dir, { withFileTypes: true });
         return entries
@@ -521,10 +575,19 @@ export async function executeTool(
     }
 
     case 'bash': {
-      const command = args['command'];
+      const command = typeof args['command'] === 'string' ? args['command'] : undefined;
       if (!command) return 'Error: bash requires "command"';
+      const cwd = typeof args['cwd'] === 'string'
+        ? resolve(args['cwd'])
+        : ctx?.artifactDir
+          ? resolve(ctx.artifactDir)
+          : process.cwd();
       try {
+        if (ctx?.artifactDir && typeof args['cwd'] !== 'string') {
+          await mkdir(cwd, { recursive: true });
+        }
         const { stdout, stderr } = await execAsync(command, {
+          cwd,
           timeout: 60_000,
           maxBuffer: 1024 * 1024 * 4,
         });
@@ -538,7 +601,7 @@ export async function executeTool(
     }
 
     case 'load_skill': {
-      const name = args['name'];
+      const name = typeof args['name'] === 'string' ? args['name'] : undefined;
       if (!name) return 'Error: load_skill requires "name"';
       const skillsDir = `${import.meta.dirname}/../skills`.replace(/\\/g, '/');
       try {
@@ -555,12 +618,58 @@ export async function executeTool(
 
     case 'spawn_subagent': {
       if (!ctx?.spawnSubagent) return 'Error: subagent support unavailable';
-      return ctx.spawnSubagent(args['prompt']);
+      return ctx.spawnSubagent(typeof args['prompt'] === 'string' ? args['prompt'] : '');
     }
 
     case 'collect_subagent': {
       if (!ctx?.collectSubagent) return 'Error: subagent support unavailable';
-      return ctx.collectSubagent(args['subagent_id']);
+      return ctx.collectSubagent(typeof args['subagent_id'] === 'string' ? args['subagent_id'] : '');
+    }
+
+    case 'submit_patch': {
+      if (!ctx?.submitPatch) return 'Error: patch writer support unavailable';
+      const summary = typeof args['summary'] === 'string' ? args['summary'] : '';
+      let files: Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
+      let verificationCommands: string[] = [];
+      try {
+        const rawValue = args['files'];
+        if (Array.isArray(rawValue)) {
+          files = rawValue as Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
+        } else {
+          const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
+          const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+          files = JSON.parse(fenced?.[1] ?? raw) as Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
+        }
+        if (!Array.isArray(files)) return 'Error: submit_patch files must be a JSON array';
+      } catch (error) {
+        return `Error parsing submit_patch files JSON: ${String(error)}`;
+      }
+      for (const [index, file] of files.entries()) {
+        if (!file || typeof file.path !== 'string' || !file.path.trim()) return `Error: submit_patch files[${index}].path is required`;
+        if (typeof file.after !== 'string') return `Error: submit_patch files[${index}].after must be a string`;
+      }
+      for (const file of files) {
+        const pathDecision = authorizeToolCall(policy, 'write_file', { path: resolve(file.path) });
+        if (!pathDecision.ok) return formatPolicyError('submit_patch', pathDecision);
+      }
+      if (args['verificationCommands']) {
+        try {
+          const rawValue = args['verificationCommands'];
+          const parsed = Array.isArray(rawValue)
+            ? rawValue
+            : (() => {
+              const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
+              const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+              return JSON.parse(fenced?.[1] ?? raw) as unknown;
+            })();
+          if (Array.isArray(parsed)) {
+            verificationCommands = parsed.filter((item): item is string => typeof item === 'string');
+          }
+        } catch {
+          verificationCommands = [];
+        }
+      }
+      return ctx.submitPatch({ summary, files, verificationCommands });
     }
 
     case 'request_clarification':
@@ -572,7 +681,9 @@ export async function executeTool(
       const rawChoices = args['choices'];
       if (rawChoices) {
         try {
-          const parsed = JSON.parse(rawChoices) as unknown;
+          const parsed = Array.isArray(rawChoices)
+            ? rawChoices
+            : JSON.parse(typeof rawChoices === 'string' ? rawChoices : JSON.stringify(rawChoices)) as unknown;
           if (Array.isArray(parsed)) {
             choices = parsed.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean);
           }
@@ -580,7 +691,7 @@ export async function executeTool(
           // Ignore malformed choices and fall back to master-generated options.
         }
       }
-      return ctx.requestClarification(args['question'] ?? '', choices);
+      return ctx.requestClarification(typeof args['question'] === 'string' ? args['question'] : '', choices);
     }
 
     default:

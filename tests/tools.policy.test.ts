@@ -16,6 +16,15 @@ describe('tool policy', () => {
     assert.match(result, /PolicyError/);
   });
 
+  test('blocks edit_file writes outside the workspace', async () => {
+    setToolPolicy(defaultPolicy('strict', process.cwd()));
+    const result = await executeTool('edit_file', {
+      path: '/tmp/coder-policy-outside.txt',
+      edits: JSON.stringify([{ search: 'old', replace: 'new' }]),
+    });
+    assert.match(result, /PolicyError/);
+  });
+
   test('allows safe allowlisted command in strict mode', async () => {
     setToolPolicy(defaultPolicy('strict', process.cwd()));
     const result = await executeTool('bash', { command: 'npm test -- --help' });

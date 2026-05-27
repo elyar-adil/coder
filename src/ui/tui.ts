@@ -6,6 +6,7 @@
 
 import * as readline from 'node:readline';
 import chalk from 'chalk';
+import stripAnsi from 'strip-ansi';
 
 import { renderMarkdown } from '../markdown.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
@@ -310,10 +311,25 @@ export async function runTui(
     renderPrompt();
   };
 
+  const clarificationChoices = (): string[] => activeClarification?.choices ?? [];
+
   const answerClarification = (answer: string): boolean => {
     if (!activeClarification) return false;
-    master.answerClarification(activeClarification.taskId, activeClarification.clarificationId, answer);
-    log(chalk.hex(THEME.success)(`You answered: ${answer}`));
+    const trimmed = answer.trim();
+    const choices = clarificationChoices();
+    const selected = choices[Number(trimmed) - 1] ?? choices.find((choice) => choice === trimmed);
+    if (!selected) {
+      log(chalk.hex(THEME.warning)('Choose one of the listed options by number.'));
+      return false;
+    }
+    const accepted = master.answerClarification(activeClarification.taskId, activeClarification.clarificationId, selected);
+    if (!accepted) {
+      log(chalk.hex(THEME.warning)('That option is no longer available.'));
+      activeClarification = undefined;
+      renderPrompt();
+      return false;
+    }
+    log(chalk.hex(THEME.success)(`Selected: ${selected}`));
     activeClarification = undefined;
     renderPrompt();
     return true;
@@ -419,6 +435,11 @@ export async function runTui(
       return;
     }
 
+    if (activeClarification && (/^\d+$/.test(cmd) || cmd === 'answer')) {
+      answerClarification(cmd === 'answer' ? args.join(' ') : cmd);
+      return;
+    }
+
     logSystem(`Unknown command: /${cmd}`);
     renderPrompt();
   }
@@ -430,7 +451,7 @@ export async function runTui(
       return;
     }
 
-    if (activeClarification && !userInput.startsWith('/')) {
+    if (activeClarification && /^\d+$/.test(userInput)) {
       answerClarification(userInput);
       return;
     }
@@ -446,7 +467,7 @@ export async function runTui(
 
     history.push({ role: 'user', content: userInput });
     await saveHistory();
-    await master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1));
+    await master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1), { sessionId });
     renderPrompt();
   };
 
@@ -464,24 +485,32 @@ export async function runTui(
 
   const unsubscribe = master.subscribe((event) => {
     if (event.type === 'task_created') {
+      if (event.task.sessionId && event.task.sessionId !== sessionId) return;
       maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
 
     if (event.type === 'task_updated') {
+      if (event.task.sessionId && event.task.sessionId !== sessionId) return;
       maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
     }
 
-    if (event.type === 'master_response') {
-      const related = event.relatedTaskIds?.length
-        ? chalk.hex(THEME.textMuted)(` (ref ${event.relatedTaskIds.map((id) => id.slice(0, 8)).join(', ')})`)
-        : '';
-      log(`${chalk.bold.hex(THEME.accentStrong)('Master')}${related}`);
+    if ('taskId' in event && typeof event.taskId === 'string') {
+      const task = master.getTask(event.taskId);
+      if (task?.sessionId && task.sessionId !== sessionId) return;
+    }
+
+    if (event.type === 'user_visible_message') {
+      if (event.sessionId && event.sessionId !== sessionId) return;
       log(renderMarkdown(event.text, 96));
       renderPrompt();
+      return;
+    }
+
+    if (event.type === 'master_response') {
       return;
     }
 
@@ -507,7 +536,12 @@ export async function runTui(
 
     if (event.type === 'clarification_requested') {
       activeClarification = event.clarification;
-      log(chalk.hex(THEME.warning)('Need your input to continue. Please answer the prompt.'));
+      const choices = clarificationChoices();
+      log(chalk.hex(THEME.warning)(event.clarification.question));
+      choices.forEach((choice, index) => {
+        log(`  ${chalk.hex(THEME.warning)(String(index + 1))}. ${choice}`);
+      });
+      log(chalk.hex(THEME.textMuted)('Select with the number, for example: 1. You can keep submitting new prompts while this waits.'));
       renderPrompt();
       return;
     }

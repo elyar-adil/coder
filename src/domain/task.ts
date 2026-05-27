@@ -3,6 +3,7 @@ import type { ToolPolicy } from '../policy.js';
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'waiting_user' | 'completed' | 'failed';
 export type TaskMode = 'execute' | 'plan' | 'react';
 export type TaskKind = 'worker' | 'inquiry' | 'derived_worker' | 'sync_worker' | 'clarification';
+export type AgentRole = 'master' | 'worker' | 'subagent' | 'writer' | 'presentation';
 export type TaskPhase = 'plan' | 'execute' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
 export type PlanStepIntent = 'answer' | 'tool_loop' | 'code_change' | 'verify' | 'ask_user';
 export type PlanStepToolPolicy = 'none' | 'safe' | 'read_only' | 'code_write' | 'verify';
@@ -94,6 +95,27 @@ export interface SubAgentTask {
   readOnly?: boolean;
 }
 
+export interface PatchFileChange {
+  path: string;
+  baseHash?: string;
+  before?: string;
+  after: string;
+  diff?: string;
+}
+
+export interface PatchSet {
+  patchId: string;
+  taskId: string;
+  summary: string;
+  files: PatchFileChange[];
+  verificationCommands: string[];
+  status: 'submitted' | 'applied' | 'verified' | 'conflict' | 'failed';
+  createdAt: string;
+  updatedAt: string;
+  result?: string;
+  conflicts?: Array<{ path: string; expectedHash?: string; actualHash: string }>;
+}
+
 export interface OllamaMsg {
   role: string;
   content: string | null;
@@ -117,6 +139,8 @@ export interface LlmTraceEntry {
 export interface PromptTask {
   traceId?: string;
   taskId: string;
+  sessionId?: string;
+  agentRole?: AgentRole;
   userId: string;
   prompt: string;
   kind?: TaskKind;
@@ -140,6 +164,10 @@ export interface PromptTask {
   relatedTaskIds?: string[];
   mailbox?: TaskMailboxMessage[];
   contextSnapshot?: string;
+  artifactDir?: string;
+  visibleMessages?: Array<{ messageId: string; text: string; ts: string }>;
+  debugEvents?: Array<{ type: string; text: string; ts: string }>;
+  patchSets?: PatchSet[];
 }
 
 export type ReleaseLock = () => void | Promise<void>;
@@ -148,9 +176,11 @@ export interface ToolContext {
   spawnSubagent: (prompt: string) => Promise<string>;
   collectSubagent: (id: string) => Promise<string>;
   requestClarification?: (question: string, choices?: string[]) => Promise<string>;
+  submitPatch?: (patch: Omit<PatchSet, 'patchId' | 'taskId' | 'status' | 'createdAt' | 'updatedAt'>) => Promise<string>;
   acquireWriteLock?: (path: string) => Promise<ReleaseLock>;
   policy?: ToolPolicy;
   sharedContext?: string;
+  artifactDir?: string;
   taskId?: string;
 }
 
@@ -158,10 +188,16 @@ export type MasterEvent =
   | { type: 'task_created'; task: PromptTask; ts: string }
   | { type: 'task_updated'; task: PromptTask; ts: string }
   | { type: 'master_response'; text: string; relatedTaskIds?: string[]; ts: string }
+  | { type: 'user_visible_message'; taskId?: string; sessionId?: string; role: 'assistant' | 'system'; text: string; ts: string }
   | { type: 'task_mailbox_updated'; taskId: string; message: TaskMailboxMessage; ts: string }
   | { type: 'subagent_created'; subagent: SubAgentTask; ts: string }
   | { type: 'subagent_updated'; subagent: SubAgentTask; ts: string }
   | { type: 'subagent_output'; subagentId: string; parentTaskId: string; text: string; ts: string }
+  | { type: 'writer_patch_submitted'; taskId: string; patch: PatchSet; ts: string }
+  | { type: 'writer_patch_applied'; taskId: string; patch: PatchSet; ts: string }
+  | { type: 'writer_patch_verified'; taskId: string; patch: PatchSet; ts: string }
+  | { type: 'writer_conflict'; taskId: string; patch: PatchSet; conflicts: NonNullable<PatchSet['conflicts']>; ts: string }
+  | { type: 'writer_failed'; taskId: string; patch: PatchSet; error: string; ts: string }
   | { type: 'task_phase'; taskId: string; phase: TaskPhase; status: PhaseEvent['status']; note?: string; ts: string }
   | { type: 'task_output'; taskId: string; text: string; ts: string }
   | { type: 'tool_call'; taskId: string; tool: string; input: string; ts: string }

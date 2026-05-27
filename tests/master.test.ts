@@ -1,7 +1,15 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MasterCoordinator, parsePlan, parseOllamaNdjson } from '../src/master.js';
+
+function hashContent(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
+}
 
 describe('MasterCoordinator', () => {
   let master: MasterCoordinator;
@@ -50,6 +58,26 @@ describe('MasterCoordinator', () => {
     test('returns empty array initially', () => {
       const fresh = new MasterCoordinator('http://localhost:11434', 'm');
       assert.equal(fresh.listTasks().length, 0);
+    });
+
+    test('filters tasks by session id', async () => {
+      const fresh = new MasterCoordinator('http://localhost:11434', 'm');
+      const s1 = await fresh.acceptPrompt('u1', 'session one task', 'execute', [], { sessionId: 's1' });
+      const s2 = await fresh.acceptPrompt('u2', 'session two task', 'execute', [], { sessionId: 's2' });
+
+      assert.deepEqual(fresh.listTasks({ sessionId: 's1' }).map((task) => task.taskId), [s1]);
+      assert.deepEqual(fresh.listTasks({ sessionId: 's2' }).map((task) => task.taskId), [s2]);
+    });
+
+    test('attaches artifact directory context to accepted tasks', async () => {
+      const fresh = new MasterCoordinator('http://localhost:11434', 'm');
+      const artifactDir = join(tmpdir(), 'coder-session-artifacts');
+      const taskId = await fresh.acceptPrompt('u1', 'generate a ppt', 'execute', [], { sessionId: 's1', artifactDir });
+      const task = fresh.getTask(taskId);
+
+      assert.equal(task?.artifactDir, artifactDir);
+      assert.match(task?.sharedContext ?? '', /Artifact workspace/);
+      assert.match(task?.sharedContext ?? '', new RegExp(artifactDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     });
   });
 
@@ -196,7 +224,7 @@ describe('MasterCoordinator', () => {
       });
     });
 
-    test('answers task questions from master without creating an extra task', async () => {
+    test('answers task questions from a session inquiry task', async () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
         let pptTaskId = '';
@@ -210,7 +238,9 @@ describe('MasterCoordinator', () => {
           if (chunk.type === 'token') answer += chunk.text;
         }
 
-        assert.equal(coordinator.listTasks().length, beforeCount);
+        assert.equal(coordinator.listTasks().length, beforeCount + 1);
+        const inquiry = coordinator.listTasks().find((task) => task.taskId !== pptTaskId);
+        assert.equal(inquiry?.kind, 'inquiry');
         assert.ok(answer.includes('in progress'));
         assert.equal(coordinator.getTask(pptTaskId)?.mailbox, undefined);
       });
@@ -227,10 +257,110 @@ describe('MasterCoordinator', () => {
         }
 
         const target = coordinator.getTask(pptTaskId);
-        assert.equal(routedTaskId, pptTaskId);
+        const routed = coordinator.getTask(routedTaskId);
+        assert.equal(routed?.kind, 'inquiry');
+        assert.deepEqual(routed?.relatedTaskIds, [pptTaskId]);
         assert.ok(target?.mailbox?.some((message) => message.text.includes('red theme')));
-        assert.equal(coordinator.listTasks().filter((task) => task.taskId !== pptTaskId).length, 0);
+        assert.equal(coordinator.listTasks().filter((task) => task.taskId !== pptTaskId).length, 1);
       });
+    });
+  });
+
+  describe('patch writer', () => {
+    test('applies a patch when the base hash matches', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'coder-writer-test-'));
+      try {
+        const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'execute', [], { sessionId: 'writer' });
+        const target = join(dir, 'file.txt');
+
+        const submitPatch = (coordinator as unknown as {
+          submitPatch: (taskId: string, input: {
+            summary: string;
+            files: Array<{ path: string; baseHash?: string; before?: string; after: string }>;
+            verificationCommands: string[];
+          }) => Promise<string>;
+        }).submitPatch.bind(coordinator);
+
+        const result = await submitPatch(taskId, {
+          summary: 'create file',
+          files: [{ path: target, baseHash: hashContent(''), before: '', after: 'created' }],
+          verificationCommands: [],
+        });
+
+        assert.match(result, /^WriterApplied:/);
+        assert.equal(await readFile(target, 'utf8'), 'created');
+        assert.equal(coordinator.getTask(taskId)?.patchSets?.[0]?.status, 'verified');
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    test('reports conflict and leaves file unchanged when base hash differs', async () => {
+      const dir = await mkdtemp(join(tmpdir(), 'coder-writer-conflict-'));
+      try {
+        const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'execute', [], { sessionId: 'writer' });
+        const target = join(dir, 'file.txt');
+        await writeFile(target, 'current', 'utf8');
+
+        const submitPatch = (coordinator as unknown as {
+          submitPatch: (taskId: string, input: {
+            summary: string;
+            files: Array<{ path: string; baseHash?: string; before?: string; after: string }>;
+            verificationCommands: string[];
+          }) => Promise<string>;
+        }).submitPatch.bind(coordinator);
+
+        const result = await submitPatch(taskId, {
+          summary: 'conflicting edit',
+          files: [{ path: target, baseHash: hashContent('old'), before: 'old', after: 'new' }],
+          verificationCommands: [],
+        });
+
+        assert.match(result, /^WriterConflict:/);
+        assert.equal(await readFile(target, 'utf8'), 'current');
+        assert.equal(coordinator.getTask(taskId)?.patchSets?.[0]?.status, 'conflict');
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+  });
+
+  describe('clarifications', () => {
+    test('requires answers to match generated choices', async () => {
+      const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+      const taskId = await coordinator.acceptPrompt('u', 'needs a choice', 'execute', [], { sessionId: 'clarify' });
+      const requestClarification = (coordinator as unknown as {
+        requestClarification: (taskId: string, question: string, choices?: string[]) => Promise<string>;
+      }).requestClarification.bind(coordinator);
+
+      const pending = requestClarification(taskId, 'Pick an implementation style.', ['Fast path', 'Careful path']);
+      const request = coordinator.listPendingClarifications(taskId)[0];
+      assert.ok(request);
+      assert.deepEqual(request.choices, ['Fast path', 'Careful path']);
+
+      assert.equal(coordinator.answerClarification(taskId, request.clarificationId, 'free-form answer'), false);
+      assert.equal(coordinator.listPendingClarifications(taskId).length, 1);
+
+      assert.equal(coordinator.answerClarification(taskId, request.clarificationId, 'Fast path'), true);
+      assert.equal(await pending, 'Fast path');
+      assert.equal(coordinator.listPendingClarifications(taskId).length, 0);
+    });
+
+    test('adds concrete fallback choices when a clarification has too few options', async () => {
+      const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
+      const taskId = await coordinator.acceptPrompt('u', 'needs fallback choices', 'execute', [], { sessionId: 'clarify' });
+      const requestClarification = (coordinator as unknown as {
+        requestClarification: (taskId: string, question: string, choices?: string[]) => Promise<string>;
+      }).requestClarification.bind(coordinator);
+
+      void requestClarification(taskId, 'Pick a path.', ['Only option']);
+      const request = coordinator.listPendingClarifications(taskId)[0];
+
+      assert.ok(request);
+      assert.equal(request.choices.length >= 2, true);
+      assert.equal(request.choices[0], 'Only option');
     });
   });
 
