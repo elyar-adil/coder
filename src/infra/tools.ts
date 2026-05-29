@@ -150,6 +150,115 @@ async function walkDir(
   return results;
 }
 
+// ── Fuzzy edit matching (inspired by OpenCode's multi-strategy approach) ──────
+//
+// LLMs frequently produce search strings with minor whitespace or indentation
+// drift. Rather than hard-failing, we attempt progressively looser strategies
+// in order, mirroring the 9-level approach described in the OpenCode analysis.
+
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
+    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
+  );
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      dp[i]![j] = a[i - 1] === b[j - 1]
+        ? dp[i - 1]![j - 1]!
+        : 1 + Math.min(dp[i - 1]![j]!, dp[i]![j - 1]!, dp[i - 1]![j - 1]!);
+    }
+  }
+  return dp[m]![n]!;
+}
+
+function similarity(a: string, b: string): number {
+  const maxLen = Math.max(a.length, b.length);
+  return maxLen === 0 ? 1 : 1 - levenshtein(a, b) / maxLen;
+}
+
+/** Try to locate `search` in `content` using progressively looser strategies.
+ *  Returns the best matching substring of `content` at the same length, or
+ *  undefined if no strategy succeeds. */
+function fuzzyFind(content: string, search: string): string | undefined {
+  // Strategy 1: exact
+  if (content.includes(search)) return search;
+
+  // Strategy 2: line-trimmed — trim each line, compare trimmed blocks
+  const trimLines = (s: string) => s.split('\n').map((l) => l.trim()).join('\n');
+  const searchTrimmed = trimLines(search);
+  const contentLines = content.split('\n');
+  const searchLineCount = search.split('\n').length;
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (trimLines(window) === searchTrimmed) return window;
+  }
+
+  // Strategy 3: whitespace-normalized — collapse all whitespace runs
+  const normWS = (s: string) => s.replace(/[\t ]+/g, ' ').trim();
+  const searchNorm = normWS(search);
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (normWS(window) === searchNorm) return window;
+  }
+
+  // Strategy 4: indentation-flexible — strip common leading indent from search
+  const stripIndent = (s: string) => {
+    const lines = s.split('\n');
+    const minIndent = lines
+      .filter((l) => l.trim())
+      .reduce((min, l) => Math.min(min, l.match(/^\s*/)?.[0].length ?? 0), Infinity);
+    return lines.map((l) => l.slice(minIndent === Infinity ? 0 : minIndent)).join('\n');
+  };
+  const searchStripped = stripIndent(search);
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (stripIndent(window) === searchStripped) return window;
+  }
+
+  // Strategy 5: escape-normalized — resolve common escape sequences
+  const normEscape = (s: string) =>
+    s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  const searchEsc = normEscape(search);
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (normEscape(window) === searchEsc) return window;
+  }
+
+  // Strategy 6: trim boundaries — trim leading/trailing whitespace of the whole block
+  const searchTrimBound = search.trim();
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (window.trim() === searchTrimBound) return window;
+  }
+
+  // Strategy 7: block-anchor with similarity — anchor on first+last line,
+  // accept the window if its Levenshtein similarity to search is >= 0.7.
+  const searchFirstLine = search.split('\n')[0]?.trim() ?? '';
+  const searchLastLine = search.split('\n').at(-1)?.trim() ?? '';
+  const candidates: string[] = [];
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    const firstMatch = contentLines[i]?.trim() === searchFirstLine;
+    const lastMatch = contentLines[i + searchLineCount - 1]?.trim() === searchLastLine;
+    if (firstMatch && lastMatch) candidates.push(window);
+  }
+  const ANCHOR_THRESHOLD = candidates.length === 1 ? 0 : 0.3;
+  for (const c of candidates) {
+    if (similarity(c, search) >= ANCHOR_THRESHOLD) return c;
+  }
+
+  // Strategy 8: context-aware — looser block anchor, 50% similarity threshold
+  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+    const window = contentLines.slice(i, i + searchLineCount).join('\n');
+    if (contentLines[i]?.trim() === searchFirstLine && similarity(window, search) >= 0.5) {
+      return window;
+    }
+  }
+
+  return undefined;
+}
+
 let defaultToolPolicy: ToolPolicy = defaultPolicy();
 
 export function setToolPolicy(policy: ToolPolicy): void {
@@ -196,11 +305,13 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read the full content of a file from disk. Always call this before writing to an existing file.',
+      description: 'Read file content from disk. Returns line-numbered output (5-digit padded line numbers). Always call this before writing to an existing file. Use offset/limit to read large files in sections.',
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Absolute or relative path to the file' },
+          offset: { type: 'number', description: '1-based line number to start reading from (optional)' },
+          limit: { type: 'number', description: 'Maximum number of lines to read (optional)' },
         },
         required: ['path'],
       },
@@ -408,8 +519,25 @@ export async function executeTool(
     case 'read_file': {
       const path = typeof args['path'] === 'string' ? args['path'] : undefined;
       if (!path) return 'Error: read_file requires "path"';
+      const offsetArg = typeof args['offset'] === 'number' ? args['offset'] : undefined;
+      const limitArg = typeof args['limit'] === 'number' ? args['limit'] : undefined;
       try {
-        return await readFile(path, 'utf8');
+        const raw = await readFile(path, 'utf8');
+        const allLines = raw.split('\n');
+        const totalLines = allLines.length;
+        const startLine = Math.max(1, Math.min(offsetArg ?? 1, totalLines));
+        const endLine = limitArg !== undefined
+          ? Math.min(startLine + limitArg - 1, totalLines)
+          : totalLines;
+        const slice = allLines.slice(startLine - 1, endLine);
+        const numbered = slice.map((line, i) => {
+          const lineNum = String(startLine + i).padStart(5, '0');
+          return `${lineNum}|${line}`;
+        }).join('\n');
+        const footer = endLine < totalLines
+          ? `\n... (showing lines ${startLine}-${endLine} of ${totalLines}; use offset/limit to read more)`
+          : '';
+        return numbered + footer;
       } catch (error) {
         return `Error reading file: ${String(error)}`;
       }
@@ -448,11 +576,13 @@ export async function executeTool(
         for (let i = 0; i < parsed.length; i += 1) {
           const { search, replace } = parsed[i]!;
           if (typeof search !== 'string') return `Error: edit[${i}].search must be a string`;
-          if (!content.includes(search)) {
-            return `Error: edit[${i}] search string not found in file. Make sure it matches exactly (whitespace and indentation included).\nSearch string was:\n${search}`;
+          const matched = fuzzyFind(content, search);
+          if (matched === undefined) {
+            return `Error: edit[${i}] search string not found in file (tried 8 fuzzy strategies). Make sure the block exists in the file.\nSearch string was:\n${search}`;
           }
-          content = content.replace(search, replace ?? '');
-          log.push(`edit[${i}]: replaced ${search.length} chars`);
+          const usedFuzzy = matched !== search;
+          content = content.replace(matched, replace ?? '');
+          log.push(`edit[${i}]: replaced ${matched.length} chars${usedFuzzy ? ' (fuzzy match)' : ''}`);
         }
 
         try {
