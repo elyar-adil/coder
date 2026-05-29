@@ -534,6 +534,42 @@ code, pre { font-family: var(--font-mono); }
   color: var(--text-muted);
   margin-bottom: 6px;
 }
+.output-progress {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 8px;
+  padding: 4px 8px;
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  background: rgba(91,163,201,.08);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 1.2;
+}
+.output-progress.done { background: rgba(109,170,127,.10); color: var(--success); }
+.output-progress.failed { background: rgba(192,112,112,.10); color: var(--danger); }
+.output-progress.waiting { color: var(--accent-hi); border-color: rgba(91,163,201,.35); }
+.output-spinner {
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(91,163,201,.25);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: output-spin .75s linear infinite;
+  flex-shrink: 0;
+}
+.output-progress.done .output-spinner,
+.output-progress.failed .output-spinner {
+  animation: none;
+  border: 0;
+  width: auto;
+  height: auto;
+}
+.output-progress.done .output-spinner::before { content: '\2713'; }
+.output-progress.failed .output-spinner::before { content: '\2717'; }
+.output-empty { color: var(--text-muted); font-style: italic; }
+@keyframes output-spin { to { transform: rotate(360deg); } }
 
 /* ── Thinking block ─────────────────────────────────────────────────────── */
 .thinking-block {
@@ -1429,6 +1465,7 @@ function makeTaskCard(task) {
   wrap.appendChild(streamEl);
 
   taskEls.set(task.taskId, { card: wrap, statusPill, phaseBar, streamEl, streamText: '' });
+  if (task.result || isTaskOutputActive(task.status)) setTaskCardOutput(task.taskId, task.result || '');
   updateTaskGoalBadge(task.taskId, visibleTaskGoal(task));
   updateTaskTodos(task.taskId, task.todos || []);
   return wrap;
@@ -1440,6 +1477,7 @@ function updateTaskCard(taskId, updates) {
   if (updates.status !== undefined) {
     els.statusPill.className = `task-status-pill ${statusClass(updates.status)}`;
     els.statusPill.textContent = `${statusIcon(updates.status)} ${updates.status}`;
+    refreshTaskOutputStatus(taskId);
   }
   if (updates.title !== undefined) {
     els.card.querySelector('.task-card-title').textContent = updates.title;
@@ -1506,10 +1544,38 @@ function renderStreamWithThinking(text) {
   }).join('');
 }
 
+function isTaskOutputActive(status) {
+  return ['queued', 'running', 'waiting_user', 'blocked'].includes(status);
+}
+function outputProgressLabel(task, status) {
+  if (status === 'queued') return '等待开始…';
+  if (status === 'waiting_user') return '等待用户回复…';
+  if (status === 'blocked') return '已暂停，等待下一步…';
+  if (status === 'completed') return '输出已结束';
+  if (status === 'failed') return '输出失败';
+  const phase = task?.phaseEvents?.slice?.().reverse?.().find?.(p => p.status === 'in_progress')?.phase;
+  return phase ? `${PHASE_LABEL[phase] || phase}中，模型正在思考…` : '模型正在思考并生成输出…';
+}
+function renderOutputProgress(task, hasText) {
+  const status = task?.status || 'running';
+  const active = isTaskOutputActive(status);
+  const cls = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : 'waiting';
+  const empty = !hasText && active ? '<div class="output-empty">输出即将实时显示在这里。</div>' : '';
+  return `${empty}<div class="output-progress ${cls}" aria-live="polite"><span class="output-spinner"></span><span>${escHtml(outputProgressLabel(task, status))}</span></div>`;
+}
 function renderTaskOutputHtml(taskId, text) {
   const task = state.tasks.get(taskId);
   const label = taskAgentLabel(task, 'Task');
-  return `<div class="task-output-source">${escHtml(label)} output</div>${renderStreamWithThinking(text)}`;
+  const body = String(text || '').trim() ? renderStreamWithThinking(text) : '';
+  return `<div class="task-output-source">${escHtml(label)} output</div>${body}${renderOutputProgress(task, Boolean(body))}`;
+}
+function refreshTaskOutputStatus(taskId) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  const task = state.tasks.get(taskId);
+  if (!task || (!els.streamText && !isTaskOutputActive(task.status) && !task.result)) return;
+  els.streamEl.style.display = 'block';
+  els.streamEl.innerHTML = renderTaskOutputHtml(taskId, els.streamText || task.result || '');
 }
 function setTaskCardOutput(taskId, text) {
   const els = taskEls.get(taskId);
