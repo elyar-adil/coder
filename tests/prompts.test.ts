@@ -29,4 +29,12 @@ describe('prompt language policy', () => {
       assert.match(prompt, /If the latest user prompt is Chinese/);
     }
   });
+
+  it('teaches agents to use explicit download markers only for artifacts', () => {
+    assert.match(PRESENTATION_SYSTEM_PROMPT, /\[\[download:\/path\/to\/file\.ext\]\]/);
+    assert.match(PRESENTATION_SYSTEM_PROMPT, /Do not mark ordinary/);
+    assert.match(WORKER_SYSTEM_PROMPT, /\[\[download:\/path\/to\/file\.ext\]\]/);
+    assert.match(WORKER_SYSTEM_PROMPT, /ordinary repository\/source paths/);
+  });
+
 });
