@@ -106,7 +106,8 @@ function artifactContext(artifactDir?: string): string {
     'Artifact workspace:',
     `- Default session artifact directory: ${artifactDir}`,
     '- Save temporary deliverables there unless the user explicitly asks for another path or the task is editing repository code.',
-    '- When reporting a generated file, mention only the file name or exact path once; the UI will expose a download link.',
+    '- When the user should download a generated artifact, report it with [[download:/exact/path/to/file.ext]] or [[download:/exact/path/to/file.ext|file.ext]].',
+    '- Do not use the download marker for ordinary repository/source paths; plain paths remain plain text.',
   ].join('\n');
 }
 
@@ -1396,10 +1397,8 @@ export class MasterCoordinator {
           task.summary = planner.summary;
           task.readOnly = planner.readOnly;
           task.plan = planner.steps;
-          if (planner.todos?.length) {
-            task.todos = planner.todos;
-            this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
-          }
+          task.todos = this.todosFromPlanner(planner);
+          this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
           await this.persist(task);
           this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
           yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
@@ -1469,6 +1468,8 @@ export class MasterCoordinator {
         task.summary = planner.summary;
         task.readOnly = planner.readOnly;
         task.plan = planner.steps;
+        task.todos = this.todosFromPlanner(planner);
+        this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
         await this.persist(task);
         this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
         yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
@@ -1494,6 +1495,10 @@ export class MasterCoordinator {
 
         const fullResult = yield* this.streamPlannerDrivenFlow(task, conversationHistory, toolCtx, planner.steps);
         task.result = fullResult;
+        if (task.todos?.length) {
+          task.todos = task.todos.map((todo) => ({ ...todo, status: 'done' as const }));
+          this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
+        }
         task.status = 'completed';
         task.completedAt = now();
         await this.persist(task);
@@ -1558,6 +1563,23 @@ export class MasterCoordinator {
       { role: 'user', content: `[Context summary from previous iterations]\n${summary}` },
       ...(userMsg ? [{ role: 'user' as const, content: userMsg }] : []),
     ];
+  }
+
+  private todosFromPlanner(planner: ParsedPlannerDecision): TodoItem[] {
+    const source = planner.todos?.length
+      ? planner.todos
+      : planner.steps.map((step, index) => ({
+          id: `step-${index + 1}`,
+          text: step.title || step.detail || `Step ${index + 1}`,
+          status: 'pending' as const,
+        }));
+    return source
+      .filter((todo) => todo.text.trim())
+      .map((todo, index) => ({
+        id: todo.id || `step-${index + 1}`,
+        text: todo.text,
+        status: index === 0 && todo.status === 'pending' ? 'in_progress' : todo.status,
+      }));
   }
 
   // ── Goal verification ─────────────────────────────────────────────────

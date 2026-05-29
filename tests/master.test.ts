@@ -204,6 +204,20 @@ describe('MasterCoordinator', () => {
       });
     });
 
+    test('stores user-visible todos from planner steps', async () => {
+      await withMockBackend(async (baseUrl) => {
+        const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
+        let taskId = '';
+        for await (const chunk of coordinator.streamPrompt('u', 'hello', 'build')) {
+          if (chunk.type === 'task_id') taskId = chunk.taskId;
+        }
+        const task = coordinator.getTask(taskId);
+        assert.equal(task?.todos?.length, 1);
+        assert.equal(task?.todos?.[0]?.text, 'Answer request');
+        assert.equal(task?.todos?.[0]?.status, 'done');
+      });
+    });
+
     test('uses planner-selected bash step for arithmetic without design phase', async () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });

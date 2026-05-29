@@ -527,6 +527,13 @@ code, pre { font-family: var(--font-mono); }
   white-space: normal;
   word-break: break-word;
 }
+.task-output-source {
+  font-size: 10.5px;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
 
 /* ── Thinking block ─────────────────────────────────────────────────────── */
 .thinking-block {
@@ -578,6 +585,24 @@ code, pre { font-family: var(--font-mono); }
 .goal-in_progress { background: var(--surface3); color: var(--accent); border: 1px solid var(--accent); }
 .goal-achieved { background: rgba(109,170,127,.12); color: var(--success); border: 1px solid var(--success); }
 .goal-failed { background: rgba(192,112,112,.12); color: var(--danger); border: 1px solid var(--danger); }
+
+.task-goal {
+  margin: 6px 14px 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: linear-gradient(180deg, rgba(111,177,214,.08), rgba(111,177,214,.03));
+}
+.task-goal-label {
+  font-size: 10px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  font-weight: 700;
+  margin-bottom: 3px;
+}
+.task-goal-text { font-size: 12.5px; color: var(--text); line-height: 1.45; }
+.task-goal-criteria { margin-top: 3px; font-size: 11.5px; color: var(--text-muted); line-height: 1.35; }
 
 .task-todos {
   margin: 4px 14px 6px;
@@ -1136,7 +1161,7 @@ function displayFileName(filePath) {
 }
 const FILE_EXT_PATTERN = '(?:pptx?|pdf|docx?|xlsx?|csv|zip|tar\\.gz|png|jpe?g|gif|webp|svg|html?|md|txt|json)';
 const FILE_EXT_RE = new RegExp('\\.(' + FILE_EXT_PATTERN + ')$', 'i');
-const AUTO_FILE_RE = new RegExp('(^|[\\s([{\'"])((?:file://)?(?:~/|/|\\.{1,2}/)?[A-Za-z0-9_@%+./~-]+\\.' + FILE_EXT_PATTERN + ')(?![A-Za-z0-9_@%+.-])', 'gi');
+const DOWNLOAD_MARKER_RE = /\[\[download:([^\]|]+)(?:\|([^\]]+))?\]\]/gi;
 function normalizeLocalFilePath(value) {
   const raw = String(value || '').trim().replace(/^<|>$/g, '');
   if (!raw) return '';
@@ -1145,8 +1170,9 @@ function normalizeLocalFilePath(value) {
   }
   return raw;
 }
-function looksLikeDownloadableFile(value) {
-  const path = normalizeLocalFilePath(value);
+function isDownloadMarkerPath(value) {
+  const raw = String(value || '').trim().replace(/^<|>$/g, '');
+  const path = normalizeLocalFilePath(raw);
   return Boolean(path) && FILE_EXT_RE.test(path) && !/^[a-z][a-z0-9+.-]*:/i.test(path);
 }
 function downloadHref(filePath) {
@@ -1154,26 +1180,29 @@ function downloadHref(filePath) {
 }
 function fileLinkHtml(filePath, label) {
   const path = normalizeLocalFilePath(filePath);
-  const text = displayFileName(path || label);
-  return `<a class="file-link" href="${escAttr(downloadHref(path))}" download title="${escAttr(path)}"><span>Download</span><code>${escHtml(text)}</code></a>`;
+  const text = String(label || '').trim() || displayFileName(path);
+  return `<a class="file-link" href="${escAttr(downloadHref(path))}" download title="${escAttr(path)}"><code>${escHtml(text)}</code></a>`;
+}
+function replaceDownloadMarkers(text, render) {
+  return String(text ?? '').replace(DOWNLOAD_MARKER_RE, (match, filePath, label) => {
+    const path = String(filePath || '').trim();
+    if (!isDownloadMarkerPath(path)) return match;
+    return render(path, String(label || '').trim() || displayFileName(path));
+  });
 }
 function renderInlineMarkdown(raw) {
   const tokens = [];
   const stash = (html) => {
     const id = tokens.push(html) - 1;
-    return `\uE000${id}\uE001`;
+    return `${id}`;
   };
   let text = String(raw ?? '');
 
-  text = text.replace(/`([^`\n]+)`/g, (_m, code) => {
-    const trimmed = code.trim();
-    if (looksLikeDownloadableFile(trimmed)) return stash(fileLinkHtml(trimmed, trimmed));
-    return stash(`<code>${escHtml(code)}</code>`);
-  });
+  text = text.replace(/`([^`\n]+)`/g, (_m, code) => stash(`<code>${escHtml(code)}</code>`));
+  text = replaceDownloadMarkers(text, (filePath, label) => stash(fileLinkHtml(filePath, label)));
 
   text = text.replace(/\[([^\]]+)\]\(([^)]+)\)/g, (match, label, hrefRaw) => {
     const href = String(hrefRaw).trim().replace(/^<|>$/g, '').replace(/\s+["'][\s\S]*$/, '');
-    if (looksLikeDownloadableFile(href)) return stash(fileLinkHtml(href, label));
     if (/^(https?:\/\/|mailto:)/i.test(href)) {
       return stash(`<a href="${escAttr(href)}" target="_blank" rel="noreferrer">${renderInlineMarkdown(label)}</a>`);
     }
@@ -1182,7 +1211,6 @@ function renderInlineMarkdown(raw) {
 
   let html = escHtml(text);
   html = html.replace(/https?:\/\/[^\s<)]+/g, (url) => stash(`<a href="${escAttr(url)}" target="_blank" rel="noreferrer">${escHtml(url)}</a>`));
-  html = html.replace(AUTO_FILE_RE, (_m, prefix, filePath) => `${prefix}${stash(fileLinkHtml(filePath, filePath))}`);
   html = html
     .replace(/\*\*\*([^*]+)\*\*\*/g, '<strong><em>$1</em></strong>')
     .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
@@ -1190,11 +1218,63 @@ function renderInlineMarkdown(raw) {
     .replace(/\*([^*]+)\*/g, '<em>$1</em>')
     .replace(/_([^_]+)_/g, '<em>$1</em>')
     .replace(/~~([^~]+)~~/g, '<del>$1</del>');
-  return html.replace(/\uE000(\d+)\uE001/g, (_m, id) => tokens[Number(id)] || '');
+  return html.replace(/(\d+)/g, (_m, id) => tokens[Number(id)] || '');
 }
+
+function markdownTableCells(line) {
+  const trimmed = String(line ?? '').trim();
+  if (!trimmed.includes('|')) return [];
+  const withoutEdges = trimmed.replace(/^\|/, '').replace(/\|$/, '');
+  return withoutEdges.split('|').map(cell => cell.trim());
+}
+function isMarkdownTableRow(line) {
+  const trimmed = String(line ?? '').trim();
+  if (!trimmed.startsWith('|')) return false;
+  return markdownTableCells(trimmed).length >= 2;
+}
+function isMarkdownTableSeparator(line) {
+  const cells = markdownTableCells(line);
+  return cells.length > 0 && cells.every(cell => /^:?-{1,}:?$/.test(cell));
+}
+function markdownTableSeparator(columnCount) {
+  return '| ' + Array.from({ length: Math.max(2, columnCount) }, () => '---').join(' | ') + ' |';
+}
+function isInsideOpenFence(text) {
+  let open = false;
+  for (const line of String(text ?? '').split('\n')) {
+    if (/^\s*```/.test(line)) open = !open;
+  }
+  return open;
+}
+function normalizeStreamingMarkdownTables(text) {
+  const raw = String(text ?? '');
+  if (!raw || isInsideOpenFence(raw)) return raw;
+
+  const lines = raw.split('\n');
+  let end = lines.length - 1;
+  while (end >= 0 && lines[end] === '') end -= 1;
+  if (end < 0 || (!isMarkdownTableRow(lines[end]) && !isMarkdownTableSeparator(lines[end]))) return raw;
+
+  let start = end;
+  while (start > 0 && (isMarkdownTableRow(lines[start - 1]) || isMarkdownTableSeparator(lines[start - 1]))) start -= 1;
+  if (!isMarkdownTableRow(lines[start])) return raw;
+
+  const headerColumnCount = markdownTableCells(lines[start]).length;
+  if (headerColumnCount < 2) return raw;
+
+  const next = lines[start + 1];
+  const replacement = lines.slice();
+  if (next === undefined || !isMarkdownTableSeparator(next)) {
+    replacement.splice(start + 1, 0, markdownTableSeparator(headerColumnCount));
+  } else if (markdownTableCells(next).length < headerColumnCount) {
+    replacement[start + 1] = markdownTableSeparator(headerColumnCount);
+  }
+  return replacement.join('\n');
+}
+
 function renderMarkdown(text) {
   if (typeof marked === 'undefined') return escHtml(String(text ?? ''));
-  const raw = String(text ?? '');
+  const raw = normalizeStreamingMarkdownTables(replaceDownloadMarkers(String(text ?? ''), (filePath, label) => fileLinkHtml(filePath, label)));
   const renderer = new marked.Renderer();
 
   renderer.code = function({ text, lang }) {
@@ -1208,9 +1288,6 @@ function renderMarkdown(text) {
   renderer.link = function({ href, title, tokens }) {
     const label = this.parser.parseInline(tokens);
     const titleAttr = title ? ` title="${escAttr(title)}"` : '';
-    if (href && looksLikeDownloadableFile(href)) {
-      return fileLinkHtml(href, typeof label === 'string' ? label.replace(/<[^>]+>/g, '') : href);
-    }
     if (href && /^(https?:\/\/|mailto:)/i.test(href)) {
       return `<a href="${escAttr(href)}"${titleAttr} target="_blank" rel="noreferrer">${label}</a>`;
     }
@@ -1218,13 +1295,10 @@ function renderMarkdown(text) {
   };
 
   renderer.codespan = function({ text }) {
-    if (looksLikeDownloadableFile(text)) return fileLinkHtml(text, text);
     return `<code>${escHtml(text)}</code>`;
   };
 
   let html = marked.parse(raw, { renderer, breaks: false, gfm: true });
-
-  html = html.replace(AUTO_FILE_RE, (_m, prefix, filePath) => `${prefix}${fileLinkHtml(filePath, filePath)}`);
 
   return html;
 }
@@ -1254,6 +1328,15 @@ function appendToFeed(el) {
   if (wasEmpty) wasEmpty.style.display = 'none';
   feed.appendChild(el);
   scrollToBottom();
+}
+
+function taskAgentLabel(task, fallback='Agent') {
+  if (!task) return fallback;
+  const short = String(task.taskId || '').slice(0, 8);
+  const kind = String(task.kind || task.agentRole || 'agent').replaceAll('_', ' ');
+  const role = task.agentRole && task.agentRole !== task.kind ? String(task.agentRole).replaceAll('_', ' ') : '';
+  const name = role ? `${role} ${kind}` : kind;
+  return `${name} · ${short}`;
 }
 
 function makeMsgRow(avatarClass, avatarChar, fromLabel, fromClass, ts, bodyHtml) {
@@ -1346,6 +1429,8 @@ function makeTaskCard(task) {
   wrap.appendChild(streamEl);
 
   taskEls.set(task.taskId, { card: wrap, statusPill, phaseBar, streamEl, streamText: '' });
+  updateTaskGoalBadge(task.taskId, visibleTaskGoal(task));
+  updateTaskTodos(task.taskId, task.todos || []);
   return wrap;
 }
 
@@ -1421,12 +1506,26 @@ function renderStreamWithThinking(text) {
   }).join('');
 }
 
+function renderTaskOutputHtml(taskId, text) {
+  const task = state.tasks.get(taskId);
+  const label = taskAgentLabel(task, 'Task');
+  return `<div class="task-output-source">${escHtml(label)} output</div>${renderStreamWithThinking(text)}`;
+}
+function setTaskCardOutput(taskId, text) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  els.streamEl.style.display = 'block';
+  els.streamText = String(text || '');
+  els.streamEl.innerHTML = renderTaskOutputHtml(taskId, els.streamText);
+  els.streamEl.scrollTop = els.streamEl.scrollHeight;
+  scrollToBottom();
+}
 function appendStreamToCard(taskId, text) {
   const els = taskEls.get(taskId);
   if (!els) return;
   els.streamEl.style.display = 'block';
   els.streamText = (els.streamText || '') + text;
-  els.streamEl.innerHTML = renderStreamWithThinking(els.streamText);
+  els.streamEl.innerHTML = renderTaskOutputHtml(taskId, els.streamText);
   els.streamEl.scrollTop = els.streamEl.scrollHeight;
   scrollToBottom();
 }
@@ -1555,10 +1654,30 @@ function updateTaskTodos(taskId, todos) {
   }).join('');
 }
 
+function visibleTaskGoal(task) {
+  if (!task) return null;
+  if (task.goal) return task.goal;
+  const description = String(task.prompt || task.summary || '').trim();
+  if (!description) return null;
+  const status = task.status === 'completed' ? 'achieved' : task.status === 'failed' ? 'failed' : 'in_progress';
+  return {
+    description,
+    completionCriteria: 'Complete the user request and verification steps.',
+    status,
+  };
+}
+
 function updateTaskGoalBadge(taskId, goal) {
   const els = taskEls.get(taskId);
-  if (!els || !goal) return;
-  let badge = els.card.querySelector('.goal-badge');
+  if (!els) return;
+  const existingPanel = els.card.querySelector('.task-goal');
+  const existingBadge = els.card.querySelector('.goal-badge');
+  if (!goal) {
+    if (existingPanel) existingPanel.remove();
+    if (existingBadge) existingBadge.remove();
+    return;
+  }
+  let badge = existingBadge;
   if (!badge) {
     badge = document.createElement('div');
     badge.className = 'goal-badge';
@@ -1568,6 +1687,15 @@ function updateTaskGoalBadge(taskId, goal) {
   const label = goal.status === 'achieved' ? 'Goal \u2713' : goal.status === 'failed' ? 'Goal \u2717' : `Goal (${goal.status})`;
   badge.textContent = label;
   badge.className = `goal-badge goal-${goal.status}`;
+
+  let panel = existingPanel;
+  if (!panel) {
+    panel = document.createElement('div');
+    panel.className = 'task-goal';
+    els.card.insertBefore(panel, els.streamEl);
+  }
+  const criteria = goal.completionCriteria ? `<div class="task-goal-criteria">Criteria: ${escHtml(goal.completionCriteria)}</div>` : '';
+  panel.innerHTML = `<div class="task-goal-label">Goal</div><div class="task-goal-text">${escHtml(goal.description)}</div>${criteria}`;
 }
 
 function statusToColor(s) {
@@ -1906,6 +2034,8 @@ function handleEvent(msg) {
       if (task.taskId === '__system__') return;
       state.tasks.set(task.taskId, task);
       updateTaskCard(task.taskId, { status: task.status, title: task.summary || task.prompt });
+      updateTaskGoalBadge(task.taskId, visibleTaskGoal(task));
+      updateTaskTodos(task.taskId, task.todos || []);
       updateSidebarItem(task.taskId, task.status, event.ts);
       break;
     }
@@ -1915,7 +2045,8 @@ function handleEvent(msg) {
       break;
     }
     case 'user_visible_message': {
-      const row = makeMsgRow('master','P','Agent','master-label', event.ts, renderMarkdown(event.text));
+      const task = event.taskId ? state.tasks.get(event.taskId) : null;
+      const row = makeMsgRow('master','P',taskAgentLabel(task, 'Agent'), 'master-label', event.ts, renderMarkdown(event.text));
       appendToFeed(row);
       break;
     }
@@ -2029,7 +2160,12 @@ function handleEvent(msg) {
       break;
     }
     case 'task_done': {
+      const task = state.tasks.get(event.taskId);
+      if (task) task.status = event.status;
       updateTaskCard(event.taskId, { status: event.status });
+      updateTaskGoalBadge(event.taskId, visibleTaskGoal(task));
+      const els = taskEls.get(event.taskId);
+      if (event.result && els && !(els.streamText || '').trim()) setTaskCardOutput(event.taskId, event.result);
       updateSidebarItem(event.taskId, event.status, event.ts);
       break;
     }
@@ -2047,10 +2183,10 @@ function hydrateTask(task) {
   appendToFeed(card);
   const li = makeSidebarItem(task);
   taskList.appendChild(li);
-  if (task.todos?.length) updateTaskTodos(task.taskId, task.todos);
+  updateTaskTodos(task.taskId, task.todos || []);
   if (task.goal) updateTaskGoalBadge(task.taskId, task.goal);
   (task.visibleMessages || []).forEach(message => {
-    const row = makeMsgRow('master','P','Agent','master-label', message.ts, renderMarkdown(message.text));
+    const row = makeMsgRow('master','P',taskAgentLabel(task, 'Agent'), 'master-label', message.ts, renderMarkdown(message.text));
     appendToFeed(row);
   });
 }

@@ -78,8 +78,10 @@ Responsibilities:
 - Write only the user-visible response.
 - Summarize worker and writer results clearly without exposing raw tool logs.
 - Mention conflicts, verification failures, or user action needed when relevant.
-- If the work created a downloadable artifact, preserve the exact workspace
-  file path in the response so the UI can turn it into a download link.
+- If the work created an artifact the user should download, wrap its exact
+  workspace path in the explicit download marker \`[[download:/path/to/file.ext]]\`
+  (optionally \`[[download:/path/to/file.ext|file.ext]]\`). Do not mark ordinary
+  source paths or diagnostic paths as downloads.
 - Keep the response concise.
 
 ${USER_LANGUAGE_RULE}
@@ -162,7 +164,10 @@ Core rules:
 9. For generated deliverable files such as PPT, PDF, CSV, ZIP, images, or HTML,
    save them in the configured artifact directory when one is provided; if you
    use write_file with a simple relative file name, it is resolved there.
-   Report only the file name or exact path once.
+   When the user should download a generated artifact, report it with the
+   explicit marker \`[[download:/path/to/file.ext]]\` or
+   \`[[download:/path/to/file.ext|file.ext]]\`. Do not use this marker for
+   ordinary repository/source paths.
 
 ${USER_LANGUAGE_RULE}
 `;
