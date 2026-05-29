@@ -107,6 +107,44 @@ interface SseClient {
   res: ServerResponse;
 }
 
+export function shutdownWebServer(
+  server: ReturnType<typeof createServer>,
+  clients: Map<string, SseClient>,
+  unsubscribe: () => void,
+  timeoutMs = 1500,
+): Promise<void> {
+  let settled = false;
+  return new Promise((resolveP) => {
+    const finish = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveP();
+    };
+
+    try { unsubscribe(); } catch { /* ignore cleanup errors */ }
+    for (const client of clients.values()) {
+      try { client.res.write('event: close\ndata: {"reason":"server_shutdown"}\n\n'); } catch { /* ignore disconnected clients */ }
+      try { client.res.end(); } catch { /* ignore disconnected clients */ }
+    }
+    clients.clear();
+
+    try { server.closeIdleConnections?.(); } catch { /* ignore unsupported or already closed server */ }
+
+    const timer = setTimeout(() => {
+      try { server.closeAllConnections?.(); } catch { /* ignore unsupported or already closed server */ }
+      finish();
+    }, timeoutMs);
+    timer.unref?.();
+
+    try {
+      server.close(() => finish());
+    } catch {
+      finish();
+    }
+  });
+}
+
 function sseWrite(res: ServerResponse, event: unknown): void {
   try {
     res.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -356,7 +394,7 @@ export async function runWeb(
 
   let activeModelName = modelName;
   let activeModelAliases = configModelAliases(loadedConfig.config, activeModelName, modelAliases);
-  let activeMode: TaskMode = 'execute';
+  let activeMode: TaskMode = 'build';
 
   const clients = new Map<string, SseClient>();
   let clientSeq = 0;
@@ -603,8 +641,8 @@ export async function runWeb(
       try {
         const body = JSON.parse(await readBody(req)) as { mode?: TaskMode };
         const mode = body.mode;
-        if (mode !== 'execute' && mode !== 'plan' && mode !== 'react') {
-          json(res, 400, { error: 'mode must be execute|plan|react' }); return;
+        if (mode !== 'build' && mode !== 'plan') {
+          json(res, 400, { error: 'mode must be build|plan' }); return;
         }
         activeMode = mode;
         broadcast({ channel: 'mode_changed', mode, ts: new Date().toISOString() });
@@ -673,11 +711,24 @@ export async function runWeb(
 
   // Keep the process alive; clean up on signal
   await new Promise<void>((resolveP) => {
-    const shutdown = (): void => {
-      unsubscribe();
-      server.close(() => resolveP());
+    let shuttingDown = false;
+    const cleanupSignalHandlers = (): void => {
+      process.off('SIGINT', onSigint);
+      process.off('SIGTERM', onSigterm);
     };
-    process.on('SIGINT', shutdown);
-    process.on('SIGTERM', shutdown);
+    const shutdown = (signal: NodeJS.Signals): void => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      console.log(`\n  ${signal} received; shutting down Coder Web UI...`);
+      void shutdownWebServer(server, clients, unsubscribe).then(() => {
+        cleanupSignalHandlers();
+        console.log('  Coder Web UI stopped.');
+        resolveP();
+      });
+    };
+    const onSigint = (): void => shutdown('SIGINT');
+    const onSigterm = (): void => shutdown('SIGTERM');
+    process.on('SIGINT', onSigint);
+    process.on('SIGTERM', onSigterm);
   });
 }

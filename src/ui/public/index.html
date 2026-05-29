@@ -31,6 +31,26 @@
   --font-sans:    'Inter', system-ui, sans-serif;
   --sidebar-w:    260px;
 }
+[data-theme="light"] {
+  --bg:           #f5f7fa;
+  --surface:      #ffffff;
+  --surface2:     #edf0f4;
+  --surface3:     #dde3ea;
+  --border:       #c8d0da;
+  --border-soft:  #d8dfe8;
+  --text:         #1a2332;
+  --text-muted:   #6b7a8d;
+  --text-soft:    #4a5568;
+  --accent:       #2b7cad;
+  --accent-hi:    #1a6a9e;
+  --plan-accent:  #9b4d94;
+  --success:      #2d8a4e;
+  --warning:      #9a7a20;
+  --danger:       #b04040;
+  --running:      #2b7cad;
+  --tool-bg:      #f0f2f5;
+}
+
 html, body { height: 100%; }
 body {
   background: var(--bg);
@@ -80,6 +100,10 @@ code, pre { font-family: var(--font-mono); }
   gap: 8px;
 }
 #sidebar-header .logo { font-size: 17px; font-weight: 700; letter-spacing: -.3px; color: var(--text); }
+#logo-dot { transition: color .3s; }
+#logo-dot.disconnected { color: var(--danger); }
+#logo-dot.connecting { color: var(--warning); }
+#logo-dot.connected { color: var(--success); }
 #sidebar-header .ver { font-size: 11px; color: var(--text-muted); margin-left: auto; }
 
 .section-label {
@@ -113,27 +137,60 @@ code, pre { font-family: var(--font-mono); }
 .task-item .task-time { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
 
 .mode-row {
-  display: flex; gap: 4px;
+  position: relative;
+  flex-shrink: 0;
 }
-.mode-btn {
-  flex: 1;
-  padding: 4px 0;
-  border-radius: var(--radius);
-  font-size: 11.5px;
-  font-weight: 500;
-  color: var(--text-muted);
+.mode-trigger {
+  padding: 0 12px;
+  height: 40px;
+  min-width: 56px;
+  border-radius: var(--radius-lg);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-hi);
+  background: var(--surface3);
+  border: 1px solid var(--accent);
+  transition: color .15s, border-color .15s, background .15s;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.mode-trigger:hover { border-color: var(--accent-hi); }
+.mode-dropdown {
+  display: none;
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  min-width: 120px;
   background: var(--surface2);
   border: 1px solid var(--border);
-  transition: all .15s;
-  text-align: center;
+  border-radius: var(--radius);
+  overflow: hidden;
+  z-index: 100;
 }
-.mode-btn.active { background: var(--surface3); border-color: var(--accent); color: var(--accent-hi); }
-.mode-btn:hover:not(.active) { border-color: var(--border); color: var(--text-soft); }
+.mode-dropdown.open { display: block; }
+.mode-dropdown button {
+  display: block;
+  width: 100%;
+  padding: 7px 10px;
+  border: none;
+  background: none;
+  font-size: 11.5px;
+  font-weight: 500;
+  color: var(--text-soft);
+  text-align: left;
+  cursor: pointer;
+}
+.mode-dropdown button:hover { background: var(--surface3); color: var(--text); }
+.mode-dropdown button.active { color: var(--accent-hi); background: var(--surface3); }
+.mode-dropdown button .mode-hint {
+  float: right;
+  font-size: 10px;
+  color: var(--text-muted);
+}
 
 .model-row {
   display: flex; align-items: center; gap: 6px;
 }
-.model-label { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
 #model-select {
   flex: 1;
   padding: 3px 6px;
@@ -142,9 +199,26 @@ code, pre { font-family: var(--font-mono); }
   height: 26px;
   min-width: 0;
 }
-#model-config-btn {
-  height: 26px;
-  padding: 0 8px;
+#model-select optgroup { color: var(--text-muted); font-size: 10.5px; font-style: normal; }
+#model-select option { color: var(--text); }
+#sidebar-footer {
+  border-top: 1px solid var(--border-soft);
+  padding: 10px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#sidebar-footer #model-select {
+  width: 100%;
+  padding: 4px 6px;
+  font-size: 11.5px;
+  border-radius: var(--radius);
+  height: 28px;
+}
+#sidebar-footer #model-config-btn {
+  width: 100%;
+  height: 28px;
+  padding: 0 10px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: var(--surface2);
@@ -152,7 +226,16 @@ code, pre { font-family: var(--font-mono); }
   font-size: 11.5px;
   flex-shrink: 0;
 }
-#model-config-btn:hover { border-color: var(--accent); color: var(--accent-hi); }
+#sidebar-footer #model-config-btn:hover { border-color: var(--accent); color: var(--accent-hi); }
+#theme-toggle {
+  height: 28px;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  cursor: pointer;
+  line-height: 1;
+}
+#theme-toggle:hover { border-color: var(--accent); }
 
 /* ── Main panel ─────────────────────────────────────────────────────────── */
 #main {
@@ -179,7 +262,7 @@ code, pre { font-family: var(--font-mono); }
   animation: fadeIn .18s ease;
 }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
-.msg-row:hover { background: rgba(255,255,255,.015); }
+.msg-row:hover { background: var(--surface2); }
 
 .msg-avatar {
   width: 26px;
@@ -192,12 +275,11 @@ code, pre { font-family: var(--font-mono); }
   flex-shrink: 0;
   margin-top: 1px;
 }
-.msg-avatar.user    { background: #2a3f55; color: var(--accent-hi); }
-.msg-avatar.master  { background: #2e1e42; color: #b88ee0; }
-.msg-avatar.task    { background: #1b2e3f; color: var(--accent); }
-.msg-avatar.system  { background: var(--surface2); color: var(--text-muted); }
-.msg-avatar.tool    { background: #1b2b1e; color: var(--success); }
-.msg-avatar.warn    { background: #2e2210; color: var(--warning); }
+.msg-avatar.user    { background: var(--surface3); color: var(--accent-hi); }
+.msg-avatar.master  { background: var(--surface3); color: #b88ee0; }
+.msg-avatar.task    { background: var(--surface3); color: var(--accent); }
+.msg-avatar.tool    { background: var(--surface3); color: var(--success); }
+.msg-avatar.warn    { background: var(--surface3); color: var(--warning); }
 
 .msg-body { flex: 1; min-width: 0; }
 .msg-header {
@@ -270,8 +352,8 @@ code, pre { font-family: var(--font-mono); }
 .stream-block.md code {
   font-family: var(--font-mono);
   font-size: .92em;
-  background: rgba(255,255,255,.055);
-  border: 1px solid rgba(255,255,255,.06);
+  background: var(--surface3);
+  border: 1px solid var(--border-soft);
   border-radius: 4px;
   padding: 1px 4px;
 }
@@ -332,6 +414,33 @@ code, pre { font-family: var(--font-mono); }
   padding: 0;
 }
 
+/* ── Markdown tables ────────────────────────────────────────────────────── */
+.msg-text.md table,
+.stream-block.md table {
+  border-collapse: collapse;
+  margin: 8px 0;
+  width: 100%;
+  font-size: 12.5px;
+}
+.msg-text.md th, .stream-block.md th,
+.msg-text.md td, .stream-block.md td {
+  padding: 5px 10px;
+  border: 1px solid var(--border-soft);
+  white-space: nowrap;
+}
+.msg-text.md th, .stream-block.md th {
+  background: var(--surface3);
+  font-weight: 600;
+  color: var(--text);
+}
+.msg-text.md td, .stream-block.md td {
+  color: var(--text-soft);
+}
+.msg-text.md tr:hover td,
+.stream-block.md tr:hover td {
+  background: var(--surface2);
+}
+
 /* ── Task header card ───────────────────────────────────────────────────── */
 .task-card {
   margin: 10px 16px 0;
@@ -356,11 +465,9 @@ code, pre { font-family: var(--font-mono); }
   border-radius: 99px;
   text-transform: uppercase;
 }
-.task-card-header .task-badge.worker { background: #1a2e44; color: var(--accent); }
-.task-card-header .task-badge.derived_worker,
-.task-card-header .task-badge.sync_worker { background: #1f2f26; color: var(--success); }
-.task-card-header .task-badge.inquiry { background: #2a1e38; color: #b88ee0; }
-.task-card-header .task-badge.plan-mode { background: #251635; color: #d090d8; }
+.task-card-header .task-badge.worker { background: var(--surface3); color: var(--accent); }
+.task-card-header .task-badge.inquiry { background: var(--surface3); color: #b88ee0; }
+.task-card-header .task-badge.plan-mode { background: var(--surface3); color: #d090d8; }
 .task-card-id { font-size: 10.5px; color: var(--text-muted); font-family: var(--font-mono); }
 .task-card-title { font-size: 13px; font-weight: 600; color: var(--text); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-status-pill {
@@ -393,9 +500,9 @@ code, pre { font-family: var(--font-mono); }
   color: var(--text-muted);
   border: 1px solid transparent;
 }
-.phase-dot.active { background: #162640; border-color: var(--accent); color: var(--accent-hi); }
-.phase-dot.done   { background: #112218; border-color: var(--success); color: var(--success); }
-.phase-dot.failed { background: #250f0f; border-color: var(--danger);  color: var(--danger);  }
+.phase-dot.active { background: var(--surface3); border-color: var(--accent); color: var(--accent-hi); }
+.phase-dot.done   { background: var(--surface3); border-color: var(--success); color: var(--success); }
+.phase-dot.failed { background: var(--surface3); border-color: var(--danger);  color: var(--danger);  }
 .phase-dot .dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
 .phase-dot.active .dot { animation: pulse .9s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .3; } }
@@ -421,6 +528,78 @@ code, pre { font-family: var(--font-mono); }
   word-break: break-word;
 }
 
+/* ── Thinking block ─────────────────────────────────────────────────────── */
+.thinking-block {
+  margin: 4px 0 8px;
+  border-left: 2px solid var(--text-muted);
+  border-radius: 0 var(--radius) var(--radius) 0;
+  background: rgba(107,128,153,.06);
+  overflow: hidden;
+}
+.thinking-header {
+  padding: 5px 10px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  user-select: none;
+}
+.thinking-header:hover { background: rgba(107,128,153,.08); }
+.thinking-arrow {
+  font-size: 10px;
+  transition: transform .15s;
+  display: inline-block;
+}
+.thinking-block.open .thinking-arrow { transform: rotate(-90deg); }
+.thinking-label { font-weight: 500; }
+.thinking-body {
+  display: none;
+  padding: 4px 10px 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  max-height: 200px;
+  overflow-y: auto;
+  font-style: italic;
+}
+.thinking-block.open .thinking-body { display: block; }
+
+/* ── Goal + Todo ─────────────────────────────────────────────────────────── */
+.goal-badge {
+  display: inline-block;
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 99px;
+  margin-left: auto;
+  font-weight: 600;
+}
+.goal-in_progress { background: var(--surface3); color: var(--accent); border: 1px solid var(--accent); }
+.goal-achieved { background: rgba(109,170,127,.12); color: var(--success); border: 1px solid var(--success); }
+.goal-failed { background: rgba(192,112,112,.12); color: var(--danger); border: 1px solid var(--danger); }
+
+.task-todos {
+  margin: 4px 14px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: var(--radius);
+  background: var(--surface2);
+}
+.todo-check { flex-shrink: 0; font-size: 13px; line-height: 1.3; }
+.todo-done .todo-text { text-decoration: line-through; color: var(--text-muted); }
+.todo-active .todo-check { color: var(--accent); }
+.todo-active .todo-text { color: var(--text); }
+.todo-pending .todo-text { color: var(--text-soft); }
+
 /* ── Tool call collapsible ──────────────────────────────────────────────── */
 .tool-call {
   margin: 4px 14px;
@@ -438,7 +617,7 @@ code, pre { font-family: var(--font-mono); }
   font-size: 12px;
   user-select: none;
 }
-.tool-call-header:hover { background: rgba(255,255,255,.03); }
+.tool-call-header:hover { background: var(--surface3); }
 .tool-name { font-family: var(--font-mono); font-size: 11.5px; color: var(--success); font-weight: 600; }
 .tool-chevron { margin-left: auto; font-size: 10px; color: var(--text-muted); transition: transform .15s; }
 .tool-call.open .tool-chevron { transform: rotate(90deg); }
@@ -485,7 +664,7 @@ code, pre { font-family: var(--font-mono); }
 /* ── Clarification panel ────────────────────────────────────────────────── */
 #clarification-bar {
   display: none;
-  background: #1e1410;
+  background: var(--surface2);
   border-top: 1px solid var(--warning);
   padding: 10px 16px;
   gap: 10px;
@@ -513,23 +692,8 @@ code, pre { font-family: var(--font-mono); }
   background: var(--surface);
   padding: 10px 16px 12px;
   display: flex;
-  gap: 10px;
+  gap: 8px;
   align-items: stretch;
-}
-#composer-controls {
-  width: 268px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  justify-content: flex-end;
-}
-#composer-controls .mode-btn {
-  height: 26px;
-  padding: 0;
-}
-#composer-controls .model-row {
-  height: 26px;
 }
 #prompt-input {
   flex: 1;
@@ -547,7 +711,7 @@ code, pre { font-family: var(--font-mono); }
 #send-btn {
   padding: 9px 18px;
   background: var(--accent);
-  color: #05111d;
+  color: var(--bg);
   font-weight: 700;
   font-size: 13px;
   border-radius: var(--radius-lg);
@@ -616,6 +780,29 @@ code, pre { font-family: var(--font-mono); }
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 10px;
 }
+.config-section {
+  grid-column: 1 / -1;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  padding: 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--surface2);
+}
+.config-section-title {
+  grid-column: 1 / -1;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.config-section-title.required { color: var(--accent-hi); }
+.config-section-title.optional { color: var(--text-muted); }
 .field {
   display: flex;
   flex-direction: column;
@@ -627,6 +814,24 @@ code, pre { font-family: var(--font-mono); }
 .check-row {
   font-size: 11px;
   color: var(--text-muted);
+}
+.field.required label::after {
+  content: "Required";
+  margin-left: 6px;
+  color: var(--accent-hi);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.field.optional label::after {
+  content: "Optional";
+  margin-left: 6px;
+  color: var(--text-muted);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
 }
 .field input,
 .field select,
@@ -657,7 +862,7 @@ code, pre { font-family: var(--font-mono); }
 .config-btn.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #05111d;
+  color: var(--bg);
   font-weight: 700;
 }
 .config-error {
@@ -688,25 +893,6 @@ code, pre { font-family: var(--font-mono); }
 #empty-state .big { font-size: 36px; }
 #empty-state .label { font-size: 14px; color: var(--text-muted); }
 
-/* ── Connection pill ────────────────────────────────────────────────────── */
-#conn-status {
-  position: fixed;
-  bottom: 62px;
-  right: 14px;
-  font-size: 11px;
-  padding: 3px 10px;
-  border-radius: 99px;
-  background: var(--surface2);
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  display: flex; align-items: center; gap: 5px;
-  transition: opacity .3s;
-  z-index: 10;
-}
-#conn-status .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-muted); }
-#conn-status.connected .dot { background: var(--success); }
-#conn-status.disconnected .dot { background: var(--danger); }
-
 /* ── Scrolled-to-bottom indicator ───────────────────────────────────────── */
 #scroll-btn {
   display: none;
@@ -725,8 +911,8 @@ code, pre { font-family: var(--font-mono); }
 }
 @media (max-width: 760px) {
   #input-bar { flex-direction: column; }
-  #composer-controls { width: 100%; }
   #model-config-form { grid-template-columns: 1fr; }
+  .config-section { grid-template-columns: 1fr; }
 }
 </style>
 </head>
@@ -735,12 +921,20 @@ code, pre { font-family: var(--font-mono); }
   <!-- ── Sidebar ── -->
   <aside id="sidebar">
     <div id="sidebar-header">
-      <span class="logo">⬡ Coder</span>
+      <span class="logo"><span id="logo-dot" class="disconnected">⬡</span> Coder</span>
       <span class="ver" id="model-label">—</span>
     </div>
     <div class="section-label">Tasks</div>
     <div id="task-list">
       <div id="empty-sidebar" style="padding:12px 16px;font-size:12px;color:var(--text-muted);">No tasks yet.</div>
+    </div>
+    <div id="sidebar-footer">
+      <div class="section-label" style="padding:0 0 6px;">Model</div>
+      <select id="model-select"><option>—</option></select>
+      <div style="display:flex;gap:6px;">
+        <button id="model-config-btn" type="button" title="Configure model" style="flex:1;">Config</button>
+        <button id="theme-toggle" type="button" title="Toggle theme" style="flex:0 0 28px;font-size:14px;padding:0;">🌙</button>
+      </div>
     </div>
   </aside>
 
@@ -760,16 +954,11 @@ code, pre { font-family: var(--font-mono); }
       </div>
     </div>
     <div id="input-bar">
-      <div id="composer-controls">
-        <div class="mode-row" role="group" aria-label="Mode">
-          <button class="mode-btn active" data-mode="execute" title="Execute">Execute</button>
-          <button class="mode-btn" data-mode="plan" title="Plan">Plan</button>
-          <button class="mode-btn" data-mode="react" title="React">React</button>
-        </div>
-        <div class="model-row">
-          <span class="model-label">Model</span>
-          <select id="model-select"><option>—</option></select>
-          <button id="model-config-btn" type="button" title="Configure model">Config</button>
+      <div class="mode-row" role="group" aria-label="Mode">
+        <button class="mode-trigger" id="mode-trigger" title="Switch mode (Shift+Tab)">Build</button>
+        <div class="mode-dropdown" id="mode-dropdown">
+          <button data-mode="build" class="active">Build <span class="mode-hint">autonomous</span></button>
+          <button data-mode="plan">Plan <span class="mode-hint">read-only</span></button>
         </div>
       </div>
       <textarea id="prompt-input" rows="1" placeholder="Message Coder…"></textarea>
@@ -785,57 +974,63 @@ code, pre { font-family: var(--font-mono); }
       <button id="model-config-close" type="button" title="Close">x</button>
     </div>
     <form id="model-config-form">
-      <div class="field">
-        <label for="cfg-alias">Alias</label>
-        <input id="cfg-alias" name="alias" autocomplete="off" required />
+      <div class="config-section">
+        <div class="config-section-title required">Required</div>
+        <div class="field required">
+          <label for="cfg-alias">Alias</label>
+          <input id="cfg-alias" name="alias" autocomplete="off" required />
+        </div>
+        <div class="field required">
+          <label for="cfg-model">Provider model</label>
+          <input id="cfg-model" name="model" autocomplete="off" required />
+        </div>
       </div>
-      <div class="field">
-        <label for="cfg-model">Provider model</label>
-        <input id="cfg-model" name="model" autocomplete="off" required />
-      </div>
-      <div class="field">
-        <label for="cfg-backend">Backend</label>
-        <select id="cfg-backend" name="backend">
-          <option value="">Auto</option>
-          <option value="ollama">Ollama</option>
-          <option value="openai">OpenAI</option>
-          <option value="anthropic">Anthropic</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="cfg-base-url">Base URL</label>
-        <input id="cfg-base-url" name="baseUrl" autocomplete="off" />
-      </div>
-      <div class="field">
-        <label for="cfg-api-key">API key</label>
-        <input id="cfg-api-key" name="apiKey" type="password" autocomplete="off" />
-      </div>
-      <div class="field">
-        <label for="cfg-context-window">Context window</label>
-        <input id="cfg-context-window" name="contextWindow" type="number" min="1" step="1" />
-      </div>
-      <div class="field">
-        <label for="cfg-temperature">Temperature</label>
-        <input id="cfg-temperature" name="temperature" type="number" min="0" max="2" step="0.01" />
-      </div>
-      <div class="field">
-        <label for="cfg-top-p">Top P</label>
-        <input id="cfg-top-p" name="topP" type="number" min="0" max="1" step="0.01" />
-      </div>
-      <div class="field">
-        <label for="cfg-max-tokens">Max tokens</label>
-        <input id="cfg-max-tokens" name="maxTokens" type="number" min="1" step="1" />
-      </div>
-      <div class="field">
-        <label for="cfg-artifacts-dir">Artifacts directory</label>
-        <input id="cfg-artifacts-dir" name="artifactsDir" autocomplete="off" />
-      </div>
-      <div class="field full">
-        <label for="cfg-extra-body">Extra body JSON</label>
-        <textarea id="cfg-extra-body" name="extraBody" spellcheck="false"></textarea>
-      </div>
-      <div class="field full">
-        <label class="check-row"><input id="cfg-select" name="select" type="checkbox" checked /> Select after save</label>
+      <div class="config-section">
+        <div class="config-section-title optional">Optional</div>
+        <div class="field optional">
+          <label for="cfg-backend">Backend</label>
+          <select id="cfg-backend" name="backend">
+            <option value="">Auto</option>
+            <option value="ollama">Ollama</option>
+            <option value="openai">OpenAI</option>
+            <option value="anthropic">Anthropic</option>
+          </select>
+        </div>
+        <div class="field optional">
+          <label for="cfg-base-url">Base URL</label>
+          <input id="cfg-base-url" name="baseUrl" autocomplete="off" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-api-key">API key</label>
+          <input id="cfg-api-key" name="apiKey" type="password" autocomplete="off" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-context-window">Context window</label>
+          <input id="cfg-context-window" name="contextWindow" type="number" min="1" step="1" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-temperature">Temperature</label>
+          <input id="cfg-temperature" name="temperature" type="number" min="0" max="2" step="0.01" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-top-p">Top P</label>
+          <input id="cfg-top-p" name="topP" type="number" min="0" max="1" step="0.01" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-max-tokens">Max tokens</label>
+          <input id="cfg-max-tokens" name="maxTokens" type="number" min="1" step="1" />
+        </div>
+        <div class="field optional">
+          <label for="cfg-artifacts-dir">Artifacts directory</label>
+          <input id="cfg-artifacts-dir" name="artifactsDir" autocomplete="off" />
+        </div>
+        <div class="field full optional">
+          <label for="cfg-extra-body">Extra body JSON</label>
+          <textarea id="cfg-extra-body" name="extraBody" spellcheck="false"></textarea>
+        </div>
+        <div class="field full optional">
+          <label class="check-row"><input id="cfg-select" name="select" type="checkbox" checked /> Select after save</label>
+        </div>
       </div>
     </form>
     <div class="config-actions">
@@ -846,19 +1041,16 @@ code, pre { font-family: var(--font-mono); }
   </div>
 </div>
 
-<div id="conn-status" class="disconnected">
-  <span class="dot"></span>
-  <span id="conn-label">connecting…</span>
-</div>
 <button id="scroll-btn">↓ new messages</button>
 
+<script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"></script>
 <script>
 // ── State ─────────────────────────────────────────────────────────────────
 const state = {
   tasks: new Map(),        // taskId → task object
   taskOrder: [],           // ordered list of taskIds (excluding __system__)
   activeTaskId: null,
-  mode: 'execute',
+  mode: 'build',
   model: '—',
   modelAliases: [],
   modelConfig: null,
@@ -882,8 +1074,7 @@ const feed           = document.getElementById('feed');
 const taskList       = document.getElementById('task-list');
 const emptySidebar   = document.getElementById('empty-sidebar');
 const emptyState     = document.getElementById('empty-state');
-const connStatus     = document.getElementById('conn-status');
-const connLabel      = document.getElementById('conn-label');
+const connDot         = document.getElementById('logo-dot');
 const modelLabel     = document.getElementById('model-label');
 const modelSelect    = document.getElementById('model-select');
 const modelConfigBtn = document.getElementById('model-config-btn');
@@ -893,7 +1084,9 @@ const modelConfigClose = document.getElementById('model-config-close');
 const modelConfigCancel = document.getElementById('model-config-cancel');
 const modelConfigSave = document.getElementById('model-config-save');
 const modelConfigError = document.getElementById('model-config-error');
-const modeButtons    = document.querySelectorAll('.mode-btn');
+const modeTrigger    = document.getElementById('mode-trigger');
+const modeDropdown   = document.getElementById('mode-dropdown');
+const modeOptions    = modeDropdown ? modeDropdown.querySelectorAll('button[data-mode]') : [];
 const promptInput    = document.getElementById('prompt-input');
 const sendBtn        = document.getElementById('send-btn');
 const clarBar        = document.getElementById('clarification-bar');
@@ -1000,113 +1193,40 @@ function renderInlineMarkdown(raw) {
   return html.replace(/\uE000(\d+)\uE001/g, (_m, id) => tokens[Number(id)] || '');
 }
 function renderMarkdown(text) {
-  const lines = String(text ?? '').replace(/\r\n?/g, '\n').split('\n');
-  const out = [];
-  let paragraph = [];
-  let listType = null;
-  let inCode = false;
-  let codeLang = '';
-  let codeLines = [];
+  if (typeof marked === 'undefined') return escHtml(String(text ?? ''));
+  const raw = String(text ?? '');
+  const renderer = new marked.Renderer();
 
-  const closeParagraph = () => {
-    if (!paragraph.length) return;
-    out.push(`<p>${renderInlineMarkdown(paragraph.join('\n')).replace(/\n/g, '<br>')}</p>`);
-    paragraph = [];
-  };
-  const closeList = () => {
-    if (!listType) return;
-    out.push(`</${listType}>`);
-    listType = null;
-  };
-  const openList = (type) => {
-    if (listType === type) return;
-    closeParagraph();
-    closeList();
-    out.push(`<${type}>`);
-    listType = type;
-  };
-  const closeCode = () => {
-    const langClass = codeLang ? ` class="language-${escAttr(codeLang)}"` : '';
-    const rawCode = codeLines.join('\n');
-    const codeHtml = codeLang.toLowerCase() === 'diff' || codeLang.toLowerCase() === 'patch'
-      ? renderDiffLines(rawCode)
-      : escHtml(rawCode);
-    out.push(`<pre><code${langClass}>${codeHtml}</code></pre>`);
-    inCode = false;
-    codeLang = '';
-    codeLines = [];
+  renderer.code = function({ text, lang }) {
+    const language = (lang || '').toLowerCase();
+    if (language === 'diff' || language === 'patch') {
+      return `<pre><code class="language-${escAttr(lang || '')}">${renderDiffLines(text)}</code></pre>`;
+    }
+    return `<pre><code class="language-${escAttr(lang || '')}">${escHtml(text)}</code></pre>`;
   };
 
-  for (const rawLine of lines) {
-    const fence = rawLine.match(/^```([A-Za-z0-9_-]*)\s*$/);
-    if (fence) {
-      if (inCode) {
-        closeCode();
-      } else {
-        closeParagraph();
-        closeList();
-        inCode = true;
-        codeLang = fence[1] || '';
-        codeLines = [];
-      }
-      continue;
+  renderer.link = function({ href, title, tokens }) {
+    const label = this.parser.parseInline(tokens);
+    const titleAttr = title ? ` title="${escAttr(title)}"` : '';
+    if (href && looksLikeDownloadableFile(href)) {
+      return fileLinkHtml(href, typeof label === 'string' ? label.replace(/<[^>]+>/g, '') : href);
     }
-    if (inCode) {
-      codeLines.push(rawLine);
-      continue;
+    if (href && /^(https?:\/\/|mailto:)/i.test(href)) {
+      return `<a href="${escAttr(href)}"${titleAttr} target="_blank" rel="noreferrer">${label}</a>`;
     }
+    return `<a href="${escAttr(href || '')}"${titleAttr}>${label}</a>`;
+  };
 
-    if (!rawLine.trim()) {
-      closeParagraph();
-      closeList();
-      continue;
-    }
+  renderer.codespan = function({ text }) {
+    if (looksLikeDownloadableFile(text)) return fileLinkHtml(text, text);
+    return `<code>${escHtml(text)}</code>`;
+  };
 
-    const heading = rawLine.match(/^(#{1,3})\s+(.+)$/);
-    if (heading) {
-      closeParagraph();
-      closeList();
-      const level = heading[1].length;
-      out.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
-      continue;
-    }
+  let html = marked.parse(raw, { renderer, breaks: false, gfm: true });
 
-    if (/^\s*(---|\*\*\*)\s*$/.test(rawLine)) {
-      closeParagraph();
-      closeList();
-      out.push('<hr>');
-      continue;
-    }
+  html = html.replace(AUTO_FILE_RE, (_m, prefix, filePath) => `${prefix}${fileLinkHtml(filePath, filePath)}`);
 
-    const bullet = rawLine.match(/^\s*[-*+]\s+(.+)$/);
-    if (bullet) {
-      openList('ul');
-      out.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
-      continue;
-    }
-
-    const numbered = rawLine.match(/^\s*\d+\.\s+(.+)$/);
-    if (numbered) {
-      openList('ol');
-      out.push(`<li>${renderInlineMarkdown(numbered[1])}</li>`);
-      continue;
-    }
-
-    const quote = rawLine.match(/^\s*>\s?(.+)$/);
-    if (quote) {
-      closeParagraph();
-      closeList();
-      out.push(`<blockquote>${renderInlineMarkdown(quote[1])}</blockquote>`);
-      continue;
-    }
-
-    paragraph.push(rawLine);
-  }
-
-  if (inCode) closeCode();
-  closeParagraph();
-  closeList();
-  return out.join('');
+  return html;
 }
 function statusClass(s) { return 's-'+(s||'queued'); }
 function statusIcon(s) {
@@ -1204,7 +1324,7 @@ function makeTaskCard(task) {
   wrap.className = 'task-card';
   wrap.dataset.taskId = task.taskId;
 
-  const modeLabel = task.mode === 'plan' ? 'plan-mode' : (task.kind || 'worker');
+  const modeLabel = task.mode === 'plan' ? 'plan-mode' : 'build-mode';
   const short = task.taskId.slice(0,8);
 
   wrap.innerHTML = `
@@ -1267,13 +1387,46 @@ function updatePhaseBar(taskId, phase, phaseStatus, note) {
   }
 }
 
+function splitThinking(text) {
+  var OPEN = '<think>', CLOSE = '</think>';
+  var parts = [], pos = 0;
+  while (pos < text.length) {
+    var oi = text.indexOf(OPEN, pos);
+    if (oi === -1) { parts.push({type:'content', text:text.slice(pos)}); break; }
+    if (oi > pos) parts.push({type:'content', text:text.slice(pos, oi)});
+    var ci = text.indexOf(CLOSE, oi + OPEN.length);
+    if (ci === -1) { parts.push({type:'thinking', text:text.slice(oi + OPEN.length), open:true}); break; }
+    parts.push({type:'thinking', text:text.slice(oi + OPEN.length, ci), open:false});
+    pos = ci + CLOSE.length;
+  }
+  return parts;
+}
+
+function renderThinkingBlock(text, isOpen) {
+  var label = isOpen ? 'Thinking…' : 'Thinking';
+  var cls = isOpen ? ' thinking-block open' : ' thinking-block';
+  return '<div class="' + cls.trim() + '" onclick="this.classList.toggle(&#39;open&#39;)">'
+    + '<div class="thinking-header"><span class="thinking-arrow">◂</span>'
+    + '<span class="thinking-label">' + label + '</span></div>'
+    + '<div class="thinking-body">' + escHtml(text.trim()) + '</div></div>';
+}
+
+function renderStreamWithThinking(text) {
+  var parts = splitThinking(text);
+  if (!parts.length) return renderMarkdown(text);
+  return parts.map(function(p) {
+    if (p.type === 'thinking') return renderThinkingBlock(p.text, p.open);
+    var t = p.text.trim();
+    return t ? renderMarkdown(t) : '';
+  }).join('');
+}
+
 function appendStreamToCard(taskId, text) {
   const els = taskEls.get(taskId);
   if (!els) return;
   els.streamEl.style.display = 'block';
   els.streamText = (els.streamText || '') + text;
-  els.streamEl.innerHTML = renderMarkdown(els.streamText);
-  // auto-scroll stream block
+  els.streamEl.innerHTML = renderStreamWithThinking(els.streamText);
   els.streamEl.scrollTop = els.streamEl.scrollHeight;
   scrollToBottom();
 }
@@ -1382,6 +1535,41 @@ function updateSidebarItem(taskId, status, ts) {
   if (ts) li.querySelector('.task-time').textContent = fmtTime(ts);
 }
 
+function updateTaskTodos(taskId, todos) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  let todoEl = els.card.querySelector('.task-todos');
+  if (!todos || !todos.length) {
+    if (todoEl) todoEl.remove();
+    return;
+  }
+  if (!todoEl) {
+    todoEl = document.createElement('div');
+    todoEl.className = 'task-todos';
+    els.card.insertBefore(todoEl, els.streamEl);
+  }
+  todoEl.innerHTML = todos.map(t => {
+    const check = t.status === 'done' ? '\u2611' : t.status === 'in_progress' ? '\u25CB' : '\u2610';
+    const cls = t.status === 'done' ? 'todo-done' : t.status === 'in_progress' ? 'todo-active' : 'todo-pending';
+    return `<div class="todo-item ${cls}"><span class="todo-check">${check}</span><span class="todo-text">${escHtml(t.text)}</span></div>`;
+  }).join('');
+}
+
+function updateTaskGoalBadge(taskId, goal) {
+  const els = taskEls.get(taskId);
+  if (!els || !goal) return;
+  let badge = els.card.querySelector('.goal-badge');
+  if (!badge) {
+    badge = document.createElement('div');
+    badge.className = 'goal-badge';
+    const header = els.card.querySelector('.task-card-header');
+    if (header) header.appendChild(badge);
+  }
+  const label = goal.status === 'achieved' ? 'Goal \u2713' : goal.status === 'failed' ? 'Goal \u2717' : `Goal (${goal.status})`;
+  badge.textContent = label;
+  badge.className = `goal-badge goal-${goal.status}`;
+}
+
 function statusToColor(s) {
   return {completed:'var(--success)',failed:'var(--danger)',running:'var(--accent)',waiting_user:'var(--warning)',blocked:'var(--warning)',queued:'var(--text-muted)'}[s] || 'var(--text-muted)';
 }
@@ -1421,16 +1609,26 @@ async function submitClarification(answer) {
 }
 
 // ── Mode buttons ──────────────────────────────────────────────────────────
-modeButtons.forEach(btn => {
-  btn.addEventListener('click', async () => {
+modeTrigger.addEventListener('click', (e) => {
+  e.stopPropagation();
+  modeDropdown.classList.toggle('open');
+});
+document.addEventListener('click', () => {
+  modeDropdown.classList.remove('open');
+});
+modeOptions.forEach(btn => {
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
     const m = btn.dataset.mode;
+    modeDropdown.classList.remove('open');
     await persistMode(m);
   });
 });
 
 function setMode(m) {
   state.mode = m;
-  modeButtons.forEach(b => b.classList.toggle('active', b.dataset.mode === m));
+  if (modeTrigger) modeTrigger.textContent = m === 'plan' ? 'Plan' : 'Build';
+  modeOptions.forEach(b => b.classList.toggle('active', b.dataset.mode === m));
 }
 
 async function persistMode(m) {
@@ -1439,7 +1637,7 @@ async function persistMode(m) {
 }
 
 function cycleMode() {
-  const modes = ['execute', 'plan', 'react'];
+  const modes = ['build', 'plan'];
   const next = modes[(modes.indexOf(state.mode) + 1) % modes.length];
   void persistMode(next);
   promptInput.focus();
@@ -1459,15 +1657,40 @@ modelSelect.addEventListener('change', async () => {
   }
 });
 
+function providerOf(entry) {
+  if (!entry) return 'Other';
+  const url = entry.baseUrl || '';
+  if (/advibe/i.test(url)) return 'ADVibe';
+  if (/volces|volcengine/i.test(url)) return 'Volcengine';
+  if (/localhost|127\.0\.0\.1/i.test(url)) return 'Local';
+  if (/anthropic/i.test(url)) return 'Anthropic';
+  if (/openai/i.test(url)) return 'OpenAI';
+  if (entry.backend === 'ollama') return 'Local';
+  return 'Other';
+}
+
 function populateModelSelect(aliases, current) {
   modelSelect.innerHTML = '';
   const options = Array.from(new Set([current, ...(aliases || [])].filter(Boolean)));
   if (!options.length) { modelSelect.innerHTML = '<option>—</option>'; return; }
+  const groups = {};
   options.forEach(a => {
-    const opt = document.createElement('option');
-    opt.value = a; opt.textContent = a;
-    if (a === current) opt.selected = true;
-    modelSelect.appendChild(opt);
+    const entry = state.modelConfig?.models?.[a] || null;
+    const p = providerOf(entry);
+    (groups[p] = groups[p] || []).push(a);
+  });
+  const order = ['ADVibe', 'Volcengine', 'Anthropic', 'OpenAI', 'Local', 'Other'];
+  order.forEach(p => {
+    if (!groups[p]) return;
+    const g = document.createElement('optgroup');
+    g.label = p;
+    groups[p].forEach(a => {
+      const opt = document.createElement('option');
+      opt.value = a; opt.textContent = a;
+      if (a === current) opt.selected = true;
+      g.appendChild(opt);
+    });
+    modelSelect.appendChild(g);
   });
 }
 
@@ -1624,7 +1847,7 @@ async function sendPrompt() {
 
 sendBtn.addEventListener('click', sendPrompt);
 promptInput.addEventListener('keydown', e => {
-  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); void sendPrompt(); }
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) { e.preventDefault(); void sendPrompt(); }
 });
 promptInput.addEventListener('input', () => {
   promptInput.style.height = 'auto';
@@ -1789,6 +2012,22 @@ function handleEvent(msg) {
       hideClarification();
       break;
     }
+    case 'todo_updated': {
+      const task = state.tasks.get(event.taskId);
+      if (task) {
+        task.todos = event.todos;
+        updateTaskTodos(event.taskId, event.todos);
+      }
+      break;
+    }
+    case 'goal_status_changed': {
+      const task = state.tasks.get(event.taskId);
+      if (task) {
+        task.goal = event.goal;
+        updateTaskGoalBadge(event.taskId, event.goal);
+      }
+      break;
+    }
     case 'task_done': {
       updateTaskCard(event.taskId, { status: event.status });
       updateSidebarItem(event.taskId, event.status, event.ts);
@@ -1808,6 +2047,8 @@ function hydrateTask(task) {
   appendToFeed(card);
   const li = makeSidebarItem(task);
   taskList.appendChild(li);
+  if (task.todos?.length) updateTaskTodos(task.taskId, task.todos);
+  if (task.goal) updateTaskGoalBadge(task.taskId, task.goal);
   (task.visibleMessages || []).forEach(message => {
     const row = makeMsgRow('master','P','Agent','master-label', message.ts, renderMarkdown(message.text));
     appendToFeed(row);
@@ -1822,20 +2063,31 @@ function connect() {
   if (sse) { try { sse.close(); } catch {} }
   sse = new EventSource('/api/events');
   sse.onopen = () => {
-    connStatus.className = 'connected';
-    connLabel.textContent = 'connected';
+    if (connDot) connDot.className = 'connected';
     clearTimeout(reconnectTimer);
   };
   sse.onmessage = (e) => {
     try { handleEvent(JSON.parse(e.data)); } catch {}
   };
   sse.onerror = () => {
-    connStatus.className = 'disconnected';
-    connLabel.textContent = 'reconnecting…';
+    if (connDot) connDot.className = 'disconnected';
     sse.close();
     reconnectTimer = setTimeout(connect, 2500);
   };
 }
+
+// ── Theme toggle ───────────────────────────────────────────────────────────
+const themeBtn = document.getElementById('theme-toggle');
+function applyTheme(t) {
+  document.documentElement.setAttribute('data-theme', t);
+  if (themeBtn) themeBtn.textContent = t === 'light' ? '\u2600' : '\uD83C\uDF19';
+  try { localStorage.setItem('theme', t); } catch {}
+}
+if (themeBtn) themeBtn.addEventListener('click', () => {
+  const next = document.documentElement.getAttribute('data-theme') === 'light' ? 'dark' : 'light';
+  applyTheme(next);
+});
+applyTheme(localStorage.getItem('theme') || 'dark');
 
 // ── Init ──────────────────────────────────────────────────────────────────
 (async () => {

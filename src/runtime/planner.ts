@@ -1,4 +1,4 @@
-import type { OllamaMsg, PlanStep, PlanStepIntent, PlanStepToolPolicy, PlannerDecision, SharedContextSnapshot } from '../domain/task.js';
+import type { OllamaMsg, PlanStep, PlanStepIntent, PlanStepToolPolicy, PlannerDecision, SharedContextSnapshot, TodoItem } from '../domain/task.js';
 
 export interface OllamaStreamChunk {
   message?: OllamaMsg & { content: string | null };
@@ -64,12 +64,16 @@ export function fallbackPlannerDecision(prompt: string): PlannerDecision {
   };
 }
 
-export function parsePlannerDecision(content: string, prompt: string): PlannerDecision {
+export interface ParsedPlannerDecision extends PlannerDecision {
+  todos?: TodoItem[];
+}
+
+export function parsePlannerDecision(content: string, prompt: string): ParsedPlannerDecision {
   try {
     const trimmed = content.trim();
     const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
     const candidate = (fenced?.[1] ?? trimmed).trim();
-    const parsed = JSON.parse(candidate) as Partial<PlannerDecision>;
+    const parsed = JSON.parse(candidate) as Partial<ParsedPlannerDecision>;
     const rawSteps = Array.isArray(parsed.steps)
       ? parsed.steps
       : Array.isArray(parsed.subtasks)
@@ -90,6 +94,16 @@ export function parsePlannerDecision(content: string, prompt: string): PlannerDe
       steps = fallbackPlannerDecision(prompt).steps;
     }
 
+    const todos: TodoItem[] | undefined = Array.isArray(parsed.todos)
+      ? (parsed.todos as unknown[])
+          .filter((t): t is Record<string, unknown> => t != null && typeof t === 'object')
+          .map((t) => ({
+            id: String(t['id'] ?? ''),
+            text: String(t['text'] ?? ''),
+            status: (['done', 'in_progress', 'pending'].includes(String(t['status'])) ? t['status'] : 'pending') as TodoItem['status'],
+          }))
+      : undefined;
+
     return {
       summary: typeof parsed.summary === 'string' && parsed.summary.trim() ? parsed.summary.slice(0, 240) : prompt.slice(0, 160),
       mode,
@@ -97,6 +111,7 @@ export function parsePlannerDecision(content: string, prompt: string): PlannerDe
       subtasks: steps,
       steps,
       questions,
+      todos,
     };
   } catch {
     return fallbackPlannerDecision(prompt);

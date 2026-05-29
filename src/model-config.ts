@@ -13,7 +13,10 @@ export function defaultBaseUrlForBackend(backend: BackendType): string {
 }
 
 export function resolveModelConfig(fileConfig: AgentConfig, requestedModel?: string): ResolvedModel {
-  const defaultModel = requestedModel ?? process.env.AGENT_MODEL ?? fileConfig.model ?? 'gemma4:31b-cloud';
+  const defaultModel = requestedModel ?? process.env.AGENT_MODEL ?? fileConfig.model;
+  if (!defaultModel) {
+    throw new Error('No model specified. Set "model" in .agentrc, use --model, or set AGENT_MODEL env var.');
+  }
   const aliasConfig = fileConfig.models?.[defaultModel];
   const modelConfig: AgentModelConfig = aliasConfig ?? { model: defaultModel };
   const requestedBackend = (process.env.LLM_BACKEND
@@ -23,8 +26,10 @@ export function resolveModelConfig(fileConfig: AgentConfig, requestedModel?: str
     ?? process.env.OLLAMA_BASE_URL
     ?? modelConfig.baseUrl
     ?? fileConfig.baseUrl
-    ?? (requestedBackend ? defaultBaseUrlForBackend(requestedBackend) : undefined)
-    ?? 'http://localhost:11434';
+    ?? (requestedBackend ? defaultBaseUrlForBackend(requestedBackend) : undefined);
+  if (!baseUrl) {
+    throw new Error('No base URL specified. Set "baseUrl" in .agentrc or set LLM_BASE_URL env var.');
+  }
   const backend = (requestedBackend ?? detectBackend(baseUrl)) as BackendType;
   const apiKey = process.env.LLM_API_KEY ?? modelConfig.apiKey ?? fileConfig.apiKey;
 

@@ -1,7 +1,8 @@
 import type { ToolPolicy } from '../policy.js';
 
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'waiting_user' | 'completed' | 'failed';
-export type TaskMode = 'execute' | 'plan' | 'react';
+export type TaskMode = 'build' | 'plan';
+export type TaskModeInput = TaskMode | 'execute' | 'react';
 export type TaskKind = 'worker' | 'inquiry' | 'derived_worker' | 'sync_worker' | 'clarification';
 export type AgentRole = 'master' | 'worker' | 'subagent' | 'writer' | 'presentation';
 export type TaskPhase = 'plan' | 'execute' | 'design' | 'inspect_code' | 'write_code' | 'verify' | 'finalize';
@@ -136,6 +137,18 @@ export interface LlmTraceEntry {
   cached?: boolean;
 }
 
+export interface Goal {
+  description: string;
+  completionCriteria: string;
+  status: 'in_progress' | 'achieved' | 'failed';
+}
+
+export interface TodoItem {
+  id: string;
+  text: string;
+  status: 'pending' | 'in_progress' | 'done';
+}
+
 export interface PromptTask {
   traceId?: string;
   taskId: string;
@@ -168,6 +181,9 @@ export interface PromptTask {
   visibleMessages?: Array<{ messageId: string; text: string; ts: string }>;
   debugEvents?: Array<{ type: string; text: string; ts: string }>;
   patchSets?: PatchSet[];
+  goal?: Goal;
+  todos?: TodoItem[];
+  goalIteration?: number;
 }
 
 export type ReleaseLock = () => void | Promise<void>;
@@ -204,6 +220,8 @@ export type MasterEvent =
   | { type: 'tool_result'; taskId: string; tool: string; output: string; ts: string }
   | { type: 'clarification_requested'; taskId: string; clarification: ClarificationRequest; ts: string }
   | { type: 'clarification_answered'; taskId: string; clarificationId: string; answer: string; ts: string }
+  | { type: 'todo_updated'; taskId: string; todos: TodoItem[]; ts: string }
+  | { type: 'goal_status_changed'; taskId: string; goal: Goal; ts: string }
   | { type: 'task_done'; taskId: string; result: string; status: 'completed' | 'failed'; ts: string };
 
 export interface TelemetryEvent {
@@ -213,4 +231,13 @@ export interface TelemetryEvent {
   taskId: string;
   note?: string;
   latencyMs?: number;
+}
+
+export function isTaskModeInput(value: unknown): value is TaskModeInput {
+  return value === 'build' || value === 'plan' || value === 'execute' || value === 'react';
+}
+
+export function normalizeTaskMode(value: TaskModeInput | string | undefined): TaskMode {
+  if (value === 'plan') return 'plan';
+  return 'build';
 }

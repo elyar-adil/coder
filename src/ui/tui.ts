@@ -114,10 +114,10 @@ const STATUS_ICON: Record<string, string> = {
   queued: '·',
 };
 
-const TASK_MODES: TaskMode[] = ['execute', 'plan', 'react'];
+const TASK_MODES: TaskMode[] = ['build', 'plan'];
 
 function nextMode(current: TaskMode): TaskMode {
-  return TASK_MODES[(TASK_MODES.indexOf(current) + 1) % TASK_MODES.length] ?? 'execute';
+  return TASK_MODES[(TASK_MODES.indexOf(current) + 1) % TASK_MODES.length] ?? 'build';
 }
 
 function formatDateTime(value?: string): string {
@@ -181,7 +181,7 @@ export async function runTui(
   const history: ConversationEntry[] = [];
   const tasks = new Map<string, TaskView>();
   const taskOrder: string[] = [];
-  let mode: TaskMode = 'execute';
+  let mode: TaskMode = 'build';
   let activeModelName = modelName;
   let activeClarification: ClarificationRequest | undefined;
   let exiting = false;
@@ -423,7 +423,7 @@ export async function runTui(
     }
 
     if (cmd === 'plan') {
-      mode = mode === 'plan' ? 'execute' : 'plan';
+      mode = mode === 'plan' ? 'build' : 'plan';
       log(chalk.hex(THEME.textMuted)(`Mode: ${mode}`));
       renderPrompt();
       return;
@@ -431,11 +431,11 @@ export async function runTui(
 
     if (cmd === 'mode') {
       const next = args[0] as TaskMode | undefined;
-      if (next === 'execute' || next === 'plan' || next === 'react') {
+      if (next === 'build' || next === 'plan') {
         mode = next;
         log(chalk.hex(THEME.textMuted)(`Mode: ${next}`));
       } else {
-        logSystem('Usage: /mode execute|plan|react');
+        logSystem('Usage: /mode build|plan');
       }
       renderPrompt();
       return;
@@ -596,8 +596,8 @@ export async function runTui(
     if (cmd === 'help') {
       log([
         chalk.bold.hex(THEME.accentStrong)('Commands'),
-        `  ${chalk.hex(THEME.accent)('/mode')} execute|plan|react`,
-        `  ${chalk.hex(THEME.accent)('/plan')}           — toggle plan/execute`,
+        `  ${chalk.hex(THEME.accent)('/mode')} build|plan`,
+        `  ${chalk.hex(THEME.accent)('/plan')}           — toggle plan/build`,
         `  ${chalk.hex(THEME.accent)('/model')} [name]  — list or switch model`,
         `  ${chalk.hex(THEME.accent)('/tasks')}          — show all tasks`,
         `  ${chalk.hex(THEME.accent)('/view')} <taskId>  — inspect task details and diffs`,

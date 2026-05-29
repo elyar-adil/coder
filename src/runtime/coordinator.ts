@@ -9,6 +9,7 @@ import { chatStream } from '../backend.js';
 import { unifiedDiff } from '../diff.js';
 import type {
   ClarificationRequest,
+  Goal,
   MasterEvent,
   OllamaMsg,
   PatchSet,
@@ -21,23 +22,22 @@ import type {
   TaskMailboxMessage,
   TaskMode,
   TaskPhase,
+  TodoItem,
   ToolContext,
 } from '../domain/task.js';
 import { clonePolicy, readOnlyPolicy } from '../policy.js';
 import type { PhaseEvent } from '../types.js';
 import {
   CHAT_SYSTEM_PROMPT,
-  DESIGN_TOOLS_PROMPT,
+  CONTEXT_SUMMARIZER_PROMPT,
   EXECUTE_SYSTEM_PROMPT,
+  GOAL_VERIFIER_PROMPT,
   MASTER_QUERY_SYSTEM_PROMPT,
   MASTER_ROUTER_SYSTEM_PROMPT,
   MASTER_SYSTEM_PROMPT,
-  PRESENTATION_SYSTEM_PROMPT,
   PLAN_SYSTEM_PROMPT,
   PLANNER_SYSTEM_PROMPT,
-  REACT_IMPLEMENT_PROMPT,
-  REACT_INSPECT_PROMPT,
-  REACT_VERIFY_PROMPT,
+  PRESENTATION_SYSTEM_PROMPT,
   STEP_EXECUTOR_SYSTEM_PROMPT,
   SUBAGENT_SYSTEM_PROMPT,
 } from '../infra/prompts.js';
@@ -52,6 +52,7 @@ import {
   parsePlan,
   parsePlannerDecision,
   type OllamaStreamChunk,
+  type ParsedPlannerDecision,
 } from './planner.js';
 
 export type StreamChunk =
@@ -698,7 +699,7 @@ export class MasterCoordinator {
   async acceptPrompt(
     userId: string,
     prompt: string,
-    mode: TaskMode = 'execute',
+    mode: TaskMode = 'build',
     conversationHistory: ConversationEntry[] = [],
     options: PromptDispatchOptions = {},
   ): Promise<string> {
@@ -786,7 +787,7 @@ export class MasterCoordinator {
     const task = this.tasks.get(taskId);
     if (!task || task.mode !== 'plan' || task.plan.length === 0) return false;
     if (this.pendingRouteTasks.has(taskId) || this.routingTasks.has(taskId) || this.runningTasks.has(taskId) || this.scheduledTaskRuns.has(taskId)) return true;
-    task.mode = 'execute';
+    task.mode = 'build';
     task.prompt = `Execute this approved plan:\n${task.plan.map((step) => `- ${step.title}: ${step.detail}`).join('\n')}`;
     task.status = 'queued';
     await this.persist(task);
@@ -1117,7 +1118,7 @@ export class MasterCoordinator {
   async *streamPrompt(
     userId: string,
     prompt: string,
-    mode: TaskMode = 'execute',
+    mode: TaskMode = 'build',
     conversationHistory: ConversationEntry[] = [],
     options: PromptDispatchOptions = {},
   ): AsyncGenerator<StreamChunk> {
@@ -1356,43 +1357,148 @@ export class MasterCoordinator {
         task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
       }
       await this.absorbMailboxUpdates(task);
-      this.markPhase(task, 'plan', 'in_progress', 'Planning next steps…');
-      yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Planning next steps…' };
-      const planner = await this.planTask(task, conversationHistory);
-      task.planner = planner;
-      task.summary = planner.summary;
-      task.readOnly = planner.readOnly;
-      task.plan = planner.steps;
-      await this.persist(task);
-      this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
-      yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
 
-      if (planner.questions[0]) {
-        const answer = await this.requestClarification(task.taskId, planner.questions[0]);
-        task.prompt = `${task.prompt}\n\nClarification from user:\n${answer}`;
-        if (task.relatedTaskIds?.length) {
-          task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
+      // Extract goal from prompt if present
+      if (!task.goal) {
+        const goalMatch = task.prompt.match(/\[GOAL\]\s*([\s\S]*?)\s*\[\/GOAL\]/i);
+        const criteriaMatch = task.prompt.match(/\[CRITERIA\]\s*([\s\S]*?)\s*\[\/CRITERIA\]/i);
+        if (goalMatch) {
+          task.goal = {
+            description: goalMatch[1].trim(),
+            completionCriteria: criteriaMatch?.[1]?.trim() ?? 'All planned steps are completed and verified.',
+            status: 'in_progress',
+          };
+          task.todos = [];
+          task.goalIteration = 0;
+          this.emit({ type: 'goal_status_changed', taskId: task.taskId, goal: { ...task.goal }, ts: now() });
+          await this.persist(task);
         }
-        await this.persist(task);
-      }
-
-      if (task.mode === 'plan') {
-        task.status = 'blocked';
-        const planText = this.renderPlanMarkdown(planner.steps);
-        task.result = planText;
-        await this.persist(task);
-        yield { type: 'token', text: planText };
-        yield { type: 'done', result: planText };
-        return;
       }
 
       const toolCtx = this.createToolContext(task);
-      const fullResult = yield* this.streamPlannerDrivenFlow(task, conversationHistory, toolCtx, planner.steps);
-      task.result = fullResult;
-      task.status = 'completed';
-      task.completedAt = now();
-      await this.persist(task);
-      yield { type: 'done', result: fullResult };
+      const maxGoalIterations = 5;
+
+      if (task.goal) {
+        // Goal-driven loop
+        let history = [...conversationHistory];
+        for (let iter = 0; iter < maxGoalIterations; iter++) {
+          task.goalIteration = iter + 1;
+          const iterLabel = `Goal iteration ${iter + 1}/${maxGoalIterations}`;
+
+          // Compress history if needed
+          history = await this.compressHistory(task, history);
+
+          // Plan
+          this.markPhase(task, 'plan', 'in_progress', iterLabel);
+          yield { type: 'phase', phase: 'plan', status: 'in_progress', note: iterLabel };
+          const planner = await this.planTask(task, history);
+          task.planner = planner;
+          task.summary = planner.summary;
+          task.readOnly = planner.readOnly;
+          task.plan = planner.steps;
+          if (planner.todos?.length) {
+            task.todos = planner.todos;
+            this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
+          }
+          await this.persist(task);
+          this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
+          yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
+
+          if (planner.questions[0]) {
+            const answer = await this.requestClarification(task.taskId, planner.questions[0]);
+            task.prompt = `${task.prompt}\n\nClarification from user:\n${answer}`;
+            await this.persist(task);
+          }
+
+          if (task.mode === 'plan') {
+            task.status = 'blocked';
+            const planText = this.renderPlanMarkdown(planner.steps);
+            task.result = planText;
+            await this.persist(task);
+            yield { type: 'token', text: planText };
+            yield { type: 'done', result: planText };
+            return;
+          }
+
+          // Execute steps
+          const iterResult = yield* this.streamPlannerDrivenFlow(task, history, toolCtx, planner.steps);
+
+          // Append to conversation history
+          history.push({ role: 'user', content: task.prompt });
+          history.push({ role: 'assistant', content: iterResult });
+
+          // Verify goal
+          const verification = await this.verifyGoal(task, iterResult);
+          task.todos = verification.todos;
+          this.emit({ type: 'todo_updated', taskId: task.taskId, todos: task.todos.map(t => ({ ...t })), ts: now() });
+
+          if (verification.achieved) {
+            task.goal.status = 'achieved';
+            this.emit({ type: 'goal_status_changed', taskId: task.taskId, goal: { ...task.goal }, ts: now() });
+            task.result = iterResult;
+            task.status = 'completed';
+            task.completedAt = now();
+            await this.persist(task);
+            yield { type: 'token', text: `\n\nGoal achieved: ${verification.reason}\n` };
+            yield { type: 'done', result: iterResult };
+            return;
+          }
+
+          // Not achieved — inject feedback and continue
+          const feedbackNote = `\n\n[Goal iteration ${iter + 1} incomplete: ${verification.reason}. Continuing...]\n`;
+          yield { type: 'token', text: feedbackNote };
+          task.prompt = `${task.prompt}\n\nPrevious iteration feedback:\n${verification.reason}`;
+          await this.persist(task);
+        }
+
+        // Exhausted iterations
+        task.goal.status = 'failed';
+        this.emit({ type: 'goal_status_changed', taskId: task.taskId, goal: { ...task.goal }, ts: now() });
+        task.result = `Goal not achieved after ${maxGoalIterations} iterations.`;
+        task.status = 'completed';
+        task.completedAt = now();
+        await this.persist(task);
+        yield { type: 'token', text: `\n\nGoal not achieved after ${maxGoalIterations} iterations.\n` };
+        yield { type: 'done', result: task.result };
+      } else {
+        // Non-goal flow (existing behavior)
+        this.markPhase(task, 'plan', 'in_progress', 'Planning next steps…');
+        yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Planning next steps…' };
+        const planner = await this.planTask(task, conversationHistory);
+        task.planner = planner;
+        task.summary = planner.summary;
+        task.readOnly = planner.readOnly;
+        task.plan = planner.steps;
+        await this.persist(task);
+        this.markPhase(task, 'plan', 'done', `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}`);
+        yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} step${planner.steps.length === 1 ? '' : 's'}` };
+
+        if (planner.questions[0]) {
+          const answer = await this.requestClarification(task.taskId, planner.questions[0]);
+          task.prompt = `${task.prompt}\n\nClarification from user:\n${answer}`;
+          if (task.relatedTaskIds?.length) {
+            task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
+          }
+          await this.persist(task);
+        }
+
+        if (task.mode === 'plan') {
+          task.status = 'blocked';
+          const planText = this.renderPlanMarkdown(planner.steps);
+          task.result = planText;
+          await this.persist(task);
+          yield { type: 'token', text: planText };
+          yield { type: 'done', result: planText };
+          return;
+        }
+
+        const fullResult = yield* this.streamPlannerDrivenFlow(task, conversationHistory, toolCtx, planner.steps);
+        task.result = fullResult;
+        task.status = 'completed';
+        task.completedAt = now();
+        await this.persist(task);
+        yield { type: 'done', result: fullResult };
+      }
     } catch (error) {
       task.status = 'failed';
       task.result = `Error: ${String(error)}`;
@@ -1431,6 +1537,59 @@ export class MasterCoordinator {
     yield { type: 'token', text: result };
     yield { type: 'phase', phase: 'inspect_code', status: 'done' };
     yield { type: 'done', result };
+  }
+
+  // ── Context compression ────────────────────────────────────────────────
+  private async compressHistory(task: PromptTask, history: ConversationEntry[]): Promise<ConversationEntry[]> {
+    const contextWindow = this.backend.contextWindow ?? 131072;
+    const maxInputTokens = Math.floor(contextWindow * 0.6);
+    const estimated = history.reduce((sum, e) => sum + Math.ceil(e.content.length / 4), 0);
+    if (estimated < maxInputTokens) return history;
+
+    const userMsg = history.length > 0 ? history[history.length - 1].content : '';
+    const summary = await this.callModelText(
+      history.map(e => `${e.role}: ${e.content}`).join('\n\n'),
+      CONTEXT_SUMMARIZER_PROMPT,
+      [],
+      task,
+      'context_compression',
+    );
+    return [
+      { role: 'user', content: `[Context summary from previous iterations]\n${summary}` },
+      ...(userMsg ? [{ role: 'user' as const, content: userMsg }] : []),
+    ];
+  }
+
+  // ── Goal verification ─────────────────────────────────────────────────
+  private async verifyGoal(
+    task: PromptTask,
+    result: string,
+  ): Promise<{ achieved: boolean; reason: string; todos: TodoItem[] }> {
+    const goal = task.goal!;
+    const prompt = [
+      `Goal: ${goal.description}`,
+      `Completion criteria: ${goal.completionCriteria}`,
+      `Current todos:\n${(task.todos ?? []).map(t => `- [${t.status}] ${t.text}`).join('\n') || '(none)'}`,
+      '',
+      'Work done so far:',
+      result.slice(-3000),
+    ].join('\n');
+    try {
+      const content = await this.callModelText(prompt, GOAL_VERIFIER_PROMPT, [], task, 'goal_verifier');
+      const trimmed = content.trim();
+      const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+      const parsed = JSON.parse((fenced?.[1] ?? trimmed).trim());
+      const todos: TodoItem[] = Array.isArray(parsed.todos)
+        ? parsed.todos.map((t: Record<string, unknown>) => ({
+            id: String(t.id ?? randomUUID().slice(0, 8)),
+            text: String(t.text ?? ''),
+            status: (['done', 'in_progress', 'pending'].includes(String(t.status)) ? t.status : 'pending') as TodoItem['status'],
+          }))
+        : task.todos ?? [];
+      return { achieved: Boolean(parsed.achieved), reason: String(parsed.reason ?? ''), todos };
+    } catch {
+      return { achieved: false, reason: 'Verification failed; could not parse result.', todos: task.todos ?? [] };
+    }
   }
 
   private async *streamPlannerDrivenFlow(
@@ -1581,7 +1740,7 @@ export class MasterCoordinator {
   private async planTask(
     task: PromptTask,
     conversationHistory: ConversationEntry[],
-  ): Promise<PlannerDecision> {
+  ): Promise<ParsedPlannerDecision> {
     const prompt = [
       task.sharedContext ? `Shared context:\n${task.sharedContext}` : '',
       `User request:\n${task.prompt}`,
@@ -1645,84 +1804,6 @@ export class MasterCoordinator {
       );
       return parsePlan(repaired);
     }
-  }
-
-  private async *streamReactFlow(
-    task: PromptTask,
-    history: ConversationEntry[],
-    toolCtx: ToolContext,
-  ): AsyncGenerator<StreamChunk> {
-    this.markPhase(task, 'plan', 'in_progress', 'Building plan…');
-    yield { type: 'phase', phase: 'plan', status: 'in_progress', note: 'Building plan…' };
-    const planContent = await this.callModelText(task.prompt, PLAN_SYSTEM_PROMPT, [], task, 'react_plan');
-    task.plan = await this.parsePlanWithRetry(planContent, task.prompt);
-    this.markPhase(task, 'plan', 'done', `${task.plan.length} steps`);
-    yield { type: 'phase', phase: 'plan', status: 'done', note: `${task.plan.length} steps` };
-    const planMarkdown = task.plan.map((step, index) => `${index + 1}. **${step.title}** — ${step.detail}`).join('\n');
-    yield { type: 'token', text: `## Plan\n${planMarkdown}\n\n` };
-
-    this.markPhase(task, 'design', 'in_progress', 'Exploring + designing…');
-    yield { type: 'phase', phase: 'design', status: 'in_progress', note: 'Exploring + designing…' };
-    yield { type: 'token', text: '## Design\n' };
-    const designMessages: OllamaMsg[] = [
-      ...history.map((entry) => ({ role: entry.role, content: entry.content })),
-      { role: 'user', content: `Shared context:\n${task.sharedContext ?? ''}\n\nPlan:\n${planMarkdown}\n\n${DESIGN_TOOLS_PROMPT}` },
-    ];
-    let designText = '';
-    for await (const _chunk of this.agenticStreamRaw(designMessages, toolCtx, task.readOnly ?? false, 'react_design', (text) => {
-      designText += text;
-    })) {
-      // tokens already captured through callback
-    }
-    task.designDoc = designText;
-    await this.persist(task);
-    yield { type: 'token', text: `${designText}\n\n` };
-    this.markPhase(task, 'design', 'done');
-    yield { type: 'phase', phase: 'design', status: 'done' };
-
-    this.markPhase(task, 'inspect_code', 'in_progress', 'Analyzing codebase…');
-    yield { type: 'phase', phase: 'inspect_code', status: 'in_progress', note: 'Analyzing codebase…' };
-    yield { type: 'token', text: '## Analysis\n' };
-    let inspectResult = '';
-    yield* this.agenticStream(REACT_INSPECT_PROMPT(planMarkdown), history, toolCtx, task.readOnly ?? false, 'react_inspect', (text) => {
-      inspectResult += text;
-    });
-    this.markPhase(task, 'inspect_code', 'done');
-    yield { type: 'phase', phase: 'inspect_code', status: 'done' };
-
-    this.markPhase(task, 'write_code', 'in_progress', 'Writing implementation…');
-    yield { type: 'phase', phase: 'write_code', status: 'in_progress', note: 'Writing implementation…' };
-    yield { type: 'token', text: '\n\n## Implementation\n' };
-    let implementation = '';
-    yield* this.agenticStream(
-      REACT_IMPLEMENT_PROMPT(planMarkdown, `${designText}\n${inspectResult}`),
-      history,
-      toolCtx,
-      task.readOnly ?? false,
-      'react_implementation',
-      (text) => {
-        implementation += text;
-      },
-    );
-    this.markPhase(task, 'write_code', 'done');
-    yield { type: 'phase', phase: 'write_code', status: 'done' };
-
-    this.markPhase(task, 'verify', 'in_progress', 'Verifying…');
-    yield { type: 'phase', phase: 'verify', status: 'in_progress', note: 'Verifying…' };
-    yield { type: 'token', text: '\n\n## Verification\n' };
-    let verify = '';
-    yield* this.agenticStream(REACT_VERIFY_PROMPT(implementation), history, toolCtx, false, 'react_verify', (text) => {
-      verify += text;
-    });
-    this.markPhase(task, 'verify', 'done');
-    yield { type: 'phase', phase: 'verify', status: 'done' };
-
-    const fullResult = `## Plan\n${planMarkdown}\n\n## Design\n${designText}\n\n## Analysis\n${inspectResult}\n\n## Implementation\n${implementation}\n\n## Verification\n${verify}`;
-    task.result = fullResult;
-    task.status = 'completed';
-    task.completedAt = now();
-    await this.persist(task);
-    yield { type: 'done', result: fullResult };
   }
 
   private async *agenticStreamRaw(

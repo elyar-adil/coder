@@ -7,6 +7,7 @@ import { loadConfig, saveSelectedModel } from './config.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { setToolPolicy } from './tools.js';
+import { normalizeTaskMode } from './domain/task.js';
 
 async function main(): Promise<void> {
   const program = new Command();
@@ -28,13 +29,13 @@ async function main(): Promise<void> {
     .command('submit')
     .requiredOption('--user <id>', 'user_id: task owner label for tracking and isolation')
     .requiredOption('--prompt <text>')
-    .option('--mode <mode>', 'execute | plan | react', 'execute')
-    .action(async (opts: { user: string; prompt: string; mode: 'execute' | 'plan' | 'react' }) => {
+    .option('--mode <mode>', 'build | plan', 'build')
+    .action(async (opts: { user: string; prompt: string; mode: string }) => {
       const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
       resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
       master.setBackendConfig(resolvedModel.config);
       master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
-      const taskId = await master.acceptPrompt(opts.user, opts.prompt, opts.mode);
+      const taskId = await master.acceptPrompt(opts.user, opts.prompt, normalizeTaskMode(opts.mode));
       console.log(JSON.stringify({ taskId, status: 'accepted', mode: opts.mode }, null, 2));
     });
 

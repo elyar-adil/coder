@@ -20,7 +20,7 @@ describe('MasterCoordinator', () => {
 
   describe('acceptPrompt and getTask', () => {
     test('acceptPrompt returns a taskId', async () => {
-      const taskId = await master.acceptPrompt('user1', 'hello', 'execute');
+      const taskId = await master.acceptPrompt('user1', 'hello', 'build');
       assert.ok(typeof taskId === 'string');
       assert.ok(taskId.length > 0);
     });
@@ -41,7 +41,7 @@ describe('MasterCoordinator', () => {
     });
 
     test('acceptPrompt sets initial status to queued', async () => {
-      const taskId = await master.acceptPrompt('user3', 'prompt', 'execute');
+      const taskId = await master.acceptPrompt('user3', 'prompt', 'build');
       const task = master.getTask(taskId);
       assert.equal(task!.status, 'queued');
     });
@@ -50,8 +50,8 @@ describe('MasterCoordinator', () => {
   describe('listTasks', () => {
     test('returns all tasks', async () => {
       const count = master.listTasks().length;
-      await master.acceptPrompt('u1', 't1', 'execute');
-      await master.acceptPrompt('u2', 't2', 'react');
+      await master.acceptPrompt('u1', 't1', 'build');
+      await master.acceptPrompt('u2', 't2', 'build');
       assert.equal(master.listTasks().length, count + 2);
     });
 
@@ -62,8 +62,8 @@ describe('MasterCoordinator', () => {
 
     test('filters tasks by session id', async () => {
       const fresh = new MasterCoordinator('http://localhost:11434', 'm');
-      const s1 = await fresh.acceptPrompt('u1', 'session one task', 'execute', [], { sessionId: 's1' });
-      const s2 = await fresh.acceptPrompt('u2', 'session two task', 'execute', [], { sessionId: 's2' });
+      const s1 = await fresh.acceptPrompt('u1', 'session one task', 'build', [], { sessionId: 's1' });
+      const s2 = await fresh.acceptPrompt('u2', 'session two task', 'build', [], { sessionId: 's2' });
 
       assert.deepEqual(fresh.listTasks({ sessionId: 's1' }).map((task) => task.taskId), [s1]);
       assert.deepEqual(fresh.listTasks({ sessionId: 's2' }).map((task) => task.taskId), [s2]);
@@ -72,7 +72,7 @@ describe('MasterCoordinator', () => {
     test('attaches artifact directory context to accepted tasks', async () => {
       const fresh = new MasterCoordinator('http://localhost:11434', 'm');
       const artifactDir = join(tmpdir(), 'coder-session-artifacts');
-      const taskId = await fresh.acceptPrompt('u1', 'generate a ppt', 'execute', [], { sessionId: 's1', artifactDir });
+      const taskId = await fresh.acceptPrompt('u1', 'generate a ppt', 'build', [], { sessionId: 's1', artifactDir });
       const task = fresh.getTask(taskId);
 
       assert.equal(task?.artifactDir, artifactDir);
@@ -179,7 +179,7 @@ describe('MasterCoordinator', () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
         let taskId = '';
-        for await (const chunk of coordinator.streamPrompt('u', 'hello', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', 'hello', 'build')) {
           if (chunk.type === 'task_id') taskId = chunk.taskId;
         }
         assert.equal(coordinator.getTask(taskId)?.llmTrace, undefined);
@@ -191,7 +191,7 @@ describe('MasterCoordinator', () => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
         coordinator.setLlmTracingEnabled(true);
         let taskId = '';
-        for await (const chunk of coordinator.streamPrompt('u', 'hello', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', 'hello', 'build')) {
           if (chunk.type === 'task_id') taskId = chunk.taskId;
         }
         const trace = coordinator.getTask(taskId)?.llmTrace ?? [];
@@ -208,7 +208,7 @@ describe('MasterCoordinator', () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
         const chunks = [];
-        for await (const chunk of coordinator.streamPrompt('u', '123456789+99999999等于多少', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', '123456789+99999999等于多少', 'build')) {
           chunks.push(chunk);
         }
         const phases = chunks
@@ -228,13 +228,13 @@ describe('MasterCoordinator', () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
         let pptTaskId = '';
-        for await (const chunk of coordinator.streamPrompt('u', 'make a ppt about roadmap', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', 'make a ppt about roadmap', 'build')) {
           if (chunk.type === 'task_id') pptTaskId = chunk.taskId;
         }
 
         const beforeCount = coordinator.listTasks().length;
         let answer = '';
-        for await (const chunk of coordinator.streamPrompt('u', 'how is the ppt going?', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', 'how is the ppt going?', 'build')) {
           if (chunk.type === 'token') answer += chunk.text;
         }
 
@@ -249,10 +249,10 @@ describe('MasterCoordinator', () => {
     test('routes requirement changes into the target task mailbox', async () => {
       await withMockBackend(async (baseUrl) => {
         const coordinator = new MasterCoordinator({ type: 'ollama', baseUrl, model: 'mock' });
-        const pptTaskId = await coordinator.acceptPrompt('u', 'make a ppt about launch', 'execute');
+        const pptTaskId = await coordinator.acceptPrompt('u', 'make a ppt about launch', 'build');
 
         let routedTaskId = '';
-        for await (const chunk of coordinator.streamPrompt('u', 'change the ppt to a red theme', 'execute')) {
+        for await (const chunk of coordinator.streamPrompt('u', 'change the ppt to a red theme', 'build')) {
           if (chunk.type === 'task_id') routedTaskId = chunk.taskId;
         }
 
@@ -271,7 +271,7 @@ describe('MasterCoordinator', () => {
       const dir = await mkdtemp(join(tmpdir(), 'coder-writer-test-'));
       try {
         const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'execute', [], { sessionId: 'writer' });
+        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'build', [], { sessionId: 'writer' });
         const target = join(dir, 'file.txt');
 
         const submitPatch = (coordinator as unknown as {
@@ -300,7 +300,7 @@ describe('MasterCoordinator', () => {
       const dir = await mkdtemp(join(tmpdir(), 'coder-writer-conflict-'));
       try {
         const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'execute', [], { sessionId: 'writer' });
+        const taskId = await coordinator.acceptPrompt('u', 'write patch', 'build', [], { sessionId: 'writer' });
         const target = join(dir, 'file.txt');
         await writeFile(target, 'current', 'utf8');
 
@@ -330,7 +330,7 @@ describe('MasterCoordinator', () => {
   describe('clarifications', () => {
     test('requires answers to match generated choices', async () => {
       const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-      const taskId = await coordinator.acceptPrompt('u', 'needs a choice', 'execute', [], { sessionId: 'clarify' });
+      const taskId = await coordinator.acceptPrompt('u', 'needs a choice', 'build', [], { sessionId: 'clarify' });
       const requestClarification = (coordinator as unknown as {
         requestClarification: (taskId: string, question: string, choices?: string[]) => Promise<string>;
       }).requestClarification.bind(coordinator);
@@ -350,7 +350,7 @@ describe('MasterCoordinator', () => {
 
     test('adds concrete fallback choices when a clarification has too few options', async () => {
       const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-      const taskId = await coordinator.acceptPrompt('u', 'needs fallback choices', 'execute', [], { sessionId: 'clarify' });
+      const taskId = await coordinator.acceptPrompt('u', 'needs fallback choices', 'build', [], { sessionId: 'clarify' });
       const requestClarification = (coordinator as unknown as {
         requestClarification: (taskId: string, question: string, choices?: string[]) => Promise<string>;
       }).requestClarification.bind(coordinator);
@@ -371,7 +371,7 @@ describe('MasterCoordinator', () => {
     });
 
     test('returns false for non-plan mode task', async () => {
-      const taskId = await master.acceptPrompt('u', 'p', 'execute');
+      const taskId = await master.acceptPrompt('u', 'p', 'build');
       const result = await master.executePlan(taskId);
       assert.equal(result, false);
     });
@@ -386,7 +386,7 @@ describe('MasterCoordinator', () => {
   describe('resolveTask', () => {
     test('does not bypass routing for a newly accepted queued task', async () => {
       const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-      const taskId = await coordinator.acceptPrompt('u', 'p', 'execute', [], { sessionId: 'resume' });
+      const taskId = await coordinator.acceptPrompt('u', 'p', 'build', [], { sessionId: 'resume' });
 
       const accepted = await coordinator.resolveTask(taskId);
       assert.equal(accepted, true);
@@ -395,7 +395,7 @@ describe('MasterCoordinator', () => {
 
     test('does not start a second runner for an already running task', async () => {
       const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
-      const taskId = await coordinator.acceptPrompt('u', 'p', 'execute', [], { sessionId: 'resume' });
+      const taskId = await coordinator.acceptPrompt('u', 'p', 'build', [], { sessionId: 'resume' });
       const task = coordinator.getTask(taskId);
       assert.ok(task);
       task!.status = 'running';

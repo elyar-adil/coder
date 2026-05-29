@@ -1,9 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { createServer, get, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { resolveConfiguredPath, resolveDownloadPath, safeDownloadName } from '../src/web.js';
+import { resolveConfiguredPath, resolveDownloadPath, safeDownloadName, shutdownWebServer } from '../src/web.js';
 
 describe('web artifact downloads', () => {
   it('uses basename-only download names', () => {
@@ -60,5 +61,47 @@ describe('web artifact downloads', () => {
       await rm(workspace, { recursive: true, force: true });
       await rm(external, { recursive: true, force: true });
     }
+  });
+
+  it('shuts down cleanly with an open SSE client', async () => {
+    const clients = new Map<string, { id: string; res: ServerResponse }>();
+    let unsubscribed = false;
+    const server = createServer((_req, res) => {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive',
+      });
+      res.write(': connected\n\n');
+      clients.set('c1', { id: 'c1', res });
+    });
+
+    await new Promise<void>((resolveListen) => server.listen(0, '127.0.0.1', resolveListen));
+    const address = server.address();
+    assert.ok(address && typeof address === 'object');
+
+    const ended = new Promise<void>((resolveEnd, reject) => {
+      const req = get({ host: '127.0.0.1', port: address.port, path: '/api/events' }, (res) => {
+        res.resume();
+        res.on('end', resolveEnd);
+      });
+      req.on('error', reject);
+    });
+
+    await new Promise<void>((resolveClient) => {
+      const started = Date.now();
+      const poll = (): void => {
+        if (clients.size > 0) { resolveClient(); return; }
+        if (Date.now() - started > 1000) throw new Error('SSE client was not registered');
+        setTimeout(poll, 10);
+      };
+      poll();
+    });
+
+    await shutdownWebServer(server, clients, () => { unsubscribed = true; }, 50);
+    await ended;
+
+    assert.equal(unsubscribed, true);
+    assert.equal(clients.size, 0);
   });
 });

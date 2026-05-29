@@ -18,7 +18,7 @@ describe('loadConfig', () => {
     assert.ok(config.model === undefined || typeof config.model === 'string');
     assert.ok(config.backend === undefined || ['ollama', 'openai', 'anthropic'].includes(config.backend));
     assert.ok(config.apiKey === undefined || typeof config.apiKey === 'string');
-    assert.ok(config.defaultMode === undefined || ['execute', 'plan', 'react'].includes(config.defaultMode));
+    assert.ok(config.defaultMode === undefined || ['build', 'plan'].includes(config.defaultMode));
   });
 
   it('persists selected model to the cwd .agentrc file', async () => {

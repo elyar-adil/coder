@@ -3,4 +3,5 @@ export {
   resolveDownloadPath,
   runWeb,
   safeDownloadName,
+  shutdownWebServer,
 } from './ui/web.js';

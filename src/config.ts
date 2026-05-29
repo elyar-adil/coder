@@ -11,7 +11,7 @@
  *    "model": "gemma4:31b-cloud",
  *    "backend": "openai",
  *    "apiKey": "sk-...",
- *    "defaultMode": "execute",
+ *    "defaultMode": "build",
  *    "artifactsDir": ".agent-workspace/artifacts",
  *    "models": {
  *      "fast": {
@@ -36,7 +36,7 @@ export interface AgentConfig {
   model?: string;
   backend?: BackendType;
   apiKey?: string;
-  defaultMode?: 'execute' | 'plan' | 'react';
+  defaultMode?: 'build' | 'plan';
   policyLevel?: 'strict' | 'moderate' | 'off';
   artifactsDir?: string;
   models?: Record<string, AgentModelConfig>;
@@ -64,12 +64,15 @@ export interface LoadedConfig {
 }
 
 function parseConfig(raw: string): AgentConfig {
-  const parsed = JSON.parse(raw) as AgentConfig;
+  const parsed = JSON.parse(raw) as AgentConfig & { defaultMode?: string };
   if (parsed.backend && !['ollama', 'openai', 'anthropic'].includes(parsed.backend)) {
     throw new Error(`Invalid backend "${parsed.backend}" in config. Use "openai", "anthropic", or "ollama".`);
   }
-  if (parsed.defaultMode && !['execute', 'plan', 'react'].includes(parsed.defaultMode)) {
-    throw new Error(`Invalid defaultMode "${parsed.defaultMode}" in config. Use "execute", "plan", or "react".`);
+  if (parsed.defaultMode && !['build', 'plan', 'execute', 'react'].includes(parsed.defaultMode)) {
+    throw new Error(`Invalid defaultMode "${parsed.defaultMode}" in config. Use "build" or "plan".`);
+  }
+  if (parsed.defaultMode && parsed.defaultMode !== 'build' && parsed.defaultMode !== 'plan') {
+    parsed.defaultMode = parsed.defaultMode === 'plan' ? 'plan' : 'build';
   }
   if (parsed.artifactsDir !== undefined && typeof parsed.artifactsDir !== 'string') {
     throw new Error('Invalid artifactsDir in config. Use a string path.');
