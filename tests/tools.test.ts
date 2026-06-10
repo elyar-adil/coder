@@ -32,7 +32,7 @@ describe('read_file', () => {
     const path = join(tmpDir, 'hello.txt');
     await writeFile(path, 'hello world', 'utf8');
     const result = await executeTool('read_file', { path });
-    assert.equal(result, 'hello world');
+    assert.equal(result, '00001|hello world');
   });
 
   test('returns error string for missing file', async () => {
@@ -50,7 +50,7 @@ describe('read_file', () => {
     const content = '你好世界 🌍\nline2';
     await writeFile(path, content, 'utf8');
     const result = await executeTool('read_file', { path });
-    assert.equal(result, content);
+    assert.equal(result, '00001|你好世界 🌍\n00002|line2');
   });
 
   test('reads an empty file', async () => {
@@ -58,6 +58,59 @@ describe('read_file', () => {
     await writeFile(path, '', 'utf8');
     const result = await executeTool('read_file', { path });
     assert.equal(result, '');
+  });
+});
+
+
+// ── edit_file ────────────────────────────────────────────────────────────────
+describe('edit_file', () => {
+  test('edits a block copied from line-numbered read_file output', async () => {
+    const path = join(tmpDir, 'line-number-edit.txt');
+    await writeFile(path, 'alpha\nbeta\ngamma', 'utf8');
+    const readResult = await executeTool('read_file', { path, offset: 2, limit: 1 });
+
+    const result = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: readResult, replace: 'BETA' }]),
+    });
+
+    assert.match(result, /line-number normalized/);
+    assert.equal(await readFile(path, 'utf8'), 'alpha\nBETA\ngamma');
+  });
+
+  test('accepts already-parsed edit arrays from tool-call arguments', async () => {
+    const path = join(tmpDir, 'array-edit.txt');
+    await writeFile(path, 'old value', 'utf8');
+
+    const result = await executeTool('edit_file', {
+      path,
+      edits: [{ search: 'old', replace: 'new' }],
+    });
+
+    assert.match(result, /^OK:/);
+    assert.equal(await readFile(path, 'utf8'), 'new value');
+  });
+
+  test('edits simple relative artifacts in the session artifact directory', async () => {
+    const artifactDir = join(tmpDir, 'edit-artifacts');
+    const artifactPath = join(artifactDir, 'notes.txt');
+    await executeTool('write_file', { path: 'notes.txt', content: 'draft artifact' }, {
+      spawnSubagent: async () => '',
+      collectSubagent: async () => '',
+      artifactDir,
+    });
+
+    const result = await executeTool('edit_file', {
+      path: 'notes.txt',
+      edits: JSON.stringify([{ search: 'draft', replace: 'final' }]),
+    }, {
+      spawnSubagent: async () => '',
+      collectSubagent: async () => '',
+      artifactDir,
+    });
+
+    assert.match(result, new RegExp(artifactPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+    assert.equal(await readFile(artifactPath, 'utf8'), 'final artifact');
   });
 });
 

@@ -177,6 +177,15 @@ function similarity(a: string, b: string): number {
   return maxLen === 0 ? 1 : 1 - levenshtein(a, b) / maxLen;
 }
 
+function stripReadFileLineNumbers(search: string): string | undefined {
+  const lines = search.split('\n');
+  const contentLines = lines.filter((line) => !line.startsWith('... (showing lines '));
+  if (contentLines.length === 0) return undefined;
+  const hasLineNumbers = contentLines.every((line) => /^\d{5}\|/.test(line));
+  if (!hasLineNumbers) return undefined;
+  return contentLines.map((line) => line.replace(/^\d{5}\|/, '')).join('\n');
+}
+
 /** Try to locate `search` in `content` using progressively looser strategies.
  *  Returns the best matching substring of `content` at the same length, or
  *  undefined if no strategy succeeds. */
@@ -523,6 +532,7 @@ export async function executeTool(
       const limitArg = typeof args['limit'] === 'number' ? args['limit'] : undefined;
       try {
         const raw = await readFile(path, 'utf8');
+        if (raw === '') return '';
         const allLines = raw.split('\n');
         const totalLines = allLines.length;
         const startLine = Math.max(1, Math.min(offsetArg ?? 1, totalLines));
@@ -545,27 +555,32 @@ export async function executeTool(
 
     case 'edit_file': {
       const path = typeof args['path'] === 'string' ? args['path'] : undefined;
-      const edits = typeof args['edits'] === 'string' ? args['edits'] : undefined;
+      const editsArg = args['edits'];
       if (!path) return 'Error: edit_file requires "path"';
-      if (!edits) return 'Error: edit_file requires "edits"';
-      const readDecision = authorizeToolCall(policy, 'read_file', { path });
+      if (editsArg === undefined || editsArg === null || editsArg === '') return 'Error: edit_file requires "edits"';
+      const targetPath = resolveWriteTarget(path, ctx);
+      const readDecision = authorizeToolCall(policy, 'read_file', { path: targetPath });
       if (!readDecision.ok) return formatPolicyError('edit_file', readDecision);
-      const writeDecision = authorizeToolCall(policy, 'edit_file', { path });
+      const writeDecision = authorizeToolCall(policy, 'edit_file', { path: targetPath });
       if (!writeDecision.ok) return formatPolicyError('edit_file', writeDecision);
 
-      return withWriteLock(ctx, path, async () => {
+      return withWriteLock(ctx, targetPath, async () => {
         let src: string;
         try {
-          src = await readFile(path, 'utf8');
+          src = await readFile(targetPath, 'utf8');
         } catch (error) {
           return `Error reading file for edit: ${String(error)}`;
         }
 
         let parsed: Array<{ search: string; replace: string }>;
         try {
-          const raw = edits.trim();
-          const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-          parsed = JSON.parse(fenced?.[1] ?? raw) as Array<{ search: string; replace: string }>;
+          if (Array.isArray(editsArg)) {
+            parsed = editsArg as Array<{ search: string; replace: string }>;
+          } else {
+            const raw = String(editsArg).trim();
+            const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+            parsed = JSON.parse(fenced?.[1] ?? raw) as Array<{ search: string; replace: string }>;
+          }
           if (!Array.isArray(parsed)) return 'Error: edits must be a JSON array';
         } catch (error) {
           return `Error parsing edits JSON: ${String(error)}`;
@@ -576,17 +591,28 @@ export async function executeTool(
         for (let i = 0; i < parsed.length; i += 1) {
           const { search, replace } = parsed[i]!;
           if (typeof search !== 'string') return `Error: edit[${i}].search must be a string`;
-          const matched = fuzzyFind(content, search);
-          if (matched === undefined) {
-            return `Error: edit[${i}] search string not found in file (tried 8 fuzzy strategies). Make sure the block exists in the file.\nSearch string was:\n${search}`;
+          if (replace !== undefined && typeof replace !== 'string') return `Error: edit[${i}].replace must be a string`;
+          const numberedSearch = stripReadFileLineNumbers(search);
+          const searchVariants = numberedSearch && numberedSearch !== search ? [search, numberedSearch] : [search];
+          let matched: string | undefined;
+          let normalizedLineNumbers = false;
+          for (const candidate of searchVariants) {
+            matched = fuzzyFind(content, candidate);
+            if (matched !== undefined) {
+              normalizedLineNumbers = candidate !== search;
+              break;
+            }
           }
-          const usedFuzzy = matched !== search;
+          if (matched === undefined) {
+            return `Error: edit[${i}] search string not found in file (tried 8 fuzzy strategies plus read_file line-number normalization). Make sure the block exists in the file.\nSearch string was:\n${search}`;
+          }
+          const usedFuzzy = matched !== (normalizedLineNumbers ? numberedSearch : search);
           content = content.replace(matched, replace ?? '');
-          log.push(`edit[${i}]: replaced ${matched.length} chars${usedFuzzy ? ' (fuzzy match)' : ''}`);
+          log.push(`edit[${i}]: replaced ${matched.length} chars${usedFuzzy || normalizedLineNumbers ? ` (${[normalizedLineNumbers ? 'line-number normalized' : '', usedFuzzy ? 'fuzzy match' : ''].filter(Boolean).join(', ')})` : ''}`);
         }
 
         try {
-          const writtenPath = await writeViaWorkspace(path, content);
+          const writtenPath = await writeViaWorkspace(path, content, ctx);
           await gitAutoCommit(writtenPath, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
           const diff = unifiedDiff(path, src, content);
           return [`OK: ${log.join('; ')} (${writtenPath})`, diff].filter(Boolean).join('\n\n');
