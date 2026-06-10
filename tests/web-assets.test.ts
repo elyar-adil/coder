@@ -110,4 +110,34 @@ describe('web static assets', () => {
     assert.match(script, /data-patch-id/);
     assert.match(script, /patchDiffMarkdown/);
   });
+
+
+  it('renders clarification questions inside task cards with choices and free-form replies', async () => {
+    const html = await readFile(resolve('src/ui/public/index.html'), 'utf8');
+    const script = extractSingleBlock(html, 'script');
+    const style = extractSingleBlock(html, 'style');
+
+    assert.match(style, /\.task-clarification/);
+    assert.match(script, /function renderTaskClarifications/);
+    assert.match(script, /task-clarification-choice/);
+    assert.match(script, /task-clarification-input/);
+    assert.match(script, /JSON\.stringify\(\{ taskId, clarificationId, answer: trimmed \}\)/);
+    assert.doesNotMatch(script, /state\.pendingClarification\s*=/);
+  });
+
+
+  it('lets users expand model think details from the task progress chip', async () => {
+    const html = await readFile(resolve('src/ui/public/index.html'), 'utf8');
+    const script = extractSingleBlock(html, 'script');
+    const style = extractSingleBlock(html, 'style');
+
+    assert.match(style, /\.thinking-details/);
+    assert.match(style, /\.output-progress:hover/);
+    assert.match(script, /expandedThinkingTasks: new Set\(\)/);
+    assert.match(script, /function renderThinkingDetails/);
+    assert.match(script, /function collectTaskThinkingEntries/);
+    assert.match(script, /data-task-id="\$\{escAttr\(taskId\)\}"/);
+    assert.match(script, /点击查看模型 think 过程/);
+    assert.match(script, /\.output-progress\[data-task-id\]/);
+  });
 });
