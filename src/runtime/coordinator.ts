@@ -756,8 +756,9 @@ export class MasterCoordinator {
 
     const request = task.pendingClarifications?.find((item) => item.clarificationId === clarificationId);
     if (!request) return false;
-    const selectedAnswer = request.choices.find((choice) => choice === answer.trim());
-    if (!selectedAnswer) return false;
+    const trimmedAnswer = answer.trim();
+    if (!trimmedAnswer) return false;
+    const selectedAnswer = request.choices.find((choice) => choice === trimmedAnswer) ?? trimmedAnswer;
 
     request.status = 'answered';
     request.answer = selectedAnswer;

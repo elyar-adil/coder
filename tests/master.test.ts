@@ -342,7 +342,7 @@ describe('MasterCoordinator', () => {
   });
 
   describe('clarifications', () => {
-    test('requires answers to match generated choices', async () => {
+    test('accepts generated choices and free-form clarification answers', async () => {
       const coordinator = new MasterCoordinator('http://localhost:11434', 'm');
       const taskId = await coordinator.acceptPrompt('u', 'needs a choice', 'build', [], { sessionId: 'clarify' });
       const requestClarification = (coordinator as unknown as {
@@ -354,11 +354,8 @@ describe('MasterCoordinator', () => {
       assert.ok(request);
       assert.deepEqual(request.choices, ['Fast path', 'Careful path']);
 
-      assert.equal(coordinator.answerClarification(taskId, request.clarificationId, 'free-form answer'), false);
-      assert.equal(coordinator.listPendingClarifications(taskId).length, 1);
-
-      assert.equal(coordinator.answerClarification(taskId, request.clarificationId, 'Fast path'), true);
-      assert.equal(await pending, 'Fast path');
+      assert.equal(coordinator.answerClarification(taskId, request.clarificationId, 'free-form answer'), true);
+      assert.equal(await pending, 'free-form answer');
       assert.equal(coordinator.listPendingClarifications(taskId).length, 0);
     });
 

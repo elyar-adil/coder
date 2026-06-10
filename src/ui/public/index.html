@@ -546,7 +546,11 @@ code, pre { font-family: var(--font-mono); }
   color: var(--text-muted);
   font-size: 11.5px;
   line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
 }
+.output-progress:hover { border-color: var(--accent); color: var(--accent-hi); }
+.output-progress:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .output-progress.done { background: rgba(109,170,127,.10); color: var(--success); }
 .output-progress.failed { background: rgba(192,112,112,.10); color: var(--danger); }
 .output-progress.waiting { color: var(--accent-hi); border-color: rgba(91,163,201,.35); }
@@ -608,6 +612,34 @@ code, pre { font-family: var(--font-mono); }
   font-style: italic;
 }
 .thinking-block.open .thinking-body { display: block; }
+.thinking-details {
+  display: none;
+  margin-top: 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: rgba(107,128,153,.05);
+}
+.thinking-details.open { display: block; }
+.thinking-details-title {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+}
+.thinking-detail-empty {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-style: italic;
+}
+.thinking-trace-label {
+  margin: 6px 0 3px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-muted);
+}
 
 /* ── Goal + Todo ─────────────────────────────────────────────────────────── */
 .goal-badge {
@@ -722,30 +754,67 @@ code, pre { font-family: var(--font-mono); }
 }
 .mailbox-from { font-size: 10.5px; color: var(--plan-accent); margin-bottom: 2px; }
 
-/* ── Clarification panel ────────────────────────────────────────────────── */
-#clarification-bar {
-  display: none;
-  background: var(--surface2);
-  border-top: 1px solid var(--warning);
-  padding: 10px 16px;
-  gap: 10px;
-  align-items: flex-start;
+/* ── Task-bound clarification panel ─────────────────────────────────────── */
+.task-clarification {
+  margin: 0 14px 8px;
+  padding: 10px 12px;
+  border: 1px solid rgba(201,160,80,.45);
+  border-left: 3px solid var(--warning);
+  border-radius: var(--radius);
+  background: rgba(201,160,80,.08);
 }
-#clarification-bar.visible { display: flex; }
-.clarify-question { flex: 1; font-size: 13px; color: var(--warning); line-height: 1.5; }
-.clarify-question .cq-label { font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; margin-bottom: 4px; opacity: .7; }
-.clarify-choices { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
-.clarify-choice-btn {
+.task-clarification-header {
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .07em;
+  color: var(--warning);
+  margin-bottom: 5px;
+}
+.task-clarification-question {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+.task-clarification-choices { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.task-clarification-choice {
   padding: 4px 10px;
   border-radius: 99px;
   border: 1px solid var(--warning);
   color: var(--warning);
   font-size: 12px;
   background: transparent;
-  cursor: pointer;
-  transition: background .1s;
 }
-.clarify-choice-btn:hover { background: rgba(201,160,80,.12); }
+.task-clarification-choice:hover { background: rgba(201,160,80,.12); }
+.task-clarification-answer { display: flex; gap: 8px; align-items: flex-start; }
+.task-clarification-input {
+  flex: 1;
+  min-height: 34px;
+  max-height: 120px;
+  padding: 7px 9px;
+  resize: vertical;
+  background: var(--surface);
+}
+.task-clarification-submit {
+  flex-shrink: 0;
+  padding: 7px 12px;
+  border-radius: var(--radius);
+  background: var(--warning);
+  color: var(--bg);
+  font-weight: 700;
+  font-size: 12px;
+}
+.task-clarification-submit:disabled { opacity: .55; cursor: default; }
+.task-clarification-answer-note {
+  margin: 0 14px 8px;
+  padding: 6px 10px;
+  border-left: 2px solid var(--warning);
+  background: rgba(201,160,80,.06);
+  color: var(--text-soft);
+  font-size: 12px;
+  border-radius: 0 var(--radius) var(--radius) 0;
+}
 
 /* ── Input bar ──────────────────────────────────────────────────────────── */
 #input-bar {
@@ -1007,13 +1076,6 @@ code, pre { font-family: var(--font-mono); }
         <div class="label">Start a conversation to see the agent flow.</div>
       </div>
     </div>
-    <div id="clarification-bar">
-      <div class="clarify-question">
-        <div class="cq-label">Agent needs your input</div>
-        <div id="clarify-text"></div>
-        <div class="clarify-choices" id="clarify-choices"></div>
-      </div>
-    </div>
     <div id="input-bar">
       <div class="mode-row" role="group" aria-label="Mode">
         <button class="mode-trigger" id="mode-trigger" title="Switch mode (Shift+Tab)">Build</button>
@@ -1117,7 +1179,8 @@ const state = {
   modelConfig: null,
   configPath: '',
   artifactDir: '',
-  pendingClarification: null, // { taskId, clarificationId, question, choices }
+  pendingClarifications: new Map(), // clarificationId → { taskId, clarificationId, question, choices }
+  expandedThinkingTasks: new Set(),
   atBottom: true,
 };
 
@@ -1150,9 +1213,6 @@ const modeDropdown   = document.getElementById('mode-dropdown');
 const modeOptions    = modeDropdown ? modeDropdown.querySelectorAll('button[data-mode]') : [];
 const promptInput    = document.getElementById('prompt-input');
 const sendBtn        = document.getElementById('send-btn');
-const clarBar        = document.getElementById('clarification-bar');
-const clarText       = document.getElementById('clarify-text');
-const clarChoices    = document.getElementById('clarify-choices');
 const scrollBtn      = document.getElementById('scroll-btn');
 
 // ── Utilities ─────────────────────────────────────────────────────────────
@@ -1403,6 +1463,22 @@ function fileNameFromDisposition(disposition, fallback) {
   return quoted?.[1] || fallback || 'download';
 }
 
+document.addEventListener('click', (event) => {
+  const trigger = event.target.closest?.('.output-progress[data-task-id]');
+  if (!trigger) return;
+  const taskId = trigger.dataset.taskId;
+  if (!taskId) return;
+  if (state.expandedThinkingTasks.has(taskId)) state.expandedThinkingTasks.delete(taskId);
+  else state.expandedThinkingTasks.add(taskId);
+  refreshTaskOutputStatus(taskId);
+});
+document.addEventListener('keydown', (event) => {
+  const trigger = event.target.closest?.('.output-progress[data-task-id]');
+  if (!trigger || (event.key !== 'Enter' && event.key !== ' ')) return;
+  event.preventDefault();
+  trigger.click();
+});
+
 document.addEventListener('click', async (event) => {
   const link = event.target.closest?.('a.file-link');
   if (!link) return;
@@ -1468,6 +1544,7 @@ function makeTaskCard(task) {
   if (task.result || isTaskOutputActive(task.status)) setTaskCardOutput(task.taskId, task.result || '');
   updateTaskGoalBadge(task.taskId, visibleTaskGoal(task));
   updateTaskTodos(task.taskId, task.todos || []);
+  setTaskClarifications(task.taskId, task.pendingClarifications || []);
   return wrap;
 }
 
@@ -1561,13 +1638,41 @@ function renderOutputProgress(task, hasText) {
   const active = isTaskOutputActive(status);
   const cls = status === 'completed' ? 'done' : status === 'failed' ? 'failed' : 'waiting';
   const empty = !hasText && active ? '<div class="output-empty">输出即将实时显示在这里。</div>' : '';
-  return `${empty}<div class="output-progress ${cls}" aria-live="polite"><span class="output-spinner"></span><span>${escHtml(outputProgressLabel(task, status))}</span></div>`;
+  const taskId = task?.taskId || '';
+  const expanded = state.expandedThinkingTasks.has(taskId);
+  const label = outputProgressLabel(task, status);
+  const title = expanded ? '隐藏模型 think 过程' : '点击查看模型 think 过程';
+  return `${empty}<div class="output-progress ${cls}" data-task-id="${escAttr(taskId)}" role="button" tabindex="0" aria-expanded="${expanded ? 'true' : 'false'}" aria-label="${escAttr(title)}" title="${escAttr(title)}"><span class="output-spinner"></span><span>${escHtml(label)}</span></div>`;
+}
+function explicitThinkingSegments(text) {
+  return splitThinking(String(text || ''))
+    .filter(part => part.type === 'thinking' && part.text.trim())
+    .map(part => ({ text: part.text.trim(), open: part.open }));
+}
+function collectTaskThinkingEntries(task, outputText) {
+  const entries = [];
+  const liveSegments = explicitThinkingSegments(outputText);
+  if (liveSegments.length) entries.push({ label: '实时输出', segments: liveSegments });
+  (task?.llmTrace || []).slice(-8).forEach(entry => {
+    const segments = explicitThinkingSegments(entry.response || '');
+    if (segments.length) entries.push({ label: `${entry.label || 'model'} · ${fmtTime(entry.ts)}`, segments });
+  });
+  return entries;
+}
+function renderThinkingDetails(task, outputText) {
+  const taskId = task?.taskId || '';
+  if (!state.expandedThinkingTasks.has(taskId)) return '';
+  const entries = collectTaskThinkingEntries(task, outputText);
+  const body = entries.length
+    ? entries.map(entry => `<div class="thinking-trace-label">${escHtml(entry.label)}</div>${entry.segments.map(segment => renderThinkingBlock(segment.text, segment.open)).join('')}`).join('')
+    : '<div class="thinking-detail-empty">暂无可展示的 think 内容。若模型返回 &lt;think&gt;...&lt;/think&gt;，会显示在这里；用 --verbose 启动后，非流式规划调用结束时也可查看捕获到的 think 内容。</div>';
+  return `<div class="thinking-details open"><div class="thinking-details-title">模型 think 过程</div>${body}</div>`;
 }
 function renderTaskOutputHtml(taskId, text) {
   const task = state.tasks.get(taskId);
   const label = taskAgentLabel(task, 'Task');
   const body = String(text || '').trim() ? renderStreamWithThinking(text) : '';
-  return `<div class="task-output-source">${escHtml(label)} output</div>${body}${renderOutputProgress(task, Boolean(body))}`;
+  return `<div class="task-output-source">${escHtml(label)} output</div>${body}${renderOutputProgress(task, Boolean(body))}${renderThinkingDetails(task, text)}`;
 }
 function refreshTaskOutputStatus(taskId) {
   const els = taskEls.get(taskId);
@@ -1768,38 +1873,139 @@ function statusToColor(s) {
   return {completed:'var(--success)',failed:'var(--danger)',running:'var(--accent)',waiting_user:'var(--warning)',blocked:'var(--warning)',queued:'var(--text-muted)'}[s] || 'var(--text-muted)';
 }
 
-// ── Clarification bar ─────────────────────────────────────────────────────
-function showClarification(clr) {
-  state.pendingClarification = clr;
-  clarText.textContent = clr.question || '';
-  clarChoices.innerHTML = '';
-  (clr.choices || []).forEach(c => {
-    const btn = document.createElement('button');
-    btn.className = 'clarify-choice-btn';
-    btn.textContent = c;
-    btn.addEventListener('click', () => submitClarification(c));
-    clarChoices.appendChild(btn);
+// ── Task-bound clarification panels ───────────────────────────────────────
+function normalizeClarification(clr) {
+  if (!clr) return null;
+  return {
+    taskId: clr.taskId,
+    clarificationId: clr.clarificationId,
+    question: clr.question || '',
+    choices: clr.choices || [],
+    status: clr.status || 'pending',
+  };
+}
+
+function pendingClarificationsForTask(taskId) {
+  return Array.from(state.pendingClarifications.values())
+    .filter(clr => clr.taskId === taskId && clr.status !== 'answered');
+}
+
+function renderTaskClarifications(taskId) {
+  const els = taskEls.get(taskId);
+  if (!els) return;
+  els.card.querySelectorAll('.task-clarification').forEach(el => el.remove());
+  const pending = pendingClarificationsForTask(taskId);
+  pending.forEach(clr => {
+    const panel = document.createElement('div');
+    panel.className = 'task-clarification';
+    panel.dataset.clarificationId = clr.clarificationId;
+
+    const choices = (clr.choices || []).map(choice => (
+      `<button class="task-clarification-choice" type="button" data-answer="${escHtml(choice)}">${escHtml(choice)}</button>`
+    )).join('');
+
+    panel.innerHTML = `
+      <div class="task-clarification-header">Agent needs your input</div>
+      <div class="task-clarification-question">${escHtml(clr.question)}</div>
+      <div class="task-clarification-choices">${choices}</div>
+      <div class="task-clarification-answer">
+        <textarea class="task-clarification-input" rows="1" placeholder="Type an answer for this task…"></textarea>
+        <button class="task-clarification-submit" type="button">Reply</button>
+      </div>`;
+
+    panel.querySelectorAll('.task-clarification-choice').forEach(btn => {
+      btn.addEventListener('click', () => submitClarification(clr.taskId, clr.clarificationId, btn.dataset.answer || btn.textContent || ''));
+    });
+    const input = panel.querySelector('.task-clarification-input');
+    const submit = panel.querySelector('.task-clarification-submit');
+    const submitInput = () => submitClarification(clr.taskId, clr.clarificationId, input.value.trim());
+    submit.addEventListener('click', submitInput);
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+        event.preventDefault();
+        void submitInput();
+      }
+    });
+
+    els.card.insertBefore(panel, els.streamEl);
   });
-  clarBar.classList.add('visible');
 }
 
-function hideClarification() {
-  state.pendingClarification = null;
-  clarBar.classList.remove('visible');
+function setTaskClarifications(taskId, clarifications) {
+  for (const [id, clr] of state.pendingClarifications.entries()) {
+    if (clr.taskId === taskId) state.pendingClarifications.delete(id);
+  }
+  (clarifications || [])
+    .map(normalizeClarification)
+    .filter(clr => clr && clr.status !== 'answered')
+    .forEach(clr => state.pendingClarifications.set(clr.clarificationId, clr));
+  renderTaskClarifications(taskId);
 }
 
-async function submitClarification(answer) {
-  if (!state.pendingClarification) return;
-  const { taskId, clarificationId } = state.pendingClarification;
-  hideClarification();
-  await fetch('/api/clarify', {
+function showClarification(clr) {
+  const normalized = normalizeClarification(clr);
+  if (!normalized) return;
+  state.pendingClarifications.set(normalized.clarificationId, normalized);
+  const task = state.tasks.get(normalized.taskId);
+  if (task) {
+    const existing = (task.pendingClarifications || []).filter(item => item.clarificationId !== normalized.clarificationId);
+    task.pendingClarifications = [...existing, normalized];
+  }
+  renderTaskClarifications(normalized.taskId);
+  const panel = taskEls.get(normalized.taskId)?.card.querySelector(`[data-clarification-id="${normalized.clarificationId}"]`);
+  if (panel) panel.scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+function hideClarification(taskId, clarificationId) {
+  if (clarificationId) {
+    const clr = state.pendingClarifications.get(clarificationId);
+    state.pendingClarifications.delete(clarificationId);
+    taskId = taskId || clr?.taskId;
+  } else if (taskId) {
+    for (const [id, clr] of state.pendingClarifications.entries()) {
+      if (clr.taskId === taskId) state.pendingClarifications.delete(id);
+    }
+  } else {
+    state.pendingClarifications.clear();
+  }
+  if (taskId) renderTaskClarifications(taskId);
+}
+
+async function submitClarification(taskId, clarificationId, answer) {
+  const trimmed = String(answer || '').trim();
+  if (!taskId || !clarificationId || !trimmed) return;
+  const panel = taskEls.get(taskId)?.card.querySelector(`[data-clarification-id="${clarificationId}"]`);
+  const submit = panel?.querySelector('.task-clarification-submit');
+  if (submit) submit.disabled = true;
+
+  const response = await fetch('/api/clarify', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ taskId, clarificationId, answer }),
+    body: JSON.stringify({ taskId, clarificationId, answer: trimmed }),
   });
-  // Show in feed
-  const row = makeMsgRow('user', 'U', 'You (answer)', 'user-label', new Date().toISOString(), renderMarkdown(answer));
-  appendToFeed(row);
+  if (!response.ok) {
+    if (submit) submit.disabled = false;
+    const data = await response.json().catch(() => ({}));
+    appendSystemMessage(data?.error || `Clarification failed (${response.status}).`, true);
+    return;
+  }
+
+  const task = state.tasks.get(taskId);
+  if (task?.pendingClarifications) {
+    task.pendingClarifications = task.pendingClarifications.map(item => (
+      item.clarificationId === clarificationId ? { ...item, status: 'answered', answer: trimmed } : item
+    ));
+  }
+  hideClarification(taskId, clarificationId);
+
+  const els = taskEls.get(taskId);
+  if (els) {
+    const note = document.createElement('div');
+    note.className = 'task-clarification-answer-note';
+    note.innerHTML = `<div class="mailbox-from">your answer</div><div class="msg-text md">${renderMarkdown(trimmed)}</div>`;
+    els.card.insertBefore(note, els.streamEl);
+    scrollToBottom();
+  }
 }
 
 // ── Mode buttons ──────────────────────────────────────────────────────────
@@ -2102,6 +2308,7 @@ function handleEvent(msg) {
       updateTaskCard(task.taskId, { status: task.status, title: task.summary || task.prompt });
       updateTaskGoalBadge(task.taskId, visibleTaskGoal(task));
       updateTaskTodos(task.taskId, task.todos || []);
+      setTaskClarifications(task.taskId, task.pendingClarifications || []);
       updateSidebarItem(task.taskId, task.status, event.ts);
       break;
     }
@@ -2206,7 +2413,7 @@ function handleEvent(msg) {
       break;
     }
     case 'clarification_answered': {
-      hideClarification();
+      hideClarification(event.taskId, event.clarificationId);
       break;
     }
     case 'todo_updated': {
@@ -2250,6 +2457,7 @@ function hydrateTask(task) {
   const li = makeSidebarItem(task);
   taskList.appendChild(li);
   updateTaskTodos(task.taskId, task.todos || []);
+  setTaskClarifications(task.taskId, task.pendingClarifications || []);
   if (task.goal) updateTaskGoalBadge(task.taskId, task.goal);
   (task.visibleMessages || []).forEach(message => {
     const row = makeMsgRow('master','P',taskAgentLabel(task, 'Agent'), 'master-label', message.ts, renderMarkdown(message.text));

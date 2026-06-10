@@ -396,9 +396,9 @@ export async function runTui(
     if (!activeClarification) return false;
     const trimmed = answer.trim();
     const choices = clarificationChoices();
-    const selected = choices[Number(trimmed) - 1] ?? choices.find((choice) => choice === trimmed);
+    const selected = choices[Number(trimmed) - 1] ?? choices.find((choice) => choice === trimmed) ?? trimmed;
     if (!selected) {
-      log(chalk.hex(THEME.warning)('Choose one of the listed options by number.'));
+      log(chalk.hex(THEME.warning)('Enter an answer or choose one of the listed options by number.'));
       return false;
     }
     const accepted = master.answerClarification(activeClarification.taskId, activeClarification.clarificationId, selected);
