@@ -67,7 +67,7 @@ export type StreamChunk =
 
 type EventListener = (event: MasterEvent) => void;
 
-type RouteAction = 'new_task' | 'query_task' | 'update_task' | 'derived_task' | 'sync_task' | 'clarify_target';
+type RouteAction = 'respond' | 'new_task' | 'query_task' | 'update_task' | 'derived_task' | 'sync_task' | 'clarify_target';
 
 type RouteDecision = {
   action: RouteAction;
@@ -151,7 +151,8 @@ function normalizeClarificationChoices(question: string, choices: string[] = [])
 }
 
 function isRouteAction(value: unknown): value is RouteAction {
-  return value === 'new_task'
+  return value === 'respond'
+    || value === 'new_task'
     || value === 'query_task'
     || value === 'update_task'
     || value === 'derived_task'
@@ -377,15 +378,13 @@ export class MasterCoordinator {
     options: PromptDispatchOptions & { excludeTaskIds?: string[] } = {},
   ): Promise<RouteDecision> {
     const candidates = this.routeCandidates(options.sessionId, options.excludeTaskIds ?? []);
-    if (candidates.length === 0) {
-      return { action: 'new_task', targetTaskIds: [], reason: 'No existing tasks.', prompt };
-    }
 
     const routePrompt = [
       `Latest user prompt:\n${prompt}`,
       '',
-      'Current task snapshots:',
-      JSON.stringify(candidates, null, 2),
+      candidates.length > 0
+        ? `Current task snapshots:\n${JSON.stringify(candidates, null, 2)}`
+        : 'No existing tasks.',
     ].join('\n');
 
     try {
@@ -393,7 +392,7 @@ export class MasterCoordinator {
       const decision = parseRouteDecision(content, prompt);
       const validIds = new Set(candidates.map((task) => task.taskId));
       decision.targetTaskIds = decision.targetTaskIds.filter((taskId) => validIds.has(taskId));
-      if (decision.action !== 'new_task' && decision.targetTaskIds.length === 0) {
+      if (decision.action !== 'new_task' && decision.action !== 'respond' && decision.targetTaskIds.length === 0) {
         return { action: 'new_task', targetTaskIds: [], reason: 'Router did not select a valid target task.', prompt };
       }
       return decision;
@@ -534,37 +533,37 @@ export class MasterCoordinator {
   }
 
   private async emitUserVisibleMessage(task: PromptTask | undefined, sourceText: string, label = 'presentation'): Promise<string> {
-    const fallback = sourceText.trim();
-    if (!fallback) return '';
-
-    let text = fallback;
+    if (!sourceText?.trim()) return '';
+    let text = '';
     if (task) {
       try {
         const prompt = [
           `Original user request:\n${task.prompt}`,
           task.relatedTaskIds?.length ? `Related tasks: ${task.relatedTaskIds.join(', ')}` : '',
-          `Worker/writer result:\n${fallback}`,
+          `Worker/writer result:\n${sourceText}`,
         ].filter(Boolean).join('\n\n');
         const presented = await this.callModelText(prompt, PRESENTATION_SYSTEM_PROMPT, [], task, label);
         if (presented.trim()) text = presented.trim();
       } catch {
-        text = fallback;
+        // presentation failed — don't show raw instructions
       }
-
-      const message = { messageId: randomUUID(), text, ts: now() };
-      task.visibleMessages = [...(task.visibleMessages ?? []), message].slice(-20);
-      await this.persist(task);
-      this.emitTaskUpdate(task);
+      if (text) {
+        const message = { messageId: randomUUID(), text, ts: now() };
+        task.visibleMessages = [...(task.visibleMessages ?? []), message].slice(-20);
+        await this.persist(task);
+        this.emitTaskUpdate(task);
+      }
     }
-
-    this.emit({
-      type: 'user_visible_message',
-      taskId: task?.taskId,
-      sessionId: task?.sessionId,
-      role: 'assistant',
-      text,
-      ts: now(),
-    });
+    if (text) {
+      this.emit({
+        type: 'user_visible_message',
+        taskId: task?.taskId,
+        sessionId: task?.sessionId,
+        role: 'assistant',
+        text,
+        ts: now(),
+      });
+    }
     return text;
   }
 
@@ -585,6 +584,7 @@ export class MasterCoordinator {
     taskId: string,
     originalPrompt: string,
     conversationHistory: ConversationEntry[],
+    precomputedDecision?: RouteDecision,
   ): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
@@ -593,10 +593,20 @@ export class MasterCoordinator {
     this.routingTasks.add(taskId);
 
     try {
-      const decision = await this.routePrompt(originalPrompt, conversationHistory, {
+      const decision = precomputedDecision ?? await this.routePrompt(originalPrompt, conversationHistory, {
         sessionId: task.sessionId,
         excludeTaskIds: [task.taskId],
       });
+
+      if (decision.action === 'respond') {
+        // Should not normally reach here (handled in acceptPrompt), but handle gracefully
+        task.status = 'completed';
+        task.completedAt = now();
+        await this.persist(task);
+        this.emitTaskUpdate(task);
+        this.emit({ type: 'task_done', taskId: task.taskId, result: '', status: 'completed', ts: now() });
+        return;
+      }
 
       if (decision.action === 'query_task') {
         task.status = 'running';
@@ -683,7 +693,7 @@ export class MasterCoordinator {
       task.contextSnapshot = targetContext || undefined;
       await this.persist(task);
       this.emitTaskUpdate(task);
-      await this.runTask(task.taskId);
+      void this.runTask(task.taskId);
     } catch (error) {
       task.status = 'failed';
       task.result = `Error: ${String(error)}`;
@@ -704,18 +714,52 @@ export class MasterCoordinator {
     conversationHistory: ConversationEntry[] = [],
     options: PromptDispatchOptions = {},
   ): Promise<string> {
+    const sessionId = options.sessionId;
+    const activeTask = this.findActiveTask(sessionId);
+
+    if (activeTask) {
+      await this.appendTaskMailboxUpdate(activeTask.taskId, prompt);
+      await this.emitUserVisibleMessage(activeTask, prompt);
+      return activeTask.taskId;
+    }
+
+    // Route first — decide if this needs a task or just a direct response
+    const decision = await this.routePrompt(prompt, conversationHistory, {
+      sessionId,
+      excludeTaskIds: [],
+    });
+
+    if (decision.action === 'respond') {
+      // Master responds directly — no task capsule
+      const answer = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, conversationHistory, undefined, 'master_direct');
+      this.emit({
+        type: 'user_visible_message',
+        taskId: undefined,
+        sessionId,
+        role: 'assistant',
+        text: answer,
+        ts: now(),
+      });
+      return 'respond';
+    }
+
+    // Needs a real task — create it now
     const task = this.createTask(userId, prompt, mode, {
       kind: 'worker',
-      sessionId: options.sessionId,
+      sessionId,
       agentRole: 'master',
       artifactDir: options.artifactDir,
     });
     this.taskHistory.set(task.taskId, [...conversationHistory]);
     this.pendingRouteTasks.add(task.taskId);
     setTimeout(() => {
-      void this.routeAndRunAcceptedTask(task.taskId, prompt, conversationHistory);
+      void this.routeAndRunAcceptedTask(task.taskId, prompt, conversationHistory, decision);
     }, 0);
     return task.taskId;
+  }
+  private findActiveTask(sessionId?: string): PromptTask | undefined {
+    const tasks = this.listTasks({ sessionId });
+    return tasks.find(t => ['running', 'waiting_user', 'blocked'].includes(t.status));
   }
 
   getTask(taskId: string): PromptTask | undefined {
@@ -726,6 +770,18 @@ export class MasterCoordinator {
     const tasks = [...this.tasks.values()];
     if (!options.sessionId) return tasks;
     return tasks.filter((task) => task.sessionId === options.sessionId);
+  }
+
+  async saveTask(task: PromptTask): Promise<void> {
+    await this.persist(task);
+  }
+
+  async updateGoal(taskId: string, goal: Goal): Promise<void> {
+    const task = this.tasks.get(taskId);
+    if (!task) return;
+    task.goal = goal;
+    await this.persist(task);
+    this.emit({ type: 'goal_status_changed', taskId, goal: { ...goal }, ts: now() });
   }
 
   async deleteTask(taskId: string): Promise<void> {
@@ -1124,6 +1180,29 @@ export class MasterCoordinator {
     conversationHistory: ConversationEntry[] = [],
     options: PromptDispatchOptions = {},
   ): AsyncGenerator<StreamChunk> {
+    // Route first — decide if this needs a task or just a direct response
+    const decision = await this.routePrompt(prompt, conversationHistory, {
+      sessionId: options.sessionId,
+      excludeTaskIds: [],
+    });
+
+    if (decision.action === 'respond') {
+      // Master responds directly — no task capsule
+      const answer = await this.callModelText(prompt, MASTER_SYSTEM_PROMPT, conversationHistory, undefined, 'master_direct');
+      this.emit({
+        type: 'user_visible_message',
+        taskId: undefined,
+        sessionId: options.sessionId,
+        role: 'assistant',
+        text: answer,
+        ts: now(),
+      });
+      yield { type: 'token', text: answer };
+      yield { type: 'done', result: answer };
+      return;
+    }
+
+    // Needs a real task — create it now
     const task = this.createTask(userId, prompt, mode, {
       kind: 'worker',
       sessionId: options.sessionId,
@@ -1133,10 +1212,6 @@ export class MasterCoordinator {
     this.taskHistory.set(task.taskId, [...conversationHistory]);
     yield { type: 'task_id', taskId: task.taskId };
 
-    const decision = await this.routePrompt(prompt, conversationHistory, {
-      sessionId: task.sessionId,
-      excludeTaskIds: [task.taskId],
-    });
     if (decision.action === 'query_task') {
       task.status = 'running';
       task.kind = 'inquiry';
