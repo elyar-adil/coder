@@ -6,7 +6,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { parseOllamaNdjson } from '../src/master.js';
+import { parseOllamaNdjson } from '../src/runtime/coordinator.js';
 
 describe('parseOllamaNdjson', () => {
   test('parses content message', () => {

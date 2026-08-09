@@ -1,0 +1,62 @@
+{
+  "generatedAt": "2026-08-09T15:46:42.678Z",
+  "config": {
+    "model": "gemma4:31b-cloud",
+    "backend": "ollama",
+    "benchmark": "HumanEval",
+    "sampleSize": 10,
+    "timeoutMs": 120000
+  },
+  "summary": {
+    "total": 2,
+    "passed": 0,
+    "passAt1": 0,
+    "producedRunnable": 1,
+    "runnableRate": 0.5,
+    "avgToolCalls": 22.5,
+    "avgDurationMs": 53179,
+    "avgDurationPassingMs": 0
+  },
+  "comparisons": [
+    {
+      "agent": "ours (gemma4:31b-cloud)",
+      "passAt1": 0
+    },
+    {
+      "agent": "Claude Code",
+      "note": "not measured yet"
+    },
+    {
+      "agent": "Codex",
+      "note": "not measured yet"
+    }
+  ],
+  "results": [
+    {
+      "taskLabel": "HumanEval/0",
+      "benchmark": "HumanEval",
+      "language": "python",
+      "pass": false,
+      "verdict": "fail_assert",
+      "producedRunnable": true,
+      "toolCalls": 5,
+      "durationMs": 14281,
+      "agentStatus": "completed",
+      "error": "Command failed: python __test__.py\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\Desktop\\coder\\.agent-workspace\\bench\\coder-bench-HumanEval-0-u4zpOr\\__test__.py\", line 22, in <module>\r\n    _g[\"check\"](_candidate)\r\n  File \"<string>\", line 10, in check\r\nAssertionError\r\n",
+      "output": "Traceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\Desktop\\coder\\.agent-workspace\\bench\\coder-bench-HumanEval-0-u4zpOr\\__test__.py\", line 22, in <module>\r\n    _g[\"check\"](_candidate)\r\n  File \"<string>\", line 10, in check\r\nAssertionError"
+    },
+    {
+      "taskLabel": "HumanEval/1",
+      "benchmark": "HumanEval",
+      "language": "python",
+      "pass": false,
+      "verdict": "fail_load",
+      "producedRunnable": false,
+      "toolCalls": 40,
+      "durationMs": 92077,
+      "agentStatus": "completed",
+      "error": "Command failed: python __test__.py\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\Desktop\\coder\\.agent-workspace\\bench\\coder-bench-HumanEval-1-oA5nRD\\__test__.py\", line 7, in <module>\r\n    exec(_sol, _g)\r\n  File \"<string>\", line 4\r\n    def separate_paren_groups(paren_string: str) -\r\n                                                 ^\r\nSyntaxError: expected ':'\r\n",
+      "output": "Traceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\Desktop\\coder\\.agent-workspace\\bench\\coder-bench-HumanEval-1-oA5nRD\\__test__.py\", line 7, in <module>\r\n    exec(_sol, _g)\r\n  File \"<string>\", line 4\r\n    def separate_paren_groups(paren_string: str) -\r\n                                                 ^\r\nSyntaxError: expected ':'"
+    }
+  ]
+}

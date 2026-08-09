@@ -1,4 +1,4 @@
-import type { SubAgentTask } from './types.js';
+import type { SubAgentTask } from './domain/task.js';
 
 export class SubagentManager {
   private queue: string[] = [];

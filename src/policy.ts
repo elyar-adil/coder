@@ -1,4 +1,4 @@
-import { resolve, isAbsolute } from 'node:path';
+import { resolve, isAbsolute, relative } from 'node:path';
 
 export type PolicyLevel = 'strict' | 'moderate' | 'off';
 
@@ -49,7 +49,12 @@ function withinRoots(target: string, roots: string[]): boolean {
   const norm = resolve(target);
   return roots.some((r) => {
     const root = resolve(r);
-    return norm === root || norm.startsWith(root + '/');
+    if (norm === root) return true;
+    // Use path.relative for cross-platform safety: on Windows, resolve()
+    // returns backslash-separated paths, so a naive `startsWith(root + '/')`
+    // check fails and wrongly rejects in-workspace files.
+    const rel = relative(root, norm);
+    return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel);
   });
 }
 

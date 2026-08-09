@@ -2,7 +2,7 @@ import { readFile, writeFile, readdir, mkdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { createHash } from 'node:crypto';
-import type { PromptTask } from './types.js';
+import type { PromptTask } from './domain/task.js';
 
 const BASE = join(homedir(), '.coder');
 

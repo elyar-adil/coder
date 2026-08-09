@@ -1,9 +1,41 @@
 {
   "benchmarks": [
-    {"name": "SWE-bench Lite", "category": "repo bug-fixing", "metric": "pass@1 on issue tasks"},
-    {"name": "HumanEval", "category": "code generation", "metric": "pass@k"},
-    {"name": "MBPP", "category": "python programming", "metric": "accuracy/pass@1"},
-    {"name": "APPS", "category": "competitive/problem solving", "metric": "test case pass rate"},
-    {"name": "LiveCodeBench", "category": "temporal coding benchmark", "metric": "pass@1 by date split"}
+    {
+      "name": "HumanEval",
+      "category": "code generation",
+      "metric": "pass@1",
+      "status": "integrated",
+      "dataset": "tests/benchmarks/datasets/humaneval/HumanEval.jsonl",
+      "taskCount": 164,
+      "language": "python",
+      "adapter": "tests/benchmarks/humaneval.ts",
+      "notes": "OpenAI HumanEval — 164 Python function tasks with hidden unit tests. Agent sees only the signature+docstring; the test field is held back and injected by the evaluator."
+    },
+    {
+      "name": "SWE-bench Lite",
+      "category": "repo bug-fixing",
+      "metric": "pass@1 on issue tasks",
+      "status": "placeholder",
+      "notes": "Planned: mini SWE-bench style repo-fix tasks. Requires real repo checkouts."
+    },
+    {
+      "name": "MBPP",
+      "category": "python programming",
+      "metric": "accuracy/pass@1",
+      "status": "planned",
+      "notes": "Planned: similar adapter to HumanEval, ~974 tasks."
+    },
+    {
+      "name": "APPS",
+      "category": "competitive/problem solving",
+      "metric": "test case pass rate",
+      "status": "planned"
+    },
+    {
+      "name": "LiveCodeBench",
+      "category": "temporal coding benchmark",
+      "metric": "pass@1 by date split",
+      "status": "planned"
+    }
   ]
 }

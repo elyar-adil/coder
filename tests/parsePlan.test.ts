@@ -6,7 +6,7 @@
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { parsePlan } from '../src/master.js';
+import { parsePlan } from '../src/runtime/coordinator.js';
 
 describe('parsePlan', () => {
   test('parses valid JSON array', () => {

@@ -1110,6 +1110,13 @@ code, pre { font-family: var(--font-mono); }
       </div>
       <div class="config-section">
         <div class="config-section-title optional">Optional</div>
+        <div id="ollama-import-section" style="display:none; margin-bottom:12px;">
+          <div style="display:flex; align-items:center; gap:8px; margin-bottom:6px;">
+            <span style="font-size:12px; color:var(--text-dim);">Local Ollama models:</span>
+            <button id="ollama-refresh-btn" type="button" class="config-btn" style="padding:2px 8px; font-size:11px;">Refresh</button>
+          </div>
+          <div id="ollama-model-list" style="max-height:120px; overflow-y:auto; border:1px solid var(--border); border-radius:4px; padding:4px;"></div>
+        </div>
         <div class="field optional">
           <label for="cfg-backend">Backend</label>
           <select id="cfg-backend" name="backend">
@@ -1208,6 +1215,9 @@ const modelConfigClose = document.getElementById('model-config-close');
 const modelConfigCancel = document.getElementById('model-config-cancel');
 const modelConfigSave = document.getElementById('model-config-save');
 const modelConfigError = document.getElementById('model-config-error');
+const ollamaImportSection = document.getElementById('ollama-import-section');
+const ollamaModelList = document.getElementById('ollama-model-list');
+const ollamaRefreshBtn = document.getElementById('ollama-refresh-btn');
 const modeTrigger    = document.getElementById('mode-trigger');
 const modeDropdown   = document.getElementById('mode-dropdown');
 const modeOptions    = modeDropdown ? modeDropdown.querySelectorAll('button[data-mode]') : [];
@@ -1255,7 +1265,7 @@ function displayFileName(filePath) {
   const parts = normalized.split(/[\\/]+/).filter(Boolean);
   return parts.at(-1) || 'download';
 }
-const FILE_EXT_PATTERN = '(?:pptx?|pdf|docx?|xlsx?|csv|zip|tar\\.gz|png|jpe?g|gif|webp|svg|html?|md|txt|json)';
+const FILE_EXT_PATTERN = '(?:pptx?|pdf|docx?|xlsx?|csv|zip|tar\\.gz|png|jpe?g|gif|webp|svg|html?|md|txt|json|c|cpp|h|hpp|py|js|ts|jsx|tsx|java|go|rs|rb|php|swift|kt|scala|sh|bash|zsh|fish|sql|r|lua|zig|nim|cs|fs|hs|ml|ex|exs|clj|dart|sol|move|wasm|wat|toml|yaml|yml|xml|ini|cfg|conf|env|lock)';
 const FILE_EXT_RE = new RegExp('\\.(' + FILE_EXT_PATTERN + ')$', 'i');
 const DOWNLOAD_MARKER_RE = /\[\[download:([^\]|]+)(?:\|([^\]]+))?\]\]/gi;
 function normalizeLocalFilePath(value) {
@@ -2141,6 +2151,7 @@ function openModelConfig() {
   populateModelForm(modelSelect.value || state.model);
   modelConfigModal.classList.add('visible');
   modelConfigModal.setAttribute('aria-hidden', 'false');
+  fetchOllamaModels();
   setTimeout(() => modelConfigForm.elements.alias?.focus(), 0);
 }
 
@@ -2167,6 +2178,42 @@ function readModelForm() {
     extraBody: form.extraBody.value.trim(),
     select: form.select.checked,
   };
+}
+
+// ── Ollama model import ────────────────────────────────────────────────────
+async function fetchOllamaModels() {
+  if (!ollamaModelList) return;
+  ollamaModelList.innerHTML = '<div style="padding:6px; color:var(--text-dim); font-size:12px;">Loading...</div>';
+  ollamaImportSection.style.display = '';
+  try {
+    const r = await fetch('/api/ollama/models');
+    const data = await r.json();
+    if (!data.models || data.models.length === 0) {
+      ollamaModelList.innerHTML = `<div style="padding:6px; color:var(--text-dim); font-size:12px;">${data.error ? 'Ollama not running or not installed' : 'No models found'}</div>`;
+      return;
+    }
+    ollamaModelList.innerHTML = '';
+    for (const m of data.models) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.style.cssText = 'display:block; width:100%; text-align:left; padding:5px 8px; border:none; background:transparent; color:var(--text); cursor:pointer; font-size:12px; border-radius:3px;';
+      btn.textContent = m.size ? `${m.name}  (${m.size})` : m.name;
+      btn.addEventListener('mouseenter', () => { btn.style.background = 'var(--surface2)'; });
+      btn.addEventListener('mouseleave', () => { btn.style.background = 'transparent'; });
+      btn.addEventListener('click', () => {
+        setField('alias', m.name);
+        setField('model', m.name);
+        setField('backend', 'ollama');
+      });
+      ollamaModelList.appendChild(btn);
+    }
+  } catch {
+    ollamaModelList.innerHTML = '<div style="padding:6px; color:var(--text-dim); font-size:12px;">Failed to fetch models</div>';
+  }
+}
+
+if (ollamaRefreshBtn) {
+  ollamaRefreshBtn.addEventListener('click', fetchOllamaModels);
 }
 
 async function saveModelConfig() {

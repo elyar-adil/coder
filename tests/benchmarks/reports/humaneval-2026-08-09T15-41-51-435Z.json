@@ -1,0 +1,48 @@
+{
+  "generatedAt": "2026-08-09T15:41:51.435Z",
+  "config": {
+    "model": "gemma4:31b-cloud",
+    "backend": "ollama",
+    "benchmark": "HumanEval",
+    "sampleSize": 10,
+    "timeoutMs": 120000
+  },
+  "summary": {
+    "total": 1,
+    "passed": 1,
+    "passAt1": 1,
+    "producedRunnable": 1,
+    "runnableRate": 1,
+    "avgToolCalls": 32,
+    "avgDurationMs": 45908,
+    "avgDurationPassingMs": 45908
+  },
+  "comparisons": [
+    {
+      "agent": "ours (gemma4:31b-cloud)",
+      "passAt1": 1
+    },
+    {
+      "agent": "Claude Code",
+      "note": "not measured yet"
+    },
+    {
+      "agent": "Codex",
+      "note": "not measured yet"
+    }
+  ],
+  "results": [
+    {
+      "taskLabel": "HumanEval/0",
+      "benchmark": "HumanEval",
+      "language": "python",
+      "pass": true,
+      "verdict": "pass",
+      "producedRunnable": true,
+      "toolCalls": 32,
+      "durationMs": 45908,
+      "agentStatus": "completed",
+      "output": "PASS"
+    }
+  ]
+}

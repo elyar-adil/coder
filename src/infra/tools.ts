@@ -1,5 +1,5 @@
 import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
-import { exec } from 'node:child_process';
+import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { ToolContext } from '../domain/task.js';
@@ -13,6 +13,7 @@ import {
 } from '../policy.js';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 const AGENT_WORKSPACE_ROOT = resolve(process.cwd(), '.agent-workspace');
 
 async function gitAutoCommit(filePath: string, message: string): Promise<void> {
@@ -53,7 +54,7 @@ async function writeViaWorkspace(targetPath: string, content: string, ctx?: Tool
   const cwd = process.cwd();
   const rel = absoluteTarget.startsWith(cwd)
     ? relative(cwd, absoluteTarget)
-    : join('__external__', absoluteTarget.replace(/^[/\\]+/, ''));
+    : join('__external__', absoluteTarget.replace(/^([a-zA-Z]:)?[/\\]+/, ''));
   const workspacePath = join(AGENT_WORKSPACE_ROOT, rel);
   await mkdir(dirname(workspacePath), { recursive: true });
   await writeFile(workspacePath, content, 'utf8');
@@ -398,12 +399,70 @@ understand the codebase structure without reading every file. Returns a compact 
   {
     type: 'function',
     function: {
+      name: 'search_text',
+      description: '在仓库中搜索文本或正则表达式，返回紧凑的文件、行号和匹配内容。优先使用本工具而不是 bash rg。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索文本或正则表达式' },
+          path: { type: 'string', description: '搜索根目录，默认当前目录' },
+          glob: { type: 'string', description: '可选文件 glob，例如 *.ts' },
+          max_results: { type: 'number', description: '最大结果数，默认 100' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_files',
+      description: '按 glob 列出仓库文件，自动忽略 .git 和 node_modules。',
+      parameters: {
+        type: 'object',
+        properties: {
+          glob: { type: 'string', description: '文件 glob，例如 **/*.ts' },
+          path: { type: 'string', description: '搜索根目录，默认当前目录' },
+          max_results: { type: 'number', description: '最大结果数，默认 200' },
+        },
+        required: ['glob'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_status',
+      description: '返回当前仓库的紧凑 Git 状态。只读。',
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_diff',
+      description: '返回工作树或暂存区差异，可限制文件。只读。',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: '可选文件路径' },
+          staged: { type: 'boolean', description: '是否查看暂存区差异' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'bash',
       description: 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
       parameters: {
         type: 'object',
         properties: {
           command: { type: 'string', description: 'Shell command to execute' },
+          cwd: { type: 'string', description: '可选工作目录' },
+          timeout_ms: { type: 'number', description: '超时毫秒数，默认 60000，最大 300000' },
         },
         required: ['command'],
       },
@@ -525,6 +584,49 @@ export async function executeTool(
   if (!decision.ok) return formatPolicyError(name, decision);
 
   switch (name) {
+    case 'search_text': {
+      const query = typeof args['query'] === 'string' ? args['query'] : '';
+      if (!query) return JSON.stringify({ ok: false, error: 'query is required' });
+      const root = typeof args['path'] === 'string' ? resolve(args['path']) : process.cwd();
+      const max = Math.max(1, Math.min(Number(args['max_results'] ?? 100), 500));
+      const glob = typeof args['glob'] === 'string' ? args['glob'] : undefined;
+      try {
+        const rgArgs = ['--line-number', '--no-heading', '--color', 'never', '--hidden', '--glob', '!.git', '--glob', '!node_modules', ...(glob ? ['--glob', glob] : []), query, root];
+        const result = await execFileAsync('rg', rgArgs, { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
+        const lines = result.stdout.split(/\r?\n/).filter(Boolean).slice(0, max);
+        return JSON.stringify({ ok: true, results: lines, truncated: lines.length >= max });
+      } catch (error: any) {
+        if (error?.code === 1) return JSON.stringify({ ok: true, results: [], truncated: false });
+        return JSON.stringify({ ok: false, error: String(error?.message ?? error) });
+      }
+    }
+    case 'search_files': {
+      const glob = typeof args['glob'] === 'string' ? args['glob'] : '*';
+      const root = typeof args['path'] === 'string' ? resolve(args['path']) : process.cwd();
+      const max = Math.max(1, Math.min(Number(args['max_results'] ?? 200), 1000));
+      try {
+        const result = await execFileAsync('rg', ['--files', '--hidden', '--glob', '!.git', '--glob', '!node_modules', '--glob', glob, root], { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
+        const files = result.stdout.split(/\r?\n/).filter(Boolean).slice(0, max);
+        return JSON.stringify({ ok: true, files, truncated: files.length >= max });
+      } catch (error: any) {
+        if (error?.code === 1) return JSON.stringify({ ok: true, files: [], truncated: false });
+        return JSON.stringify({ ok: false, error: String(error?.message ?? error) });
+      }
+    }
+    case 'git_status': {
+      try {
+        const result = await execFileAsync('git', ['status', '--short', '--branch'], { cwd: process.cwd(), timeout: 15_000, signal: ctx?.signal });
+        return JSON.stringify({ ok: true, status: result.stdout.trim() });
+      } catch (error: any) { return JSON.stringify({ ok: false, error: String(error?.message ?? error) }); }
+    }
+    case 'git_diff': {
+      const path = typeof args['path'] === 'string' ? args['path'] : undefined;
+      const staged = args['staged'] === true;
+      try {
+        const result = await execFileAsync('git', ['diff', ...(staged ? ['--cached'] : []), '--', ...(path ? [path] : [])], { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 4, timeout: 20_000, signal: ctx?.signal });
+        return JSON.stringify({ ok: true, diff: result.stdout, truncated: false });
+      } catch (error: any) { return JSON.stringify({ ok: false, error: String(error?.message ?? error) }); }
+    }
     case 'read_file': {
       const path = typeof args['path'] === 'string' ? args['path'] : undefined;
       if (!path) return 'Error: read_file requires "path"';

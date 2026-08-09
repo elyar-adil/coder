@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer, get, type ServerResponse } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { resolveConfiguredPath, resolveDownloadPath, safeDownloadName, shutdownWebServer } from '../src/web.js';
+import { resolveConfiguredPath, resolveDownloadPath, safeDownloadName, shutdownWebServer } from '../src/ui/web.js';
 
 describe('web artifact downloads', () => {
   it('uses basename-only download names', () => {

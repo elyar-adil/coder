@@ -10,8 +10,8 @@
  */
 
 import { resilientFetch, FetchError } from './fetch.js';
-import type { OllamaMsg } from './types.js';
-import type { OllamaToolDef } from './tools.js';
+import type { OllamaMsg } from './domain/task.js';
+import type { OllamaToolDef } from './infra/tools.js';
 
 export type BackendType = 'openai' | 'anthropic' | 'ollama';
 

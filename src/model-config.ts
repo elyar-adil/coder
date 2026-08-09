@@ -15,7 +15,14 @@ export function defaultBaseUrlForBackend(backend: BackendType): string {
 export function resolveModelConfig(fileConfig: AgentConfig, requestedModel?: string): ResolvedModel {
   const defaultModel = requestedModel ?? process.env.AGENT_MODEL ?? fileConfig.model;
   if (!defaultModel) {
-    throw new Error('No model specified. Set "model" in .agentrc, use --model, or set AGENT_MODEL env var.');
+    return {
+      name: '(unconfigured)',
+      config: {
+        type: 'ollama',
+        baseUrl: 'http://localhost:11434',
+        model: '',
+      },
+    };
   }
   const aliasConfig = fileConfig.models?.[defaultModel];
   const modelConfig: AgentModelConfig = aliasConfig ?? { model: defaultModel };

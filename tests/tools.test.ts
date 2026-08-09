@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtemp, realpath, rm, writeFile, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
-import { executeTool } from '../src/tools.js';
+import { executeTool } from '../src/infra/tools.js';
 
 // ── Temp directory shared across tests ───────────────────────────────────────
 let tmpDir: string;

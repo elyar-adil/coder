@@ -26,9 +26,10 @@ import type {
   ToolContext,
 } from '../domain/task.js';
 import { clonePolicy, readOnlyPolicy } from '../policy.js';
-import type { PhaseEvent } from '../types.js';
+import type { PhaseEvent } from '../domain/task.js';
 import {
   CHAT_SYSTEM_PROMPT,
+  AUTONOMOUS_SYSTEM_PROMPT,
   CONTEXT_SUMMARIZER_PROMPT,
   EXECUTE_SYSTEM_PROMPT,
   GOAL_VERIFIER_PROMPT,
@@ -190,6 +191,8 @@ export class MasterCoordinator {
   private routingTasks = new Set<string>();
   private scheduledTaskRuns = new Set<string>();
   private runningTasks = new Set<string>();
+  /** Cooperative cancellation: checked between model/tool turns. */
+  private taskControllers = new Map<string, AbortController>();
   private sharedSummary = '';
   private basePolicy = getToolPolicy();
   private llmTracingEnabled = false;
@@ -728,6 +731,42 @@ export class MasterCoordinator {
     return tasks.filter((task) => task.sessionId === options.sessionId);
   }
 
+  /** Stop a task at the next safe execution boundary. */
+  async cancelTask(taskId: string, reason = 'Cancelled by user'): Promise<boolean> {
+    const task = this.tasks.get(taskId);
+    if (!task || ['completed', 'failed'].includes(task.status)) return false;
+    this.taskControllers.get(taskId)?.abort(reason);
+    task.status = 'failed';
+    task.result = reason;
+    task.completedAt = now();
+    await this.persist(task);
+    this.emitTaskUpdate(task);
+    this.emit({ type: 'task_done', taskId, result: reason, status: 'failed', ts: now() });
+    return true;
+  }
+
+  /** Classify and apply a user steering message without blocking reception. */
+  async steerTask(taskId: string, update: string): Promise<'correct_now' | 'augment' | 'new_task' | 'query' | 'not_found'> {
+    const task = this.tasks.get(taskId);
+    if (!task) return 'not_found';
+    const text = update.trim();
+    const lower = text.toLowerCase();
+    const query = /^(what|why|status|progress|where|how far|现在|进度|做到|为什么)/i.test(text);
+    const correction = /(stop|cancel|abort|wrong|mistake|instead|不要|停下|取消|错了|不对|改成|换成|别这样)/i.test(lower);
+    if (query) return 'query';
+    if (correction && this.runningTasks.has(taskId)) {
+      this.taskControllers.get(taskId)?.abort(`Steering correction: ${text}`);
+      await this.appendTaskMailboxUpdate(taskId, text);
+      task.status = 'queued';
+      task.result = undefined;
+      await this.persist(task);
+      this.emitTaskUpdate(task);
+      return 'correct_now';
+    }
+    await this.appendTaskMailboxUpdate(taskId, text);
+    return 'augment';
+  }
+
   async deleteTask(taskId: string): Promise<void> {
     this.tasks.delete(taskId);
     this.taskHistory.delete(taskId);
@@ -1243,6 +1282,8 @@ export class MasterCoordinator {
     if (!task) return;
     if (this.runningTasks.has(taskId)) return;
     this.runningTasks.add(taskId);
+    const controller = new AbortController();
+    this.taskControllers.set(taskId, controller);
 
     const conversationHistory = this.taskHistory.get(taskId) ?? [];
     task.status = 'running';
@@ -1286,10 +1327,12 @@ export class MasterCoordinator {
       }
     } finally {
       this.runningTasks.delete(taskId);
+      this.taskControllers.delete(taskId);
       if (['completed', 'failed'].includes(task.status)) {
         this.rememberTask(task);
       }
       this.emitTaskUpdate(task);
+      if ((task.status as string) === 'queued') this.enqueueTaskRun(taskId);
     }
   }
 
@@ -1355,10 +1398,13 @@ export class MasterCoordinator {
     conversationHistory: ConversationEntry[],
   ): AsyncGenerator<StreamChunk> {
     try {
+      const signal = this.taskControllers.get(task.taskId)?.signal;
+      if (signal?.aborted) return;
       if (!task.sharedContext && task.relatedTaskIds?.length) {
         task.sharedContext = this.renderTaskContextBundle(task.relatedTaskIds);
       }
       await this.absorbMailboxUpdates(task);
+      if (this.taskControllers.get(task.taskId)?.signal.aborted) return;
 
       // Extract goal from prompt if present
       if (!task.goal) {
@@ -1621,48 +1667,31 @@ export class MasterCoordinator {
     toolCtx: ToolContext,
     steps: PlanStep[],
   ): AsyncGenerator<StreamChunk, string> {
-    const results: string[] = [];
-    let activeSteps = [...steps];
-    for (let index = 0; index < activeSteps.length; index += 1) {
-      const updates = await this.absorbMailboxUpdates(task);
-      if (updates.length > 0) {
-        const note = `Absorbed ${updates.length} update${updates.length === 1 ? '' : 's'}; replanning`;
-        this.markPhase(task, 'plan', 'in_progress', note);
-        yield { type: 'phase', phase: 'plan', status: 'in_progress', note };
-        const planner = await this.planTask(task, conversationHistory);
-        task.planner = planner;
-        task.summary = planner.summary;
-        task.readOnly = planner.readOnly;
-        task.plan = planner.steps;
-        activeSteps = [...planner.steps];
-        await this.persist(task);
-        this.markPhase(task, 'plan', 'done', `${planner.steps.length} replanned step${planner.steps.length === 1 ? '' : 's'}`);
-        yield { type: 'phase', phase: 'plan', status: 'done', note: `${planner.steps.length} replanned step${planner.steps.length === 1 ? '' : 's'}` };
-        index = -1;
-        continue;
-      }
-      const step = activeSteps[index]!;
-      const phase = this.phaseForStep(step);
-      const note = `${index + 1}/${activeSteps.length}: ${step.title}`;
-      this.markPhase(task, phase, 'in_progress', note);
-      yield { type: 'phase', phase, status: 'in_progress', note };
-      const heading = `## ${step.title}\n`;
-      yield { type: 'token', text: heading };
-
-      const result = yield* this.executePlannerStep(task, conversationHistory, toolCtx, step, index);
-      const trimmed = result.trim();
-      if (trimmed) {
-        results.push(`## ${step.title}\n${trimmed}`);
-        if (step.intent === 'answer' || step.intent === 'ask_user') {
-          yield { type: 'token', text: `${trimmed}\n\n` };
-        } else {
-          yield { type: 'token', text: '\n\n' };
-        }
-      }
-      this.markPhase(task, phase, 'done', step.title);
-      yield { type: 'phase', phase, status: 'done', note: step.title };
+    // Autonomous loop: the model chooses the next action from tool results and
+    // current context. Planner output is retained as a hint/summary only; it
+    // never dictates a fixed workflow or tool sequence.
+    this.markPhase(task, 'execute', 'in_progress', 'Autonomous loop');
+    yield { type: 'phase', phase: 'execute', status: 'in_progress', note: 'Autonomous loop' };
+    const messages: OllamaMsg[] = [
+      ...conversationHistory.map((entry) => ({ role: entry.role, content: entry.content })),
+      {
+        role: 'user',
+        content: [
+          task.sharedContext ? `Context:\n${task.sharedContext}` : '',
+          `Goal:\n${task.prompt}`,
+          '自主解决问题：自行决定下一步，按需读取、修改、测试、诊断并迭代；不要遵循预先枚举的流程，只有在目标已验证或明确受阻时才停止。',
+        ].filter(Boolean).join('\n\n'),
+      },
+    ];
+    let result = '';
+    for await (const chunk of this.runToolLoopStream(messages, 40, toolCtx, Boolean(task.readOnly), 'autonomous_loop', (text) => {
+      result += text;
+    }, undefined, undefined, AUTONOMOUS_SYSTEM_PROMPT)) {
+      yield chunk;
     }
-    return results.join('\n\n').trim();
+    this.markPhase(task, 'execute', 'done', 'Autonomous loop finished');
+    yield { type: 'phase', phase: 'execute', status: 'done', note: 'Autonomous loop finished' };
+    return result.trim();
   }
 
   private async *executePlannerStep(
@@ -1905,6 +1934,7 @@ export class MasterCoordinator {
   ): AsyncGenerator<StreamChunk> {
     const tools = toolsOverride ?? this.getToolsForTask(readOnly);
     for (let turn = 0; turn < maxTurns; turn += 1) {
+      if (toolCtx.taskId && this.taskControllers.get(toolCtx.taskId)?.signal.aborted) return;
       let assistantText = '';
       let toolCalls: OllamaMsg['tool_calls'];
 
@@ -1926,6 +1956,7 @@ export class MasterCoordinator {
       if (!toolCalls?.length) break;
 
       for (const call of toolCalls) {
+        if (toolCtx.taskId && this.taskControllers.get(toolCtx.taskId)?.signal.aborted) return;
         onToolCall?.(call.function.name);
         const toolName = call.function.name;
         const toolArgs = call.function.arguments;

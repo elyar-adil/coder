@@ -17,6 +17,10 @@ import { mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { exec as _exec } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execAsync = promisify(_exec);
 
 import type { MasterCoordinator } from '../runtime/coordinator.js';
 import type { BackendConfig, BackendType } from '../backend.js';
@@ -203,7 +207,7 @@ function expandHomePath(value: string): string {
 export function resolveConfiguredPath(configuredPath: string | undefined, workspaceRoot: string, fallback: string): string {
   const raw = configuredPath?.trim() || fallback;
   const expanded = expandHomePath(raw);
-  return isAbsolute(expanded) ? resolve(expanded) : resolve(workspaceRoot, expanded);
+  return isAbsolute(expanded) ? expanded : resolve(workspaceRoot, expanded);
 }
 
 function isExistingFile(path: string): boolean {
@@ -632,6 +636,24 @@ export async function runWeb(
         });
       } catch (err) {
         json(res, 400, { error: err instanceof Error ? err.message : String(err) });
+      }
+      return;
+    }
+
+    // ── List local Ollama models ─────────────────────────────────────────────
+    if (path === '/api/ollama/models' && method === 'GET') {
+      try {
+        const { stdout } = await execAsync('ollama list', { timeout: 5000 });
+        const lines = stdout.trim().split('\n').slice(1); // skip header
+        const models = lines
+          .map((line) => {
+            const [name, size] = line.split(/\s+/);
+            return name ? { name, size: size ?? '' } : null;
+          })
+          .filter((m): m is { name: string; size: string } => m !== null);
+        json(res, 200, { models });
+      } catch (err) {
+        json(res, 200, { models: [], error: err instanceof Error ? err.message : String(err) });
       }
       return;
     }

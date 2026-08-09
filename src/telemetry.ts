@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import type { TelemetryEvent } from './types.js';
+import type { TelemetryEvent } from './domain/task.js';
 
 export class TelemetryStore {
   private events: TelemetryEvent[] = [];

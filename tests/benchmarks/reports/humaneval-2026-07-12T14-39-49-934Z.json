@@ -1,0 +1,49 @@
+{
+  "generatedAt": "2026-07-12T14:39:49.933Z",
+  "config": {
+    "model": "gemma4:31b-cloud",
+    "backend": "ollama",
+    "benchmark": "HumanEval",
+    "sampleSize": 1,
+    "timeoutMs": 120000
+  },
+  "summary": {
+    "total": 1,
+    "passed": 0,
+    "passAt1": 0,
+    "producedRunnable": 1,
+    "runnableRate": 1,
+    "avgToolCalls": 17,
+    "avgDurationMs": 35418,
+    "avgDurationPassingMs": 0
+  },
+  "comparisons": [
+    {
+      "agent": "ours (gemma4:31b-cloud)",
+      "passAt1": 0
+    },
+    {
+      "agent": "Claude Code",
+      "note": "not measured yet"
+    },
+    {
+      "agent": "Codex",
+      "note": "not measured yet"
+    }
+  ],
+  "results": [
+    {
+      "taskLabel": "HumanEval/0",
+      "benchmark": "HumanEval",
+      "language": "python",
+      "pass": false,
+      "verdict": "fail_assert",
+      "producedRunnable": true,
+      "toolCalls": 17,
+      "durationMs": 35418,
+      "agentStatus": "completed",
+      "error": "Command failed: python __test__.py\nTraceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\AppData\\Local\\Temp\\coder-bench-HumanEval-0-HMoMSF\\__test__.py\", line 22, in <module>\r\n    _g[\"check\"](_candidate)\r\n    ~~~~~~~~~~~^^^^^^^^^^^^\r\n  File \"<string>\", line 10, in check\r\nAssertionError\r\n",
+      "output": "Traceback (most recent call last):\r\n  File \"C:\\Users\\Elyar\\AppData\\Local\\Temp\\coder-bench-HumanEval-0-HMoMSF\\__test__.py\", line 22, in <module>\r\n    _g[\"check\"](_candidate)\r\n    ~~~~~~~~~~~^^^^^^^^^^^^\r\n  File \"<string>\", line 10, in check\r\nAssertionError"
+    }
+  ]
+}

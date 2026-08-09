@@ -541,6 +541,17 @@ export async function runTui(
       return;
     }
 
+    if (cmd === 'cancel') {
+      const taskId = resolveSessionTaskId(args[0]);
+      if (!taskId) { logSystem('Usage: /cancel <taskId>'); return; }
+      const task = master.getTask(taskId);
+      if (!task || task.sessionId !== sessionId) { logSystem(`Task not found in this session: ${args[0]}`); return; }
+      const cancelled = await master.cancelTask(taskId);
+      log(cancelled ? chalk.hex(THEME.success)(`Cancelled task ${taskId.slice(0, 8)}.`) : chalk.hex(THEME.warning)('Task is already finished.'));
+      renderPrompt();
+      return;
+    }
+
     if (cmd === 'sessions') {
       const sessions = await convStore.list();
       if (sessions.length === 0) {

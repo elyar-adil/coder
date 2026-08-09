@@ -5,7 +5,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { createServer, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MasterCoordinator, parsePlan, parseOllamaNdjson } from '../src/master.js';
+import { MasterCoordinator, parsePlan, parseOllamaNdjson } from '../src/runtime/coordinator.js';
 
 function hashContent(content: string): string {
   return createHash('sha256').update(content).digest('hex');

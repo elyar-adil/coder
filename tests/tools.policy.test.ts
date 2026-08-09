@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { executeTool, setToolPolicy } from '../src/tools.js';
+import { executeTool, setToolPolicy } from '../src/infra/tools.js';
 import { defaultPolicy } from '../src/policy.js';
 
 describe('tool policy', () => {

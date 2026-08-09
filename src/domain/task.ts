@@ -198,6 +198,8 @@ export interface ToolContext {
   sharedContext?: string;
   artifactDir?: string;
   taskId?: string;
+  signal?: AbortSignal;
+  checkpoint?: (note: string) => Promise<void>;
 }
 
 export type MasterEvent =

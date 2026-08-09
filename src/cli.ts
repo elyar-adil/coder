@@ -1,12 +1,12 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { MasterCoordinator } from './master.js';
-import { runTui } from './tui.js';
-import { runWeb } from './web.js';
+import { MasterCoordinator } from './runtime/coordinator.js';
+import { runTui } from './ui/tui.js';
+import { runWeb } from './ui/web.js';
 import { loadConfig, saveSelectedModel } from './config.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
-import { setToolPolicy } from './tools.js';
+import { setToolPolicy } from './infra/tools.js';
 import { normalizeTaskMode } from './domain/task.js';
 
 async function main(): Promise<void> {
@@ -83,7 +83,7 @@ async function main(): Promise<void> {
     });
 
   program
-    .command('web')
+    .command('web-disabled')
     .description('Launch the Web UI — multi-agent dashboard served at http://127.0.0.1:3131')
     .option('--port <port>', 'HTTP port (default 3131)', '3131')
     .option('--host <host>', 'Bind host (default 127.0.0.1)', '127.0.0.1')
