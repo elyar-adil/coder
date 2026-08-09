@@ -8,6 +8,7 @@ import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { setToolPolicy } from './infra/tools.js';
 import { normalizeTaskMode } from './domain/task.js';
+import { runConfigCommand } from './config-command.js';
 
 async function main(): Promise<void> {
   const program = new Command();
@@ -110,6 +111,13 @@ async function main(): Promise<void> {
           verbose: Boolean(globalOpts.verbose),
         },
       );
+    });
+
+  program
+    .command('config')
+    .description('Interactive model configuration — add models from Ollama, OpenRouter, etc.')
+    .action(async () => {
+      await runConfigCommand();
     });
 
   // Default to TUI when no subcommand is given, including global-option-only invocations.

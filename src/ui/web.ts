@@ -25,7 +25,7 @@ const execAsync = promisify(_exec);
 import type { MasterCoordinator } from '../runtime/coordinator.js';
 import type { BackendConfig, BackendType } from '../backend.js';
 import { loadConfigWithPath, saveConfig, type AgentConfig, type AgentModelConfig } from '../config.js';
-import type { TaskMode } from '../domain/task.js';
+import type { Goal, TaskMode } from '../domain/task.js';
 import { resolveModelConfig as resolveModelFromConfig } from '../model-config.js';
 import { ConversationStore, type ConversationEntry } from '../store.js';
 
@@ -226,14 +226,25 @@ export function resolveDownloadPath(
   if (!raw) return undefined;
   const withoutFileScheme = raw.startsWith('file://') ? fileURLToPath(raw) : raw;
   const expanded = expandHomePath(withoutFileScheme);
-  const candidates = isAbsolute(expanded)
-    ? [resolve(expanded)]
-    : [
-      resolve(roots.sessionArtifactDir, expanded),
-      resolve(roots.artifactRoot, expanded),
-      resolve(roots.workspaceRoot, expanded),
+  if (isAbsolute(expanded)) {
+    const resolved = resolve(expanded);
+    if (isExistingFile(resolved)) return resolved;
+    // Try basename in workspace/artifact dirs
+    const base = basename(resolved);
+    const candidates = [
+      resolve(roots.workspaceRoot, base),
+      resolve(roots.artifactRoot, base),
+      resolve(roots.sessionArtifactDir, base),
     ];
-  const allowedRoots = [roots.sessionArtifactDir, roots.artifactRoot, roots.workspaceRoot];
+    return candidates.find(c => isExistingFile(c));
+  }
+  const candidates = [
+    resolve(roots.workspaceRoot, expanded),
+    resolve(roots.artifactRoot, expanded),
+    resolve(roots.sessionArtifactDir, expanded),
+    resolve(process.cwd(), expanded),
+  ];
+  const allowedRoots = [roots.sessionArtifactDir, roots.artifactRoot, roots.workspaceRoot, process.cwd()];
   return candidates.find((candidate) => (
     allowedRoots.some((root) => isInsideRoot(root, candidate))
     && isExistingFile(candidate)
@@ -390,11 +401,16 @@ export async function runWeb(
   const convStore = new ConversationStore();
   await convStore.init();
   let loadedConfig = await loadConfigWithPath();
-  const sessionId = `web-session-${Date.now()}`;
+  const sessionId = 'web-session';
   let artifactRoot = resolveConfiguredPath(loadedConfig.config.artifactsDir, workspaceRoot, '.agent-workspace/artifacts');
   let sessionArtifactDir = resolve(artifactRoot, sessionId);
   await mkdir(sessionArtifactDir, { recursive: true });
   const history: ConversationEntry[] = [];
+  // Load persisted conversation history
+  try {
+    const saved = await convStore.load(sessionId);
+    history.push(...saved);
+  } catch { /* ignore */ }
 
   let activeModelName = modelName;
   let activeModelAliases = configModelAliases(loadedConfig.config, activeModelName, modelAliases);
@@ -432,6 +448,11 @@ export async function runWeb(
   // Subscribe to all master events and forward to browser
   const unsubscribe = master.subscribe((event) => {
     if (!eventBelongsToSession(event)) return;
+    // Persist assistant messages to conversation history
+    if (event.type === 'user_visible_message' && event.text) {
+      history.push({ role: 'assistant', content: event.text, ts: event.ts || new Date().toISOString() });
+      void convStore.save(sessionId, history);
+    }
     broadcast({ channel: 'master', event });
   });
 
@@ -490,6 +511,7 @@ export async function runWeb(
       const tasks = master.listTasks?.({ sessionId }) ?? [];
       json(res, 200, {
         tasks,
+        messages: history.map(e => ({ role: e.role, content: e.content })),
         mode: activeMode,
         model: activeModelName,
         modelAliases: activeModelAliases,
@@ -507,7 +529,7 @@ export async function runWeb(
         const mode = body.mode ?? activeMode;
         if (!text) { json(res, 400, { error: 'text is required' }); return; }
         activeMode = mode;
-        history.push({ role: 'user', content: text });
+        history.push({ role: 'user', content: text, ts: new Date().toISOString() });
         await convStore.save(sessionId, history);
         const taskId = await master.acceptPrompt('web-user', text, mode, history.slice(0, -1), { sessionId, artifactDir: sessionArtifactDir });
         broadcast({ channel: 'user_message', sessionId, text, mode, ts: new Date().toISOString() });
@@ -672,6 +694,64 @@ export async function runWeb(
       } catch (err) {
         json(res, 500, { error: String(err) });
       }
+      return;
+    }
+
+    // ── Goal management ─────────────────────────────────────────────────────
+    if (path === '/api/goal' && method === 'POST') {
+      try {
+        const body = JSON.parse(await readBody(req)) as { taskId?: string; description?: string; criteria?: string };
+        const taskId = body.taskId?.trim();
+        const description = body.description?.trim();
+        if (!taskId || !description) {
+          json(res, 400, { error: 'taskId and description are required' }); return;
+        }
+        const task = master.getTask(taskId);
+        if (!task || task.sessionId !== sessionId) {
+          json(res, 404, { error: 'Task not found in this session' }); return;
+        }
+        const goal = {
+          description,
+          completionCriteria: body.criteria?.trim() || 'Complete the user request and verification steps.',
+          status: 'in_progress' as const,
+        };
+        await master.updateGoal(taskId, goal);
+        json(res, 200, { ok: true, goal });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+      return;
+    }
+
+    if (path === '/api/goal' && method === 'DELETE') {
+      try {
+        const taskId = url.searchParams.get('taskId')?.trim();
+        if (!taskId) { json(res, 400, { error: 'taskId is required' }); return; }
+        const task = master.getTask(taskId);
+        if (!task || task.sessionId !== sessionId) {
+          json(res, 404, { error: 'Task not found in this session' }); return;
+        }
+        task.goal = undefined;
+        await master.saveTask(task);
+        json(res, 200, { ok: true });
+      } catch (err) {
+        json(res, 500, { error: String(err) });
+      }
+      return;
+    }
+
+    // ── Status summary ──────────────────────────────────────────────────────
+    if (path === '/api/status' && method === 'GET') {
+      const tasks = master.listTasks?.({ sessionId }) ?? [];
+      const active = tasks.filter(t => ['queued', 'running', 'waiting_user', 'blocked'].includes(t.status));
+      const completed = tasks.filter(t => t.status === 'completed');
+      const failed = tasks.filter(t => t.status === 'failed');
+      json(res, 200, {
+        active: active.map(t => ({ taskId: t.taskId, title: t.summary || t.prompt?.slice(0, 60), status: t.status, phase: t.phaseEvents?.at?.(-1)?.phase })),
+        completed: completed.length,
+        failed: failed.length,
+        total: tasks.length,
+      });
       return;
     }
 

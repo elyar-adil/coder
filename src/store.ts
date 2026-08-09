@@ -9,6 +9,7 @@ const BASE = join(homedir(), '.coder');
 export interface ConversationEntry {
   role: 'user' | 'assistant';
   content: string;
+  ts?: string;
 }
 
 export class ConversationStore {

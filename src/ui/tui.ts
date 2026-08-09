@@ -653,7 +653,7 @@ export async function runTui(
     log(chalk.hex(THEME.textMuted)(`  › ${simplifyText(userInput, 80)}`));
     log(chalk.hex(THEME.textMuted)('  routing request…'));
 
-    history.push({ role: 'user', content: userInput });
+    history.push({ role: 'user', content: userInput, ts: new Date().toISOString() });
     await saveHistory();
     await master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1), { sessionId });
     renderPrompt();
@@ -745,7 +745,7 @@ export async function runTui(
       const view = tasks.get(event.taskId);
       const prefix = view ? taskPrefix(view) : event.taskId;
       if (event.status === 'completed') {
-        history.push({ role: 'assistant', content: event.result });
+        history.push({ role: 'assistant', content: event.result, ts: new Date().toISOString() });
         void saveHistory();
       } else {
         log(chalk.hex(THEME.danger)(`Task failed: ${event.result}`));
