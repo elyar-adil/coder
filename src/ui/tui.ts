@@ -14,6 +14,7 @@ import { ConversationStore, type ConversationEntry } from '../store.js';
 import type { BackendConfig } from '../backend.js';
 import type { MasterCoordinator } from '../runtime/coordinator.js';
 import type { ClarificationRequest, LlmTraceEntry, PatchSet, PromptTask, TaskMode, TaskPhase, TaskStatus } from '../domain/task.js';
+import { listTools } from '../infra/tools.js';
 
 const PHASE_LABELS: Record<TaskPhase, string> = {
   plan: 'Planning',
@@ -480,6 +481,16 @@ export async function runTui(
       return;
     }
 
+    if (cmd === 'tools') {
+      const tools = listTools();
+      log(chalk.bold.hex(THEME.accentStrong)('Available agent tools:'));
+      for (const tool of tools) {
+        const tag = `[${tool.metadata.effect}/${tool.metadata.category}]`;
+        log(`  ${chalk.hex(THEME.accent)(tool.name.padEnd(22))} ${chalk.hex(THEME.textMuted)(tag)} ${tool.description}`);
+      }
+      return;
+    }
+
     if (cmd === 'view') {
       const taskId = resolveSessionTaskId(args[0]);
       if (!taskId) {
@@ -611,6 +622,7 @@ export async function runTui(
         `  ${chalk.hex(THEME.accent)('/plan')}           — toggle plan/build`,
         `  ${chalk.hex(THEME.accent)('/model')} [name]  — list or switch model`,
         `  ${chalk.hex(THEME.accent)('/tasks')}          — show all tasks`,
+        `  ${chalk.hex(THEME.accent)('/tools')}          — list available agent tools`,
         `  ${chalk.hex(THEME.accent)('/view')} <taskId>  — inspect task details and diffs`,
         `  ${chalk.hex(THEME.accent)('/approve')} <id>   — execute an approved plan task`,
         `  ${chalk.hex(THEME.accent)('/resume')} <id>    — resume a queued/running task`,
@@ -655,7 +667,10 @@ export async function runTui(
 
     history.push({ role: 'user', content: userInput, ts: new Date().toISOString() });
     await saveHistory();
-    await master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1), { sessionId });
+    // Route and execution are intentionally detached from readline. A slow
+    // model must never prevent the next TUI prompt from being accepted.
+    void master.acceptPrompt('tui-user', userInput, mode, history.slice(0, -1), { sessionId })
+      .catch((error) => logSystem(`Prompt dispatch failed: ${String(error)}`));
     renderPrompt();
   };
 

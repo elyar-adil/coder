@@ -1,12 +1,12 @@
-# Top-tier Coding Agent CLI/TUI/Web
+# TUI-first Coding Agent
 
-A TypeScript-based coding agent with CLI, TUI, and Web UI that connects to OpenAI-compatible, Anthropic, or local NDJSON chat APIs for asynchronous AI-powered code generation, planning, and verification.
+A TypeScript coding agent centered on an interactive terminal UI. It connects to OpenAI-compatible, Anthropic, or local NDJSON chat APIs for asynchronous code generation, planning, and verification.
 
 ## Features
 
 - **Instant prompt dispatch** — every prompt becomes a task immediately; the UI stays usable while routing, planning, execution, and verification continue in the background
 - **Cross-task coordination** — follow-up prompts can query a running task, change a task through its mailbox, or start derived/sync work from existing task context
-- **Web dashboard** — browser UI for live task timelines, tool calls, writer patch status, model/mode switching and configuration, session artifact downloads, and background task tracking
+- **Embeddable tool system** — provider-neutral definitions, registry-based execution, policy controls, repository search, file operations, Git inspection, shell execution, and coordinator capabilities
 - **Execute mode** — planner-driven agentic execution; the planner chooses direct answer, bash, read-only inspection, code edits, and verification steps dynamically
 - **Plan mode** — generate step-by-step execution plans for manual approval
 - **ReAct mode** — compatibility alias for planner-driven execution
@@ -73,16 +73,6 @@ TUI commands:
 | `/exit` or Ctrl+C | Quit |
 
 When an agent needs clarification, the TUI prints numbered options. Reply with a number such as `1`; any other prompt starts or routes normal work instead of being consumed as the answer.
-
-## Web UI
-
-```bash
-coder web
-# or
-npm run dev -- web --port 3131
-```
-
-Open `http://127.0.0.1:3131`. The Web UI is designed for the project's main differentiator: you can submit multiple prompts without waiting, watch each task progress independently, and steer running work with more prompts. Mode and model controls sit before the input box; Shift+Tab cycles Execute, Plan, and React. The model configuration dialog edits `.agentrc` aliases, backend settings, request options, API keys, and the artifact directory. Clarifications appear as selectable buttons, and generated artifact files mentioned by agents become basename-only download links.
 
 ## Testing
 

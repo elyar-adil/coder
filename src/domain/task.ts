@@ -1,4 +1,5 @@
 import type { ToolPolicy } from '../policy.js';
+import type { ToolExecutionContext } from '../tools/types.js';
 
 export type TaskStatus = 'queued' | 'running' | 'blocked' | 'waiting_user' | 'completed' | 'failed';
 export type TaskMode = 'build' | 'plan';
@@ -188,18 +189,10 @@ export interface PromptTask {
 
 export type ReleaseLock = () => void | Promise<void>;
 
-export interface ToolContext {
+/** Coordinator-specific refinement of the provider-neutral tool context. */
+export interface ToolContext extends ToolExecutionContext<ToolPolicy> {
   spawnSubagent: (prompt: string) => Promise<string>;
   collectSubagent: (id: string) => Promise<string>;
-  requestClarification?: (question: string, choices?: string[]) => Promise<string>;
-  submitPatch?: (patch: Omit<PatchSet, 'patchId' | 'taskId' | 'status' | 'createdAt' | 'updatedAt'>) => Promise<string>;
-  acquireWriteLock?: (path: string) => Promise<ReleaseLock>;
-  policy?: ToolPolicy;
-  sharedContext?: string;
-  artifactDir?: string;
-  taskId?: string;
-  signal?: AbortSignal;
-  checkpoint?: (note: string) => Promise<void>;
 }
 
 export type MasterEvent =

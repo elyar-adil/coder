@@ -1851,11 +1851,11 @@ export class MasterCoordinator {
         case 'none':
           return new Set<string>();
         case 'read_only':
-          return new Set(['repo_map', 'read_file', 'list_dir', 'bash', 'load_skill', 'request_clarification']);
+          return new Set(['repo_map', 'read_file', 'read_files', 'file_info', 'list_dir', 'search_text', 'search_files', 'git_status', 'git_diff', 'git_log', 'bash', 'load_skill', 'request_clarification']);
         case 'code_write':
-          return new Set(['repo_map', 'read_file', 'list_dir', 'bash', 'load_skill', 'spawn_subagent', 'collect_subagent', 'submit_patch', 'request_clarification']);
+          return new Set(['repo_map', 'read_file', 'read_files', 'file_info', 'list_dir', 'search_text', 'search_files', 'git_status', 'git_diff', 'git_log', 'bash', 'load_skill', 'spawn_subagent', 'collect_subagent', 'submit_patch', 'request_clarification']);
         case 'verify':
-          return new Set(['read_file', 'list_dir', 'bash', 'submit_patch', 'request_clarification']);
+          return new Set(['read_file', 'read_files', 'file_info', 'list_dir', 'search_text', 'search_files', 'git_status', 'git_diff', 'bash', 'submit_patch', 'request_clarification']);
         case 'safe':
         default:
           return new Set(['bash', 'request_clarification']);
@@ -1885,7 +1885,11 @@ export class MasterCoordinator {
     if (!task.readOnly && task.artifactDir && !policy.allowedWriteRoots.includes(task.artifactDir)) {
       policy.allowedWriteRoots.push(task.artifactDir);
     }
+    if (task.artifactDir && !policy.allowedReadRoots.includes(task.artifactDir)) {
+      policy.allowedReadRoots.push(task.artifactDir);
+    }
     return {
+      workspaceRoot: policy.workspaceRoot,
       spawnSubagent: (prompt) => this.spawnSubagent(prompt, task.taskId, Boolean(task.readOnly)),
       collectSubagent: (id) => this.collectSubagent(id),
       requestClarification: (question, choices) => this.requestClarification(task.taskId, question, choices),

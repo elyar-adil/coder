@@ -1,8 +1,9 @@
-import { readFile, writeFile, readdir, mkdir } from 'node:fs/promises';
+import { readFile, writeFile, readdir, mkdir, stat } from 'node:fs/promises';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
-import type { ToolContext } from '../domain/task.js';
+import { ToolRegistry } from '../tools/registry.js';
+import type { ToolDefinition, ToolExecutionContext, ToolMetadata } from '../tools/types.js';
 import { unifiedDiff } from '../diff.js';
 import {
   authorizeToolCall,
@@ -14,15 +15,22 @@ import {
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-const AGENT_WORKSPACE_ROOT = resolve(process.cwd(), '.agent-workspace');
+export type BuiltinToolContext = ToolExecutionContext<ToolPolicy>;
 
-async function gitAutoCommit(filePath: string, message: string): Promise<void> {
+function workspaceRoot(ctx?: BuiltinToolContext): string {
+  return resolve(ctx?.workspaceRoot ?? ctx?.policy?.workspaceRoot ?? process.cwd());
+}
+
+function resolveToolPath(targetPath: string, ctx?: BuiltinToolContext): string {
+  return isAbsolute(targetPath) ? resolve(targetPath) : resolve(workspaceRoot(ctx), targetPath);
+}
+
+async function gitAutoCommit(filePath: string, message: string, ctx?: BuiltinToolContext): Promise<void> {
   if (process.env.AGENT_AUTO_COMMIT !== '1') return;
   try {
-    await execAsync(`git add "${filePath}" && git commit -m "${message.replace(/"/g, "'")}" --no-verify`, {
-      timeout: 15_000,
-      cwd: process.cwd(),
-    });
+    const cwd = workspaceRoot(ctx);
+    await execFileAsync('git', ['add', '--', filePath], { timeout: 15_000, cwd, signal: ctx?.signal });
+    await execFileAsync('git', ['commit', '-m', message, '--no-verify'], { timeout: 15_000, cwd, signal: ctx?.signal });
   } catch {
     // Best-effort only.
   }
@@ -36,26 +44,26 @@ function artifactRelativePath(targetPath: string): string | undefined {
   return normalized;
 }
 
-function resolveWriteTarget(targetPath: string, ctx?: ToolContext): string {
+function resolveWriteTarget(targetPath: string, ctx?: BuiltinToolContext): string {
   const artifactDir = ctx?.artifactDir;
   const artifactRel = artifactDir ? artifactRelativePath(targetPath) : undefined;
   if (artifactDir && artifactRel) return resolve(artifactDir, artifactRel);
-  return isAbsolute(targetPath) ? targetPath : resolve(process.cwd(), targetPath);
+  return resolveToolPath(targetPath, ctx);
 }
 
-function authorizeWithResolvedPath(policy: ToolPolicy, name: string, path: string, ctx?: ToolContext): string | undefined {
+function authorizeWithResolvedPath(policy: ToolPolicy, name: string, path: string, ctx?: BuiltinToolContext): string | undefined {
   const target = resolveWriteTarget(path, ctx);
   const decision = authorizeToolCall(policy, name, { path: target });
   return decision.ok ? undefined : formatPolicyError(name, decision);
 }
 
-async function writeViaWorkspace(targetPath: string, content: string, ctx?: ToolContext): Promise<string> {
+async function writeViaWorkspace(targetPath: string, content: string, ctx?: BuiltinToolContext): Promise<string> {
   const absoluteTarget = resolveWriteTarget(targetPath, ctx);
-  const cwd = process.cwd();
-  const rel = absoluteTarget.startsWith(cwd)
-    ? relative(cwd, absoluteTarget)
+  const root = workspaceRoot(ctx);
+  const rel = absoluteTarget.startsWith(root)
+    ? relative(root, absoluteTarget)
     : join('__external__', absoluteTarget.replace(/^([a-zA-Z]:)?[/\\]+/, ''));
-  const workspacePath = join(AGENT_WORKSPACE_ROOT, rel);
+  const workspacePath = join(root, '.agent-workspace', rel);
   await mkdir(dirname(workspacePath), { recursive: true });
   await writeFile(workspacePath, content, 'utf8');
   await mkdir(dirname(absoluteTarget), { recursive: true });
@@ -280,7 +288,7 @@ export function getToolPolicy(): ToolPolicy {
 }
 
 async function withWriteLock<T>(
-  ctx: ToolContext | undefined,
+  ctx: BuiltinToolContext | undefined,
   path: string,
   action: () => Promise<T>,
 ): Promise<T> {
@@ -292,23 +300,8 @@ async function withWriteLock<T>(
   }
 }
 
-export interface OllamaToolDef {
-  type: 'function';
-  function: {
-    name: string;
-    description: string;
-    parameters: {
-      type: 'object';
-      properties: Record<string, {
-        type: string;
-        description: string;
-        items?: Record<string, unknown>;
-        enum?: string[];
-      }>;
-      required: string[];
-    };
-  };
-}
+/** Backward-compatible provider name; the schema is provider-neutral. */
+export type OllamaToolDef = ToolDefinition;
 
 export const TOOLS: OllamaToolDef[] = [
   {
@@ -399,6 +392,33 @@ understand the codebase structure without reading every file. Returns a compact 
   {
     type: 'function',
     function: {
+      name: 'read_files',
+      description: 'Read several files in one call. Returns independently labelled, line-numbered sections and continues when one file is missing.',
+      parameters: {
+        type: 'object',
+        properties: {
+          paths: { type: 'array', description: 'File paths to read', items: { type: 'string' } },
+          max_lines: { type: 'number', description: 'Maximum lines per file (default 400)' },
+        },
+        required: ['paths'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'file_info',
+      description: 'Return safe metadata for a file or directory without reading its contents.',
+      parameters: {
+        type: 'object',
+        properties: { path: { type: 'string', description: 'File or directory path' } },
+        required: ['path'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'search_text',
       description: '在仓库中搜索文本或正则表达式，返回紧凑的文件、行号和匹配内容。优先使用本工具而不是 bash rg。',
       parameters: {
@@ -447,6 +467,21 @@ understand the codebase structure without reading every file. Returns a compact 
         properties: {
           path: { type: 'string', description: '可选文件路径' },
           staged: { type: 'boolean', description: '是否查看暂存区差异' },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'git_log',
+      description: 'Show recent commits with subject, author and date. Read-only and optionally scoped to a path.',
+      parameters: {
+        type: 'object',
+        properties: {
+          path: { type: 'string', description: 'Optional repository-relative path' },
+          max_count: { type: 'number', description: 'Maximum commits (default 20, max 100)' },
         },
         required: [],
       },
@@ -574,10 +609,63 @@ understand the codebase structure without reading every file. Returns a compact 
 
 export const WORKER_TOOLS = TOOLS.filter((tool) => tool.function.name !== 'ask_user');
 
-export async function executeTool(
+const TOOL_METADATA: Record<string, ToolMetadata> = {
+  read_file: { effect: 'read', category: 'filesystem' },
+  read_files: { effect: 'read', category: 'filesystem' },
+  file_info: { effect: 'read', category: 'filesystem' },
+  edit_file: { effect: 'write', category: 'filesystem' },
+  write_file: { effect: 'write', category: 'filesystem' },
+  list_dir: { effect: 'read', category: 'filesystem' },
+  repo_map: { effect: 'read', category: 'search' },
+  search_text: { effect: 'read', category: 'search' },
+  search_files: { effect: 'read', category: 'search' },
+  git_status: { effect: 'read', category: 'git' },
+  git_diff: { effect: 'read', category: 'git' },
+  git_log: { effect: 'read', category: 'git' },
+  bash: { effect: 'execute', category: 'shell' },
+  load_skill: { effect: 'read', category: 'agent' },
+  spawn_subagent: { effect: 'coordinate', category: 'agent' },
+  collect_subagent: { effect: 'coordinate', category: 'agent' },
+  submit_patch: { effect: 'write', category: 'agent' },
+  request_clarification: { effect: 'coordinate', category: 'agent' },
+  ask_user: { effect: 'coordinate', category: 'agent', hidden: true },
+};
+
+function parseStringArray(value: unknown): string[] | undefined {
+  if (Array.isArray(value)) return value.filter((item): item is string => typeof item === 'string');
+  if (typeof value !== 'string') return undefined;
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readLineRange(filePath: string, offset = 1, limit?: number): Promise<string> {
+  const raw = await readFile(filePath, 'utf8');
+  if (raw === '') return '';
+  const allLines = raw.split('\n');
+  const totalLines = allLines.length;
+  const startLine = Math.max(1, Math.min(offset, totalLines));
+  const endLine = limit !== undefined ? Math.min(startLine + Math.max(1, limit) - 1, totalLines) : totalLines;
+  const numbered = allLines.slice(startLine - 1, endLine).map((line, index) => (
+    `${String(startLine + index).padStart(5, '0')}|${line}`
+  )).join('\n');
+  return endLine < totalLines
+    ? `${numbered}\n... (showing lines ${startLine}-${endLine} of ${totalLines}; use offset/limit to read more)`
+    : numbered;
+}
+
+function boundedOutput(value: string, maxChars = 4 * 1024 * 1024): string {
+  if (value.length <= maxChars) return value;
+  return `${value.slice(0, maxChars)}\n... (output truncated at ${maxChars} characters)`;
+}
+
+async function executeBuiltinTool(
   name: string,
   args: Record<string, unknown>,
-  ctx?: ToolContext,
+  ctx?: BuiltinToolContext,
 ): Promise<string> {
   const policy = ctx?.policy ?? getToolPolicy();
   const decision = authorizeToolCall(policy, name, args);
@@ -587,12 +675,12 @@ export async function executeTool(
     case 'search_text': {
       const query = typeof args['query'] === 'string' ? args['query'] : '';
       if (!query) return JSON.stringify({ ok: false, error: 'query is required' });
-      const root = typeof args['path'] === 'string' ? resolve(args['path']) : process.cwd();
+      const root = resolveToolPath(typeof args['path'] === 'string' ? args['path'] : '.', ctx);
       const max = Math.max(1, Math.min(Number(args['max_results'] ?? 100), 500));
       const glob = typeof args['glob'] === 'string' ? args['glob'] : undefined;
       try {
         const rgArgs = ['--line-number', '--no-heading', '--color', 'never', '--hidden', '--glob', '!.git', '--glob', '!node_modules', ...(glob ? ['--glob', glob] : []), query, root];
-        const result = await execFileAsync('rg', rgArgs, { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
+        const result = await execFileAsync('rg', rgArgs, { cwd: workspaceRoot(ctx), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
         const lines = result.stdout.split(/\r?\n/).filter(Boolean).slice(0, max);
         return JSON.stringify({ ok: true, results: lines, truncated: lines.length >= max });
       } catch (error: any) {
@@ -602,10 +690,10 @@ export async function executeTool(
     }
     case 'search_files': {
       const glob = typeof args['glob'] === 'string' ? args['glob'] : '*';
-      const root = typeof args['path'] === 'string' ? resolve(args['path']) : process.cwd();
+      const root = resolveToolPath(typeof args['path'] === 'string' ? args['path'] : '.', ctx);
       const max = Math.max(1, Math.min(Number(args['max_results'] ?? 200), 1000));
       try {
-        const result = await execFileAsync('rg', ['--files', '--hidden', '--glob', '!.git', '--glob', '!node_modules', '--glob', glob, root], { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
+        const result = await execFileAsync('rg', ['--files', '--hidden', '--glob', '!.git', '--glob', '!node_modules', '--glob', glob, root], { cwd: workspaceRoot(ctx), maxBuffer: 1024 * 1024 * 2, timeout: 30_000, signal: ctx?.signal });
         const files = result.stdout.split(/\r?\n/).filter(Boolean).slice(0, max);
         return JSON.stringify({ ok: true, files, truncated: files.length >= max });
       } catch (error: any) {
@@ -615,7 +703,7 @@ export async function executeTool(
     }
     case 'git_status': {
       try {
-        const result = await execFileAsync('git', ['status', '--short', '--branch'], { cwd: process.cwd(), timeout: 15_000, signal: ctx?.signal });
+        const result = await execFileAsync('git', ['status', '--short', '--branch'], { cwd: workspaceRoot(ctx), timeout: 15_000, signal: ctx?.signal });
         return JSON.stringify({ ok: true, status: result.stdout.trim() });
       } catch (error: any) { return JSON.stringify({ ok: false, error: String(error?.message ?? error) }); }
     }
@@ -623,7 +711,7 @@ export async function executeTool(
       const path = typeof args['path'] === 'string' ? args['path'] : undefined;
       const staged = args['staged'] === true;
       try {
-        const result = await execFileAsync('git', ['diff', ...(staged ? ['--cached'] : []), '--', ...(path ? [path] : [])], { cwd: process.cwd(), maxBuffer: 1024 * 1024 * 4, timeout: 20_000, signal: ctx?.signal });
+        const result = await execFileAsync('git', ['diff', ...(staged ? ['--cached'] : []), '--', ...(path ? [path] : [])], { cwd: workspaceRoot(ctx), maxBuffer: 1024 * 1024 * 4, timeout: 20_000, signal: ctx?.signal });
         return JSON.stringify({ ok: true, diff: result.stdout, truncated: false });
       } catch (error: any) { return JSON.stringify({ ok: false, error: String(error?.message ?? error) }); }
     }
@@ -633,25 +721,48 @@ export async function executeTool(
       const offsetArg = typeof args['offset'] === 'number' ? args['offset'] : undefined;
       const limitArg = typeof args['limit'] === 'number' ? args['limit'] : undefined;
       try {
-        const raw = await readFile(path, 'utf8');
-        if (raw === '') return '';
-        const allLines = raw.split('\n');
-        const totalLines = allLines.length;
-        const startLine = Math.max(1, Math.min(offsetArg ?? 1, totalLines));
-        const endLine = limitArg !== undefined
-          ? Math.min(startLine + limitArg - 1, totalLines)
-          : totalLines;
-        const slice = allLines.slice(startLine - 1, endLine);
-        const numbered = slice.map((line, i) => {
-          const lineNum = String(startLine + i).padStart(5, '0');
-          return `${lineNum}|${line}`;
-        }).join('\n');
-        const footer = endLine < totalLines
-          ? `\n... (showing lines ${startLine}-${endLine} of ${totalLines}; use offset/limit to read more)`
-          : '';
-        return numbered + footer;
+        return await readLineRange(resolveToolPath(path, ctx), offsetArg, limitArg);
       } catch (error) {
         return `Error reading file: ${String(error)}`;
+      }
+    }
+
+    case 'read_files': {
+      const paths = parseStringArray(args['paths']);
+      if (!paths?.length) return 'Error: read_files requires a non-empty "paths" array';
+      if (paths.length > 50) return 'Error: read_files accepts at most 50 paths';
+      const maxLines = Math.max(1, Math.min(Number(args['max_lines'] ?? 400), 5000));
+      const sections: string[] = [];
+      for (const path of paths) {
+        const decision = authorizeToolCall(policy, 'read_file', { path });
+        if (!decision.ok) {
+          sections.push(`===== ${path} =====\n${formatPolicyError('read_files', decision)}`);
+          continue;
+        }
+        try {
+          sections.push(`===== ${path} =====\n${await readLineRange(resolveToolPath(path, ctx), 1, maxLines)}`);
+        } catch (error) {
+          sections.push(`===== ${path} =====\nError reading file: ${String(error)}`);
+        }
+      }
+      return boundedOutput(sections.join('\n\n'));
+    }
+
+    case 'file_info': {
+      const path = typeof args['path'] === 'string' ? args['path'] : '';
+      if (!path) return 'Error: file_info requires "path"';
+      try {
+        const info = await stat(resolveToolPath(path, ctx));
+        return JSON.stringify({
+          ok: true,
+          path,
+          type: info.isFile() ? 'file' : info.isDirectory() ? 'directory' : info.isSymbolicLink() ? 'symlink' : 'other',
+          size: info.size,
+          modifiedAt: info.mtime.toISOString(),
+          createdAt: info.birthtime.toISOString(),
+        });
+      } catch (error) {
+        return JSON.stringify({ ok: false, path, error: String(error) });
       }
     }
 
@@ -715,7 +826,7 @@ export async function executeTool(
 
         try {
           const writtenPath = await writeViaWorkspace(path, content, ctx);
-          await gitAutoCommit(writtenPath, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`);
+          await gitAutoCommit(writtenPath, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`, ctx);
           const diff = unifiedDiff(path, src, content);
           return [`OK: ${log.join('; ')} (${writtenPath})`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
@@ -728,11 +839,12 @@ export async function executeTool(
       const root = typeof args['root'] === 'string' ? args['root'] : '.';
       const maxDepth = parseInt(typeof args['max_depth'] === 'string' ? args['max_depth'] : '6', 10);
       try {
-        const files = await walkDir(root, Number.isNaN(maxDepth) ? 6 : maxDepth);
+        const files = await walkDir(resolveToolPath(root, ctx), Number.isNaN(maxDepth) ? 6 : maxDepth);
         if (files.length === 0) return '(no supported source files found)';
         const lines: string[] = [`Repo map — ${files.length} file(s):\n`];
         for (const { path, symbols } of files) {
-          const rel = path.startsWith(process.cwd()) ? path.slice(process.cwd().length + 1) : path;
+          const base = workspaceRoot(ctx);
+          const rel = path.startsWith(base) ? path.slice(base.length + 1) : path;
           lines.push(`  ${rel}`);
           if (symbols.length > 0) {
             lines.push(`    ${symbols.join(', ')}`);
@@ -762,7 +874,7 @@ export async function executeTool(
             previous = '';
           }
           const writtenPath = await writeViaWorkspace(path, content, ctx);
-          await gitAutoCommit(writtenPath, `write: ${path}`);
+          await gitAutoCommit(writtenPath, `write: ${path}`, ctx);
           const diff = unifiedDiff(path, previous, content);
           return [`OK: wrote ${writtenPath} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
@@ -774,7 +886,7 @@ export async function executeTool(
     case 'list_dir': {
       const dir = typeof args['path'] === 'string' ? args['path'] : '.';
       try {
-        const entries = await readdir(dir, { withFileTypes: true });
+        const entries = await readdir(resolveToolPath(dir, ctx), { withFileTypes: true });
         return entries
           .map((entry) => (entry.isDirectory() ? `[dir]  ${entry.name}` : `[file] ${entry.name}`))
           .join('\n') || '(empty directory)';
@@ -783,25 +895,48 @@ export async function executeTool(
       }
     }
 
+    case 'git_log': {
+      const path = typeof args['path'] === 'string' ? args['path'] : undefined;
+      const maxCount = Math.max(1, Math.min(Number(args['max_count'] ?? 20), 100));
+      try {
+        const gitArgs = [
+          'log', `--max-count=${maxCount}`,
+          '--date=short', '--pretty=format:%h%x09%ad%x09%an%x09%s',
+          ...(path ? ['--', path] : []),
+        ];
+        const result = await execFileAsync('git', gitArgs, {
+          cwd: workspaceRoot(ctx), timeout: 20_000, maxBuffer: 1024 * 1024 * 2, signal: ctx?.signal,
+        });
+        return result.stdout.trim() || '(no commits)';
+      } catch (error: unknown) {
+        const err = error as { stderr?: string; message?: string };
+        return err.stderr?.trim() || `Error: ${err.message ?? String(error)}`;
+      }
+    }
+
     case 'bash': {
       const command = typeof args['command'] === 'string' ? args['command'] : undefined;
       if (!command) return 'Error: bash requires "command"';
       const cwd = typeof args['cwd'] === 'string'
-        ? resolve(args['cwd'])
+        ? resolveToolPath(args['cwd'], ctx)
         : ctx?.artifactDir
           ? resolve(ctx.artifactDir)
-          : process.cwd();
+          : workspaceRoot(ctx);
+      const timeout = Math.max(100, Math.min(Number(args['timeout_ms'] ?? 60_000), 300_000));
+      const cwdDecision = authorizeToolCall(policy, 'bash', { ...args, cwd });
+      if (!cwdDecision.ok) return formatPolicyError('bash', cwdDecision);
       try {
         if (ctx?.artifactDir && typeof args['cwd'] !== 'string') {
           await mkdir(cwd, { recursive: true });
         }
         const { stdout, stderr } = await execAsync(command, {
           cwd,
-          timeout: 60_000,
+          timeout,
           maxBuffer: 1024 * 1024 * 4,
+          signal: ctx?.signal,
         });
         const output = [stdout, stderr].filter(Boolean).join('\n--- stderr ---\n');
-        return output || '(no output)';
+        return boundedOutput(output || '(no output)');
       } catch (error: unknown) {
         const err = error as { stdout?: string; stderr?: string; message?: string };
         const output = [err.stdout, err.stderr].filter(Boolean).join('\n');
@@ -812,17 +947,16 @@ export async function executeTool(
     case 'load_skill': {
       const name = typeof args['name'] === 'string' ? args['name'] : undefined;
       if (!name) return 'Error: load_skill requires "name"';
-      const skillsDir = `${import.meta.dirname}/../skills`.replace(/\\/g, '/');
-      try {
-        return await readFile(`${skillsDir}/${name}.md`, 'utf8');
-      } catch {
-        try {
-          const available = (await readdir(skillsDir)).map((file) => file.replace(/\.md$/, '')).join(', ');
-          return `Error: skill "${name}" not found. Available: ${available}`;
-        } catch {
-          return `Error: skill "${name}" not found`;
-        }
+      if (!/^[a-z0-9_-]+$/i.test(name)) return 'Error: invalid skill name';
+      const candidates = [resolve(workspaceRoot(ctx), 'skills'), resolve(import.meta.dirname, '..', '..', 'skills')];
+      for (const skillsDir of candidates) {
+        try { return await readFile(resolve(skillsDir, `${name}.md`), 'utf8'); } catch { /* try next root */ }
       }
+      const available = new Set<string>();
+      for (const skillsDir of candidates) {
+        try { for (const file of await readdir(skillsDir)) if (file.endsWith('.md')) available.add(file.slice(0, -3)); } catch { /* ignore */ }
+      }
+      return `Error: skill "${name}" not found${available.size ? `. Available: ${[...available].sort().join(', ')}` : ''}`;
     }
 
     case 'spawn_subagent': {
@@ -858,7 +992,7 @@ export async function executeTool(
         if (typeof file.after !== 'string') return `Error: submit_patch files[${index}].after must be a string`;
       }
       for (const file of files) {
-        const pathDecision = authorizeToolCall(policy, 'write_file', { path: resolve(file.path) });
+        const pathDecision = authorizeToolCall(policy, 'write_file', { path: resolveToolPath(file.path, ctx) });
         if (!pathDecision.ok) return formatPolicyError('submit_patch', pathDecision);
       }
       if (args['verificationCommands']) {
@@ -906,4 +1040,27 @@ export async function executeTool(
     default:
       return `Error: unknown tool "${name}"`;
   }
+}
+
+/** Default built-in registry. Consumers can use ToolRegistry directly for custom sets. */
+export const toolRegistry = new ToolRegistry<BuiltinToolContext>();
+for (const definition of TOOLS) {
+  const name = definition.function.name;
+  toolRegistry.register({
+    definition,
+    metadata: TOOL_METADATA[name] ?? { effect: 'read', category: 'agent' },
+    execute: (args, context) => executeBuiltinTool(name, args, context),
+  });
+}
+
+export function listTools(options: { includeHidden?: boolean } = {}) {
+  return toolRegistry.describe(options);
+}
+
+export async function executeTool(
+  name: string,
+  args: Record<string, unknown>,
+  ctx?: BuiltinToolContext,
+): Promise<string> {
+  return toolRegistry.execute(name, args, ctx);
 }

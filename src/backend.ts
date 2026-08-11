@@ -11,7 +11,8 @@
 
 import { resilientFetch, FetchError } from './fetch.js';
 import type { OllamaMsg } from './domain/task.js';
-import type { OllamaToolDef } from './infra/tools.js';
+import type { ToolDefinition } from './tools/types.js';
+type OllamaToolDef = ToolDefinition;
 
 export type BackendType = 'openai' | 'anthropic' | 'ollama';
 
@@ -74,7 +75,7 @@ async function* ollamaStream(
   config: BackendConfig,
   systemPrompt: string,
   messages: OllamaMsg[],
-  tools?: OllamaToolDef[],
+  tools?: ToolDefinition[],
 ): AsyncGenerator<ChatChunk> {
   const body: Record<string, unknown> = {
     model: config.model,
