@@ -721,8 +721,12 @@ export class MasterCoordinator {
     const activeTask = this.findActiveTask(sessionId);
 
     if (activeTask) {
+      if (this.isTaskStatusQuery(prompt)) {
+        const answer = await this.answerTaskQuery(prompt, [activeTask.taskId], conversationHistory);
+        this.emit({ type: 'master_response', text: answer, relatedTaskIds: [activeTask.taskId], ts: now() });
+        return activeTask.taskId;
+      }
       await this.appendTaskMailboxUpdate(activeTask.taskId, prompt);
-      await this.emitUserVisibleMessage(activeTask, prompt);
       return activeTask.taskId;
     }
 
@@ -763,6 +767,12 @@ export class MasterCoordinator {
   private findActiveTask(sessionId?: string): PromptTask | undefined {
     const tasks = this.listTasks({ sessionId });
     return tasks.find(t => ['running', 'waiting_user', 'blocked'].includes(t.status));
+  }
+
+  private isTaskStatusQuery(prompt: string): boolean {
+    const text = prompt.trim().toLowerCase();
+    return /^(怎么(样|了)|进展如何|有结果吗|完成了吗|改好了吗|你改好文件了吗|状态|进度|status|progress|how(?:'| )?s it going|is it done|did you fix)/i.test(text)
+      ;
   }
 
   getTask(taskId: string): PromptTask | undefined {
