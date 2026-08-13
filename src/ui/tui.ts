@@ -60,14 +60,19 @@ const THEME = {
   text: '#d7e0ea',
   textMuted: '#7f92a6',
   textSoft: '#a9b7c6',
-  model: '#cdd6df',
-  accent: '#6fb1d6',
-  accentStrong: '#8ac3e6',
-  planAccent: '#d987c7',
-  planAccentStrong: '#f0a8dc',
-  success: '#7fb98f',
-  warning: '#d0a86e',
-  danger: '#c97c7c',
+  model: '#f0c674',
+  accent: '#62c4d8',
+  accentStrong: '#8be9fd',
+  planAccent: '#c792ea',
+  planAccentStrong: '#e5b5ff',
+  success: '#a8d8a8',
+  warning: '#f2c777',
+  danger: '#ff7b8b',
+  queued: '#9aa7ff',
+  info: '#7dcfff',
+  user: '#b8e986',
+  task: '#89ddff',
+  phase: '#bb9af7',
 } as const;
 
 function simplifyText(text: string, max = 90): string {
@@ -98,6 +103,7 @@ function statusColor(status: TaskStatus | string): string {
     case 'blocked':
     case 'waiting_user': return THEME.warning;
     case 'running': return THEME.accentStrong;
+    case 'queued': return THEME.queued;
     default: return THEME.textMuted;
   }
 }
@@ -155,12 +161,12 @@ function renderSummaryBar(tasks: Map<string, TaskView>, taskOrder: string[]): st
     if (!view) return '';
     const icon = STATUS_ICON[view.status] ?? '·';
     const colored = chalk.hex(statusColor(view.status))(icon);
-    const title = chalk.hex(THEME.textSoft)(simplifyText(view.title, 18));
+    const title = chalk.hex(THEME.text)(simplifyText(view.title, 18));
     return `${colored} ${title}`;
   }).filter(Boolean);
 
-  const bar = parts.join(chalk.hex(THEME.textMuted)('  ·  '));
-  const label = chalk.hex(THEME.textMuted)('tasks: ');
+  const bar = parts.join(chalk.hex(THEME.panelElevated)('  ·  '));
+  const label = chalk.bold.hex(THEME.task)('tasks: ');
   const raw = stripAnsi(label + bar);
   if (raw.length <= cols) return label + bar;
   // Avoid slicing ANSI-colored text, which can break terminal escape sequences.
@@ -667,10 +673,6 @@ export async function runTui(
       return;
     }
 
-    // Immediate feedback
-    log(chalk.hex(THEME.textMuted)(`  › ${simplifyText(userInput, 80)}`));
-    log(chalk.hex(THEME.textMuted)('  routing request…'));
-
     history.push({ role: 'user', content: userInput, ts: new Date().toISOString() });
     await saveHistory();
     // Route and execution are intentionally detached from readline. A slow
@@ -687,7 +689,7 @@ export async function runTui(
     const headline = `${status}  ${simplifyText(view.title, 96)}`;
     if (lastTaskHeadline.get(task.taskId) === headline) return;
     lastTaskHeadline.set(task.taskId, headline);
-    log(`${chalk.hex(THEME.textMuted)('task')} ${chalk.hex(statusColor(view.status))(status)}  ${chalk.bold.hex(THEME.textSoft)(simplifyText(view.title, 96))}`);
+    log(`${chalk.bold.hex(THEME.task)('task')} ${chalk.hex(statusColor(view.status))(status)}  ${chalk.bold.hex(THEME.text)(simplifyText(view.title, 96))}`);
   };
 
   // ── Event subscription ────────────────────────────────────────────────────
@@ -695,6 +697,7 @@ export async function runTui(
   const unsubscribe = master.subscribe((event) => {
     if (event.type === 'task_created') {
       if (event.task.sessionId && event.task.sessionId !== sessionId) return;
+      log(`${chalk.hex(THEME.info)('✓')} ${chalk.hex(THEME.textSoft)('Received — working on it now')}`);
       maybeLogTaskHeadline(event.task);
       renderPrompt();
       return;
@@ -731,6 +734,16 @@ export async function runTui(
     }
 
     if (event.type === 'task_phase') {
+      const task = master.getTask(event.taskId);
+      if (task) {
+        ensureTaskView(task);
+        const phases = Object.keys(PHASE_LABELS);
+        const index = Math.max(0, phases.indexOf(event.phase));
+        const width = 16;
+        const filled = event.status === 'done' ? Math.max(1, Math.round(((index + 1) / phases.length) * width)) : Math.max(1, Math.round((index / phases.length) * width));
+        const bar = `${'█'.repeat(Math.min(width, filled))}${'░'.repeat(Math.max(0, width - filled))}`;
+        log(`  ${chalk.hex(THEME.phase)(bar)} ${chalk.hex(THEME.textSoft)(phaseText(event.phase, event.note))}`);
+      }
       return;
     }
 
@@ -739,6 +752,8 @@ export async function runTui(
     }
 
     if (event.type === 'tool_call') {
+      const input = event.input ? ` · ${simplifyText(event.input, 64)}` : '';
+      appendLine(event.taskId, `${chalk.hex(THEME.info)('▸')} ${chalk.hex(THEME.textSoft)(event.tool)}${chalk.hex(THEME.textMuted)(input)}`);
       return;
     }
 
