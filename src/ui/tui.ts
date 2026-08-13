@@ -186,6 +186,7 @@ export async function runTui(
   let activeModelName = modelName;
   let activeClarification: ClarificationRequest | undefined;
   let exiting = false;
+  let readlineClosed = false;
   let streamBuffers = new Map<string, string>(); // taskId -> pending stream text
   const lastTaskHeadline = new Map<string, string>();
   const shownPatchDiffs = new Set<string>();
@@ -202,6 +203,7 @@ export async function runTui(
   const out = process.stdout;
 
   function renderPrompt(): void {
+    if (exiting || readlineClosed) return;
     const modeCol = chalk.hex(modeColor(mode))(mode);
     const clarification = activeClarification ? chalk.hex(THEME.warning)(' [answering question]') : '';
     const promptLine = `${chalk.hex(THEME.textMuted)('[')}${modeCol}${chalk.hex(THEME.textMuted)(']')}${clarification} ${chalk.hex(THEME.accent)('›')} `;
@@ -210,6 +212,10 @@ export async function runTui(
   }
 
   function log(line: string): void {
+    if (readlineClosed) {
+      out.write(`${line}\n`);
+      return;
+    }
     readline.clearLine(out, 0);
     readline.cursorTo(out, 0);
     out.write(`${line}\n`);
@@ -714,6 +720,9 @@ export async function runTui(
     }
 
     if (event.type === 'master_response') {
+      log(renderMarkdown(event.text, 96));
+      history.push({ role: 'assistant', content: event.text, ts: new Date().toISOString() });
+      void saveHistory();
       return;
     }
 
@@ -760,6 +769,7 @@ export async function runTui(
       const view = tasks.get(event.taskId);
       const prefix = view ? taskPrefix(view) : event.taskId;
       if (event.status === 'completed') {
+        if (event.result) log(renderMarkdown(event.result, 96));
         history.push({ role: 'assistant', content: event.result, ts: new Date().toISOString() });
         void saveHistory();
       } else {
@@ -822,6 +832,7 @@ export async function runTui(
   });
 
   rl.on('close', () => {
+    readlineClosed = true;
     shutdown();
   });
 
@@ -833,6 +844,8 @@ export async function runTui(
   };
 
   const shutdown = (): void => {
+    exiting = true;
+    readlineClosed = true;
     cleanup();
     try { rl.close(); } catch { /* ignore */ }
   };
