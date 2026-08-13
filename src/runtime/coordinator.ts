@@ -721,11 +721,6 @@ export class MasterCoordinator {
     const activeTask = this.findActiveTask(sessionId);
 
     if (activeTask) {
-      if (this.isTaskStatusQuery(prompt)) {
-        const answer = await this.answerTaskQuery(prompt, [activeTask.taskId], conversationHistory);
-        this.emit({ type: 'master_response', text: answer, relatedTaskIds: [activeTask.taskId], ts: now() });
-        return activeTask.taskId;
-      }
       await this.appendTaskMailboxUpdate(activeTask.taskId, prompt);
       return activeTask.taskId;
     }
@@ -765,14 +760,13 @@ export class MasterCoordinator {
     return task.taskId;
   }
   private findActiveTask(sessionId?: string): PromptTask | undefined {
-    const tasks = this.listTasks({ sessionId });
-    return tasks.find(t => ['running', 'waiting_user', 'blocked'].includes(t.status));
-  }
-
-  private isTaskStatusQuery(prompt: string): boolean {
-    const text = prompt.trim().toLowerCase();
-    return /^(怎么(样|了)|进展如何|有结果吗|完成了吗|改好了吗|你改好文件了吗|状态|进度|status|progress|how(?:'| )?s it going|is it done|did you fix)/i.test(text)
-      ;
+    const tasks = [...this.tasks.values()].filter((task) => {
+      if (sessionId) return task.sessionId === sessionId;
+      return this.sessionTaskIds.has(task.taskId);
+    });
+    return tasks
+      .filter(t => ['queued', 'running', 'waiting_user', 'blocked'].includes(t.status))
+      .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)))[0];
   }
 
   getTask(taskId: string): PromptTask | undefined {
@@ -1892,6 +1886,14 @@ export class MasterCoordinator {
 
   private createToolContext(task: PromptTask): ToolContext {
     const policy = task.readOnly ? readOnlyPolicy(this.basePolicy) : clonePolicy(this.basePolicy);
+    if (!task.readOnly) {
+      const explicitPaths = task.prompt.match(/(?:[A-Za-z]:[\\/]|\\\\)[^\s"'<>|]+/g) ?? [];
+      for (const explicitPath of explicitPaths) {
+        const parent = dirname(resolve(explicitPath.replace(/[。，；、)】》]+$/g, '')));
+        if (!policy.allowedWriteRoots.includes(parent)) policy.allowedWriteRoots.push(parent);
+        if (!policy.allowedReadRoots.includes(parent)) policy.allowedReadRoots.push(parent);
+      }
+    }
     if (!task.readOnly && task.artifactDir && !policy.allowedWriteRoots.includes(task.artifactDir)) {
       policy.allowedWriteRoots.push(task.artifactDir);
     }
