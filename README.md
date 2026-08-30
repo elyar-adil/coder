@@ -1,180 +1,127 @@
-# TUI-first Coding Agent
+# Coder
 
-A TypeScript coding agent centered on an interactive terminal UI. It connects to OpenAI-compatible, Anthropic, or local NDJSON chat APIs for asynchronous code generation, planning, and verification.
+Coder is a TUI-first, document-driven coding-agent runtime. The framework owns execution, tools, safety, persistence, and concurrency. Markdown Agent Specs own roles and collaboration behavior.
 
-## Features
+## Quick start
 
-- **Instant prompt dispatch** — every prompt becomes a task immediately; the UI stays usable while routing, planning, execution, and verification continue in the background
-- **Cross-task coordination** — follow-up prompts can query a running task, change a task through its mailbox, or start derived/sync work from existing task context
-- **Embeddable tool system** — provider-neutral definitions, registry-based execution, policy controls, repository search, file operations, Git inspection, shell execution, and coordinator capabilities
-- **Execute mode** — planner-driven agentic execution; the planner chooses direct answer, bash, read-only inspection, code edits, and verification steps dynamically
-- **Plan mode** — generate step-by-step execution plans for manual approval
-- **ReAct mode** — compatibility alias for planner-driven execution
-- **TUI** — interactive terminal UI with streaming output, conversation history, session-scoped task management, and numbered clarification choices
-- **Choice-based clarification** — agents ask concrete selectable options; arbitrary free-form clarification answers are rejected so blocked tasks resume from explicit user choices
-- **Writer patch pipeline** — workers submit structured patches with base hashes and verification commands; the writer applies them under file locks and reports conflicts without clobbering concurrent work
-- **Multi-backend** — OpenAI-compatible APIs, Anthropic, and local NDJSON-compatible runtimes
-- **Conversation persistence** — sessions auto-saved and can be loaded later
-- **Config file** — `.agentrc` for persistent settings
-- **Resilient networking** — automatic retry with backoff on connection failures
-
-## Install
-
-```bash
+```powershell
 npm install
 npm run build
-npm link   # globally installs `coder` command
-```
-
-## CLI Usage
-
-```bash
-# Submit a task
-coder submit --user alice --prompt "add error handling" --mode execute
-# or in development
-npm run dev -- submit --user alice --prompt "add error handling" --mode execute
-npm run dev -- submit --user alice --prompt "plan the refactor" --mode plan
-npm run dev -- submit --user alice --prompt "implement login" --mode react
-
-# Get task status
-coder get --task <task_id>
-# or
-npm run dev -- get --task <task_id>
-
-# Execute an approved plan
-coder execute-plan --task <task_id>
-# or
-npm run dev -- execute-plan --task <task_id>
-```
-
-## TUI Usage
-
-```bash
+npm link
 coder
-# or
-npm run dev -- tui
 ```
 
-TUI commands:
+Inside the TUI:
 
-| Command | Description |
-|---------|-------------|
-| `/mode <execute\|plan\|react>` | Switch agent mode |
-| `/clear` | Clear conversation history |
-| `/history` | Show conversation history |
-| `/tasks` | List all background tasks |
-| `/view <taskId>` | Inspect a task in detail |
-| `/approve <taskId>` | Execute an approved plan task |
-| `/model` | Open model picker and persist selection |
-| `/resume <taskId>` | Resume a queued/running task |
-| `/sessions` | List saved conversation sessions |
-| `/load <sessionId>` | Load a saved conversation |
-| `/help` | Show help |
-| `/exit` or Ctrl+C | Quit |
+- `/provider` manages providers and credentials in one modal.
+- `/model` selects the default model for the current session.
+- `/agents` shows the effective Agent Specs and their sources.
+- `/sessions` switches sessions; `/new` creates one.
+- `Ctrl+K` opens the command palette.
+- `Ctrl+B` toggles Agent Activity.
 
-When an agent needs clarification, the TUI prints numbered options. Reply with a number such as `1`; any other prompt starts or routes normal work instead of being consumed as the answer.
+For a non-interactive run:
 
-## Testing
+```powershell
+coder run --prompt "Inspect this repository and fix the failing tests"
+```
 
-```bash
-# Run all tests
-npm test
+List effective specs:
 
-# Type check without emitting
+```powershell
+coder agents
+```
+
+Coder intentionally has no Web UI or Web server.
+
+## Architecture
+
+The user talks only to a lightweight `main` agent. Simple conversation stays with main; complex work is handed to one or more coordinator agents. Coordinators select specialist agents themselves.
+
+```text
+user ↔ main → coordinator(s) → explorer / implement / review / custom agents
+```
+
+The runtime does not contain role-specific routing or planner branches. `main`, `coordinator`, and specialists are all ordinary persistent AgentInstances with mailboxes. A user message is a Session message, not a task.
+
+See [docs/architecture-revision.md](docs/architecture-revision.md) for the complete design and implementation status.
+
+## Agent Specs
+
+Specs are loaded with project-first effective precedence:
+
+1. built-in `agents/**/*.md`
+2. user `~/.coder/agents/**/*.md`
+3. project `.coder/agents/**/*.md`
+
+Later roots replace an earlier spec with the same relative ID.
+
+```md
+---
+description: Coordinates frontend work
+model: strong
+tools: []
+agents:
+  - explorer
+  - implement
+  - review/*
+---
+
+Coordinate the requested frontend work. Delegate independent investigation in
+parallel and return verified results to the parent agent.
+```
+
+Fields:
+
+- `description` is required and is shown to agents choosing whom to call.
+- `model` is an optional `.agentrc` alias; omitted or `inherit` uses the session model.
+- `tools` accepts exact tool names or `*`.
+- `agents` accepts exact IDs, namespace selectors such as `review/*`, `*`, or `[]`.
+
+Specs can reduce capabilities but cannot bypass global tool policy, path boundaries, concurrency, timeout, or recursion limits.
+
+## Runtime behavior
+
+- One persistent main instance per Session.
+- Agent instances retain their own model history and mailbox.
+- `spawn_agent`, `send_agent`, `wait_agent`, and `cancel_agent` are generic runtime primitives.
+- Related work can reuse an existing coordinator; unrelated coordinators can run concurrently.
+- New user input interrupts only main's current generation. Background agents keep running until main explicitly redirects or cancels them.
+- Only main output enters the user-visible conversation.
+- Sessions and instances persist under `~/.coder/runtime/` and recover after restart.
+
+## Model configuration
+
+Provider and model configuration is stored in the user-level `~/.agentrc`. Project configuration may provide defaults, while interactive changes remain user-scoped.
+
+```json
+{
+  "model": "fast",
+  "models": {
+    "fast": {
+      "backend": "openai",
+      "baseUrl": "https://api.openai.com/v1",
+      "model": "gpt-5-mini",
+      "apiKey": "..."
+    },
+    "strong": {
+      "backend": "anthropic",
+      "baseUrl": "https://api.anthropic.com",
+      "model": "claude-sonnet-4-5",
+      "apiKey": "..."
+    }
+  }
+}
+```
+
+Agent-specific model choice belongs in its Markdown spec. The retired Reception/Brain/Worker role-model mapping is no longer supported.
+
+## Development
+
+```powershell
 npm run typecheck
+npm test
+npm run build
 ```
 
-## Planner-Driven Execution
-
-For each prompt, the planner first creates dynamic steps. Simple questions can be answered directly, exact calculations can use `bash`, repository inspection can stay read-only, and code changes can include edit and verification steps. There is no fixed design phase unless the planner decides a design step is actually needed.
-
-## Asynchronous Coordination
-
-Prompts are accepted before routing finishes, so a slow model call never blocks the next prompt. The master router inspects current task snapshots and chooses one of several actions:
-
-- `new_task` starts independent work.
-- `query_task` answers from task state without changing the task.
-- `update_task` appends a requirement to the target task mailbox; running tasks absorb mailbox updates and replan.
-- `derived_task` and `sync_task` create new work with shared context from related tasks.
-- `clarify_target` asks the user to choose from concrete target-task options when multiple tasks match.
-
-## Configuration
-
-### Environment variables
-
-| Env var | Default | Description |
-|---------|---------|-------------|
-| `LLM_BASE_URL` | `http://localhost:11434` | LLM server URL |
-| `OLLAMA_BASE_URL` | legacy alias | Backward-compatible alias for `LLM_BASE_URL` |
-| `AGENT_MODEL` | `gemma4:31b-cloud` | Model name |
-| `LLM_BACKEND` | auto-detected | `openai`, `anthropic`, or `ollama` |
-| `LLM_API_KEY` | — | API key (for OpenAI-compatible backends) |
-
-For `openai` backends, `baseUrl` may be either the API root (`https://api.openai.com`) or a `/v1` URL (`https://gateway.example/v1`). The client normalizes both forms and sends requests to `/v1/chat/completions`.
-
-### Config file (.agentrc)
-
-Create `.agentrc` in your project directory or home directory:
-
-```json
-{
-  "baseUrl": "http://localhost:11434",
-  "model": "gemma4:31b-cloud",
-  "backend": "openai",
-  "defaultMode": "execute",
-  "policyLevel": "moderate",
-  "artifactsDir": ".agent-workspace/artifacts"
-}
-```
-
-`artifactsDir` controls where Web sessions create per-session temporary artifact folders. Relative paths are resolved from the workspace. Generated deliverables should go there unless the user explicitly asks for another output path or the task is editing repository code.
-
-For OpenAI-compatible backends:
-
-```json
-{
-  "baseUrl": "https://api.openai.com",
-  "model": "gpt-4o",
-  "backend": "openai",
-  "apiKey": "sk-..."
-}
-```
-
-For Anthropic backends:
-
-```json
-{
-  "baseUrl": "https://api.anthropic.com",
-  "model": "claude-sonnet-4-20250514",
-  "backend": "anthropic",
-  "apiKey": "sk-ant-..."
-}
-```
-
-## Skills
-
-Built-in skill definitions for domain guidance:
-
-| Skill | Description |
-|-------|-------------|
-| `python-flask` | Flask web app conventions |
-| `react-component` | React + TypeScript components |
-| `testing` | Test writing guidelines |
-| `node-express` | Node.js Express API conventions |
-| `git-workflow` | Git branching and commit conventions |
-| `debugging` | Bug diagnosis methodology |
-| `sql-database` | SQL and ORM guidelines |
-
-
-## Benchmarks
-
-The project now includes a benchmark catalog at `tests/benchmarks/benchmark_catalog.json` covering SWE-bench Lite, HumanEval, MBPP, APPS, and LiveCodeBench and a runnable isolated-checkout harness under `tests/benchmarks/harness.ts`.
-
-
-### Run benchmark harness
-
-```bash
-npm run eval:bench
-# optional: custom tasks and output
-# npm run eval:bench -- tests/benchmarks/tasks.sample.json tests/benchmarks/reports/custom.json
-```
+The project uses TypeScript, Node.js ESM, Blessed for the TUI, and provider-neutral tool definitions for OpenAI-compatible, Anthropic, and Ollama backends.

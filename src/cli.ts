@@ -1,104 +1,97 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
-import { MasterCoordinator } from './runtime/coordinator.js';
-import { runTui } from './ui/tui.js';
-import { loadConfig, saveSelectedModel } from './config.js';
+
+import { loadConfig, saveConfig, saveSelectedModel, type AgentConfig } from './config.js';
+import { setToolPolicy } from './infra/tools.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
-import { setToolPolicy } from './infra/tools.js';
-import { normalizeTaskMode } from './domain/task.js';
-import { runConfigCommand } from './config-command.js';
+import { AgentRegistry } from './runtime/agent-registry.js';
+import { AgentRuntime } from './runtime/agent-runtime.js';
+import { runFullscreenTui } from './ui/fullscreen-tui.js';
 
 async function main(): Promise<void> {
   const program = new Command();
-  program.name('coder').description('TUI-first coding agent (TypeScript)').version('0.2.0');
+  program.name('coder').description('Document-driven coding agent runtime').version('0.3.0');
+  program.allowExcessArguments(false).showSuggestionAfterError();
+  program.option('--model <name>', 'default model name or .agentrc alias');
 
-  // Build backend config from env vars + .agentrc
-  let fileConfig = await loadConfig();
-  let resolvedModel = resolveModelConfig(fileConfig);
+  let config = await loadConfig();
+  const selectedFromCli = (): string | undefined => program.opts<{ model?: string }>().model;
+  const resolvedDefault = resolveModelConfig(config, selectedFromCli());
+  setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
 
-  setToolPolicy(defaultPolicy(fileConfig.policyLevel ?? 'moderate', process.cwd()));
+  const registry = new AgentRegistry({ workspaceRoot: process.cwd() });
+  const runtime = new AgentRuntime({
+    registry,
+    workspaceRoot: process.cwd(),
+    defaultModel: selectedFromCli() ?? config.model,
+    resolveModel: (alias) => resolveModelConfig(config, alias).config,
+  });
 
-  const master = new MasterCoordinator(resolvedModel.config);
+  const configManager = {
+    getConfig: (): AgentConfig => config,
+    saveConfig: async (next: AgentConfig): Promise<void> => {
+      await saveConfig(next);
+      config = next;
+      setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
+    },
+  };
 
   program
-    .option('--model <name>', 'model name or .agentrc model alias')
-    .option('--verbose', 'show raw LLM prompt/reply traces in the TUI');
-
-  program
-    .command('submit')
-    .requiredOption('--user <id>', 'user_id: task owner label for tracking and isolation')
-    .requiredOption('--prompt <text>')
-    .option('--mode <mode>', 'build | plan', 'build')
-    .action(async (opts: { user: string; prompt: string; mode: string }) => {
-      const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
-      resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
-      master.setBackendConfig(resolvedModel.config);
-      master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
-      const taskId = await master.acceptPrompt(opts.user, opts.prompt, normalizeTaskMode(opts.mode));
-      console.log(JSON.stringify({ taskId, status: 'accepted', mode: opts.mode }, null, 2));
+    .command('run')
+    .description('Run one non-interactive main-agent session')
+    .requiredOption('--prompt <text>', 'message for the main agent')
+    .option('--session <id>', 'session id')
+    .action(async (options: { prompt: string; session?: string }) => {
+      await runtime.whenReady();
+      const sessionId = options.session ?? `run-${Date.now()}`;
+      await runtime.openSession(sessionId);
+      await runtime.submitMessage(sessionId, options.prompt);
+      await runtime.waitForIdle(sessionId);
+      const session = runtime.getSession(sessionId)!;
+      const response = [...session.messages].reverse().find((message) => message.role === 'assistant');
+      if (response) process.stdout.write(`${response.content}\n`);
+      await runtime.shutdown();
     });
 
   program
-    .command('get')
-    .requiredOption('--task <id>')
-    .action((opts: { task: string }) => {
-      const task = master.getTask(opts.task);
-      console.log(JSON.stringify(task ?? { error: 'not_found' }, null, 2));
-    });
-
-  program
-    .command('execute-plan')
-    .requiredOption('--task <id>')
-    .action(async (opts: { task: string }) => {
-      const ok = await master.executePlan(opts.task);
-      console.log(JSON.stringify({ taskId: opts.task, accepted: ok }, null, 2));
-    });
-
-  program
-    .command('tui')
-    .description('Interactive terminal UI — Claude Code-class experience')
+    .command('agents')
+    .description('List effective Agent Specs')
     .action(async () => {
-      const globalOpts = program.opts<{ model?: string; verbose?: boolean }>();
-      resolvedModel = resolveModelConfig(fileConfig, globalOpts.model);
-      master.setBackendConfig(resolvedModel.config);
-      master.setLlmTracingEnabled(Boolean(globalOpts.verbose));
-      await runTui(
-        master,
-        resolvedModel.name,
-        (name?: string) => resolveModelConfig(fileConfig, name),
-        Array.from(new Set([
-          ...(fileConfig.model ? [fileConfig.model] : []),
-          ...Object.keys(fileConfig.models ?? {}),
-        ])),
-        async (name: string) => {
-          await saveSelectedModel(name);
-          fileConfig = {
-            ...fileConfig,
-            model: name,
-          };
-        },
-        { verbose: Boolean(globalOpts.verbose) },
-      );
+      await runtime.whenReady();
+      for (const spec of runtime.listAgentSpecs()) {
+        process.stdout.write(`${spec.id}\t${spec.scope}\t${spec.model ?? 'inherit'}\t${spec.description}\n`);
+      }
+      await runtime.shutdown();
     });
 
-  program
-    .command('config')
-    .description('Interactive model configuration — add models from Ollama, OpenRouter, etc.')
-    .action(async () => {
-      await runConfigCommand();
+  program.action(async () => {
+    await runtime.whenReady();
+    const requested = selectedFromCli();
+    const selected = resolveModelConfig(config, requested);
+    runtime.setDefaultModel(requested ?? config.model);
+    await runFullscreenTui(runtime, {
+      modelName: selected.name,
+      modelAliases: Object.keys(config.models ?? {}),
+      resolveModel: (alias) => resolveModelConfig(config, alias),
+      persistModelSelection: async (alias) => {
+        await saveSelectedModel(alias);
+        config = { ...config, model: alias };
+      },
+      configManager,
     });
+    await runtime.shutdown();
+  });
 
-  // Default to TUI when no subcommand is given, including global-option-only invocations.
-  const subcommands = new Set(program.commands.map((command) => command.name()));
-  if (!process.argv.slice(2).some((arg) => subcommands.has(arg))) {
-    process.argv.push('tui');
-  }
-
+  const shutdown = async (): Promise<void> => {
+    await runtime.shutdown().catch(() => undefined);
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => { void shutdown(); });
   await program.parseAsync(process.argv);
 }
 
-main().catch((err) => {
-  console.error('Fatal:', err);
-  process.exit(1);
+main().catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exitCode = 1;
 });

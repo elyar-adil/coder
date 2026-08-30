@@ -1,5 +1,11 @@
 # SOTA Coding Agent 审查报告
 
+> 历史文档：本文审计的是 0.2.x 的旧 Task/Coordinator/Web 架构。0.3.0 已按 `architecture-revision.md` 替换该架构，本文仅保留为迁移背景，不代表当前实现状态。
+
+> 2026-08-29 实施更新：本文主体保留的是改造前审计快照。当前代码已经完成即时任务接收、独立任务、pause/resume/cancel/steer、attempt/abort 竞态保护、稳定 event ID 与 SSE 重放、有限 live output 持久化、canonical artifact/patch 路径、写后 hash 校验、策略化验证命令、结构化完成证据、角色模型、串行原子持久化、用户级 provider/model 配置、多会话 Web、全屏任务面板 TUI 和显式 shutdown/flush。当前全量测试为 159/159，通过 typecheck 与 build。
+>
+> 尚未解决的长期项主要是：Reception 与 Brain 仍不是完全并行的两条流式 agent 链；Web 仍为单文件原生前端而非组件化框架；工具策略不是 OS 级沙箱；任务/会话仍按单机单用户设计；subagent 状态尚未独立持久化。这些不再属于本文所列“说完成但没做/不能恢复”的阻断级问题，但仍是商业化前需要继续推进的架构工作。
+
 日期：2026-08-14  
 范围：任务接收、路由、执行循环、工具调用、文件写入、验证、TUI/Web 反馈、session 持久化。
 

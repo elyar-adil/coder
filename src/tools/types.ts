@@ -23,22 +23,8 @@ export type ToolEffect = 'read' | 'write' | 'execute' | 'coordinate';
 
 export interface ToolMetadata {
   effect: ToolEffect;
-  category: 'filesystem' | 'search' | 'git' | 'shell' | 'agent';
+  category: 'filesystem' | 'search' | 'web' | 'git' | 'shell' | 'agent';
   hidden?: boolean;
-}
-
-export interface ToolPatchFile {
-  path: string;
-  baseHash?: string;
-  before?: string;
-  after: string;
-  diff?: string;
-}
-
-export interface ToolPatch {
-  summary: string;
-  files: ToolPatchFile[];
-  verificationCommands: string[];
 }
 
 /**
@@ -52,10 +38,6 @@ export interface ToolExecutionContext<TPolicy = unknown> {
   sharedContext?: string;
   signal?: AbortSignal;
   policy?: TPolicy;
-  spawnSubagent?: (prompt: string) => Promise<string>;
-  collectSubagent?: (id: string) => Promise<string>;
-  requestClarification?: (question: string, choices?: string[]) => Promise<string>;
-  submitPatch?: (patch: ToolPatch) => Promise<string>;
   acquireWriteLock?: (path: string) => Promise<() => void | Promise<void>>;
   checkpoint?: (note: string) => Promise<void>;
 }

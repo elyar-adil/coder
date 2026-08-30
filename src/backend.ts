@@ -10,7 +10,7 @@
  */
 
 import { resilientFetch, FetchError } from './fetch.js';
-import type { OllamaMsg } from './domain/task.js';
+import type { AgentModelMessage as OllamaMsg } from './domain/agent.js';
 import type { ToolDefinition } from './tools/types.js';
 type OllamaToolDef = ToolDefinition;
 
@@ -76,11 +76,12 @@ async function* ollamaStream(
   systemPrompt: string,
   messages: OllamaMsg[],
   tools?: ToolDefinition[],
+  signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
   const body: Record<string, unknown> = {
     model: config.model,
     stream: true,
-    messages: [{ role: 'system', content: systemPrompt }, ...messages],
+    messages: [{ role: 'system', content: String(systemPrompt) }, ...messages],
   };
   if (tools?.length) body.tools = tools;
 
@@ -90,6 +91,7 @@ async function* ollamaStream(
     body: JSON.stringify(body),
     retries: 2,
     timeout: 120_000,
+    signal,
   });
 
   if (!response.ok) throw new FetchError(`NDJSON backend HTTP ${response.status}`, response.status, false);
@@ -131,7 +133,7 @@ async function ollamaNonStream(
   const body: Record<string, unknown> = {
     model: config.model,
     stream: false,
-    messages: [{ role: 'system', content: systemPrompt }, ...messages],
+    messages: [{ role: 'system', content: String(systemPrompt) }, ...messages],
   };
   if (tools?.length) body.tools = tools;
 
@@ -242,6 +244,7 @@ async function* openaiStream(
   systemPrompt: string,
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
+  signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
   const headers: Record<string, string> = { 'content-type': 'application/json' };
   if (config.apiKey) headers['authorization'] = `Bearer ${config.apiKey}`;
@@ -261,6 +264,7 @@ async function* openaiStream(
     body: JSON.stringify(body),
     retries: 2,
     timeout: 120_000,
+    signal,
   });
 
   if (!response.ok) throw new FetchError(`OpenAI-compatible HTTP ${response.status}: ${await response.text()}`, response.status, false);
@@ -492,6 +496,7 @@ async function* anthropicStream(
   systemPrompt: string,
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
+  signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
   const body: Record<string, unknown> = {
     model: config.model,
@@ -509,6 +514,7 @@ async function* anthropicStream(
     body: JSON.stringify(body),
     retries: 2,
     timeout: 120_000,
+    signal,
   });
 
   if (!response.ok) throw new FetchError(`Anthropic HTTP ${response.status}: ${await response.text()}`, response.status, false);
@@ -651,10 +657,11 @@ export function chatStream(
   systemPrompt: string,
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
+  signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
-  if (config.type === 'anthropic') return anthropicStream(config, systemPrompt, messages, tools);
-  if (config.type === 'openai') return openaiStream(config, systemPrompt, messages, tools);
-  return ollamaStream(config, systemPrompt, messages, tools);
+  if (config.type === 'anthropic') return anthropicStream(config, systemPrompt, messages, tools, signal);
+  if (config.type === 'openai') return openaiStream(config, systemPrompt, messages, tools, signal);
+  return ollamaStream(config, systemPrompt, messages, tools, signal);
 }
 
 export async function chatNonStream(

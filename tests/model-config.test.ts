@@ -50,4 +50,5 @@ describe('resolveModelConfig', () => {
       apiKey: 'default-key',
     });
   });
+
 });

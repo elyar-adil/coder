@@ -18,13 +18,14 @@ describe('loadConfig', () => {
     assert.ok(config.model === undefined || typeof config.model === 'string');
     assert.ok(config.backend === undefined || ['ollama', 'openai', 'anthropic'].includes(config.backend));
     assert.ok(config.apiKey === undefined || typeof config.apiKey === 'string');
-    assert.ok(config.defaultMode === undefined || ['build', 'plan'].includes(config.defaultMode));
   });
 
-  it('persists selected model to the cwd .agentrc file', async () => {
+  it('persists selected model to the user-scoped .agentrc file', async () => {
     const cwd = process.cwd();
     const dir = await mkdtemp(join(tmpdir(), 'coder-config-'));
+    const previousConfigHome = process.env.CODER_CONFIG_HOME;
     process.chdir(dir);
+    process.env.CODER_CONFIG_HOME = dir;
 
     try {
       const path = await saveSelectedModel('gemmaLocal');
@@ -33,13 +34,17 @@ describe('loadConfig', () => {
       assert.equal(parsed.model, 'gemmaLocal');
     } finally {
       process.chdir(cwd);
+      if (previousConfigHome === undefined) delete process.env.CODER_CONFIG_HOME;
+      else process.env.CODER_CONFIG_HOME = previousConfigHome;
     }
   });
 
   it('persists model aliases and artifact directory', async () => {
     const cwd = process.cwd();
     const dir = await mkdtemp(join(tmpdir(), 'coder-config-models-'));
+    const previousConfigHome = process.env.CODER_CONFIG_HOME;
     process.chdir(dir);
+    process.env.CODER_CONFIG_HOME = dir;
 
     try {
       const path = await saveConfig({
@@ -66,6 +71,8 @@ describe('loadConfig', () => {
       assert.equal(parsed.models?.fast?.requestOptions?.temperature, 0.2);
     } finally {
       process.chdir(cwd);
+      if (previousConfigHome === undefined) delete process.env.CODER_CONFIG_HOME;
+      else process.env.CODER_CONFIG_HOME = previousConfigHome;
     }
   });
 });

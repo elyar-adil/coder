@@ -20,6 +20,4 @@ export type {
   ToolHandler,
   ToolMetadata,
   ToolParameterSchema,
-  ToolPatch,
-  ToolPatchFile,
 } from './types.js';

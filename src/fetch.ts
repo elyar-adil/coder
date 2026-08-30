@@ -101,6 +101,12 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
 
       if (err instanceof FetchError) throw err;
 
+      // Caller cancellation is intentional, not a transient network failure.
+      // Never retry an aborted model request.
+      if (fetchOpts.signal?.aborted) {
+        throw new FetchError('Request aborted', null, false);
+      }
+
       const retriable = isRetriable(null, err);
       lastError = new FetchError(
         getErrorMessage(null, err),

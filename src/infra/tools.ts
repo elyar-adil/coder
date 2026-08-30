@@ -1,10 +1,12 @@
-import { readFile, writeFile, readdir, mkdir, stat } from 'node:fs/promises';
+import { readFile, writeFile, readdir, mkdir, stat, rename, rm } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ToolRegistry } from '../tools/registry.js';
 import type { ToolDefinition, ToolExecutionContext, ToolMetadata } from '../tools/types.js';
 import { unifiedDiff } from '../diff.js';
+import { resilientFetch } from '../fetch.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -65,10 +67,26 @@ async function writeViaWorkspace(targetPath: string, content: string, ctx?: Buil
     : join('__external__', absoluteTarget.replace(/^([a-zA-Z]:)?[/\\]+/, ''));
   const workspacePath = join(root, '.agent-workspace', rel);
   await mkdir(dirname(workspacePath), { recursive: true });
-  await writeFile(workspacePath, content, 'utf8');
+  await atomicWrite(workspacePath, content);
   await mkdir(dirname(absoluteTarget), { recursive: true });
-  await writeFile(absoluteTarget, content, 'utf8');
+  await atomicWrite(absoluteTarget, content);
   return absoluteTarget;
+}
+
+async function atomicWrite(path: string, content: string): Promise<void> {
+  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  await writeFile(temp, content, 'utf8');
+  try {
+    await rename(temp, path);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (!['EPERM', 'EEXIST', 'EACCES'].includes(code ?? '')) {
+      await rm(temp, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    await rm(path, { force: true });
+    await rename(temp, path);
+  }
 }
 
 const SYMBOL_PATTERNS: Record<string, RegExp[]> = {
@@ -452,6 +470,21 @@ understand the codebase structure without reading every file. Returns a compact 
   {
     type: 'function',
     function: {
+      name: 'web_search',
+      description: '在互联网上搜索网页，返回标题、链接和摘要。用于需要最新信息、外部资料或超出本地仓库知识的问题。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词或问题' },
+          max_results: { type: 'number', description: '最大结果数，默认 8，最大 20' },
+        },
+        required: ['query'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'git_status',
       description: '返回当前仓库的紧凑 Git 状态。只读。',
       parameters: { type: 'object', properties: {}, required: [] },
@@ -517,97 +550,9 @@ understand the codebase structure without reading every file. Returns a compact 
       },
     },
   },
-  {
-    type: 'function',
-    function: {
-      name: 'spawn_subagent',
-      description: 'Delegate a well-defined sub-task to a sub-agent that runs independently. Returns a subagent_id.',
-      parameters: {
-        type: 'object',
-        properties: {
-          prompt: { type: 'string', description: 'Clear, self-contained instructions for the sub-agent.' },
-        },
-        required: ['prompt'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'collect_subagent',
-      description: 'Retrieve the result of a previously spawned sub-agent by subagent_id.',
-      parameters: {
-        type: 'object',
-        properties: {
-          subagent_id: { type: 'string', description: 'The subagent_id returned by spawn_subagent' },
-        },
-        required: ['subagent_id'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'submit_patch',
-      description: 'Submit a structured patch to the writer agent. Workers should use this instead of directly writing files when patch-writer mode is enabled.',
-      parameters: {
-        type: 'object',
-        properties: {
-          summary: { type: 'string', description: 'Concise summary of the change.' },
-          files: {
-            type: 'string',
-            description: 'JSON array of {path, baseHash?, before?, after, diff?}. The writer validates baseHash before applying.',
-          },
-          verificationCommands: {
-            type: 'string',
-            description: 'JSON array of commands the writer should run after applying the patch.',
-          },
-        },
-        required: ['summary', 'files'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'request_clarification',
-      description: 'Ask the master coordinator for missing information when the task is blocked. The master may answer directly or ask the user.',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'A precise clarification question describing what is missing.' },
-          choices: {
-            type: 'array',
-            description: 'Two to four concrete answer options for the user. Avoid generic yes/no labels unless the decision is truly binary.',
-            items: { type: 'string' },
-          },
-        },
-        required: ['question'],
-      },
-    },
-  },
-  {
-    type: 'function',
-    function: {
-      name: 'ask_user',
-      description: 'Deprecated alias for request_clarification. Prefer request_clarification.',
-      parameters: {
-        type: 'object',
-        properties: {
-          question: { type: 'string', description: 'The clarification question.' },
-          choices: {
-            type: 'array',
-            description: 'Two to four concrete answer options for the user.',
-            items: { type: 'string' },
-          },
-        },
-        required: ['question'],
-      },
-    },
-  },
 ];
 
-export const WORKER_TOOLS = TOOLS.filter((tool) => tool.function.name !== 'ask_user');
+export const WORKER_TOOLS = TOOLS;
 
 const TOOL_METADATA: Record<string, ToolMetadata> = {
   read_file: { effect: 'read', category: 'filesystem' },
@@ -619,16 +564,12 @@ const TOOL_METADATA: Record<string, ToolMetadata> = {
   repo_map: { effect: 'read', category: 'search' },
   search_text: { effect: 'read', category: 'search' },
   search_files: { effect: 'read', category: 'search' },
+  web_search: { effect: 'execute', category: 'web' },
   git_status: { effect: 'read', category: 'git' },
   git_diff: { effect: 'read', category: 'git' },
   git_log: { effect: 'read', category: 'git' },
   bash: { effect: 'execute', category: 'shell' },
   load_skill: { effect: 'read', category: 'agent' },
-  spawn_subagent: { effect: 'coordinate', category: 'agent' },
-  collect_subagent: { effect: 'coordinate', category: 'agent' },
-  submit_patch: { effect: 'write', category: 'agent' },
-  request_clarification: { effect: 'coordinate', category: 'agent' },
-  ask_user: { effect: 'coordinate', category: 'agent', hidden: true },
 };
 
 function parseStringArray(value: unknown): string[] | undefined {
@@ -662,6 +603,303 @@ function boundedOutput(value: string, maxChars = 4 * 1024 * 1024): string {
   return `${value.slice(0, maxChars)}\n... (output truncated at ${maxChars} characters)`;
 }
 
+// ── Pure-Node search fallback (used when `rg` is not installed) ──────────────
+// Mirrors the rg invocations in `search_text`/`search_files`: hidden files are
+// included, only `.git` and `node_modules` are skipped.
+
+const SEARCH_IGNORE_DIRS = new Set(['.git', 'node_modules']);
+
+function forwardSlash(path: string): string {
+  return path.replace(/\\/g, '/');
+}
+
+function trimSnippet(line: string, max = 300): string {
+  const text = line.replace(/\s+$/g, '');
+  return text.length > max ? `…${text.slice(-max)}` : text;
+}
+
+/** Convert a common glob (**, *, ?) into an anchored RegExp. */
+function globToRegExp(glob: string): RegExp {
+  const sentinel: Array<[RegExp, string]> = [
+    [/\*\*\//g, '\u0001'],
+    [/\*\*/g, '\u0002'],
+    [/\*/g, '\u0003'],
+    [/\?/g, '\u0004'],
+  ];
+  let source = forwardSlash(glob);
+  for (const [re, token] of sentinel) source = source.replace(re, token);
+  source = source.replace(/([.+^${}()|[\]\\])/g, '\\$&');
+  source = source
+    .replace(/\u0001/g, '(?:.*/)?')
+    .replace(/\u0002/g, '.*')
+    .replace(/\u0003/g, '[^/]*')
+    .replace(/\u0004/g, '[^/]');
+  return new RegExp(`^${source}$`);
+}
+
+function globMatches(glob: string, filePath: string, root: string): boolean {
+  const rel = forwardSlash(relative(root, filePath));
+  if (glob.includes('/')) return globToRegExp(glob).test(rel);
+  const re = globToRegExp(glob);
+  return re.test(basename(rel)) || re.test(rel);
+}
+
+async function walkAllFiles(root: string, signal?: AbortSignal, maxFiles = 200_000): Promise<string[]> {
+  const files: string[] = [];
+  const stack = [root];
+  while (stack.length > 0) {
+    if (signal?.aborted) throw new Error('search aborted');
+    const dir = stack.pop()!;
+    let entries;
+    try {
+      entries = await readdir(dir, { withFileTypes: true, encoding: 'utf8' });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (files.length >= maxFiles) return files;
+      if (SEARCH_IGNORE_DIRS.has(entry.name)) continue;
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(full);
+      } else if (entry.isFile()) {
+        files.push(full);
+      }
+    }
+  }
+  return files;
+}
+
+async function searchTextFallback(
+  root: string,
+  query: string,
+  glob: string | undefined,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  let pattern: RegExp;
+  try {
+    pattern = new RegExp(query, 'm');
+  } catch {
+    pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'm');
+  }
+  const files = await walkAllFiles(root, signal);
+  const results: string[] = [];
+  for (const file of files) {
+    if (signal?.aborted) throw new Error('search aborted');
+    if (results.length >= max) break;
+    if (glob && !globMatches(glob, file, root)) continue;
+    let statInfo;
+    try {
+      statInfo = await stat(file);
+    } catch {
+      continue;
+    }
+    if (statInfo.size > 8 * 1024 * 1024) continue;
+    let text: string;
+    try {
+      text = await readFile(file, 'utf8');
+    } catch {
+      continue;
+    }
+    const lines = text.split(/\r?\n/);
+    for (let index = 0; index < lines.length && results.length < max; index++) {
+      if (pattern.test(lines[index]!)) {
+        results.push(`${forwardSlash(relative(root, file))}:${index + 1}:${trimSnippet(lines[index]!)}`);
+      }
+    }
+  }
+  return results;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new Error('search aborted');
+}
+
+async function searchFilesFallback(
+  root: string,
+  glob: string,
+  max: number,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  const files = await walkAllFiles(root, signal);
+  const matches: string[] = [];
+  for (const file of files) {
+    throwIfAborted(signal);
+    if (matches.length >= max) break;
+    if (!globMatches(glob, file, root)) continue;
+    matches.push(forwardSlash(relative(root, file)));
+  }
+  return matches;
+}
+
+interface WebSearchResult {
+  title: string;
+  url: string;
+  snippet: string;
+}
+
+function decodeHtmlEntities(input: string): string {
+  const namedEntities: Record<string, string> = {
+    ensp: ' ', emsp: '  ', thinsp: ' ', middot: '·', ndash: '–', mdash: '—',
+    hellip: '…', laquo: '«', raquo: '»', lsquo: '‘', rsquo: '’', ldquo: '“', rdquo: '”',
+    copy: '©', reg: '®', trade: '™', bull: '•', deg: '°', plusmn: '±', times: '×', divide: '÷',
+  };
+  return input
+    .replace(/&#x([0-9a-f]+);?/gi, (_match, value: string) => {
+      const codePoint = Number.parseInt(value, 16);
+      return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : _match;
+    })
+    .replace(/&#(\d+);?/g, (_match, value: string) => {
+      const codePoint = Number.parseInt(value, 10);
+      return Number.isFinite(codePoint) && codePoint <= 0x10ffff ? String.fromCodePoint(codePoint) : _match;
+    })
+    .replace(/&#x27;/g, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x2F;/g, '/')
+    .replace(/&quot;/g, '"')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&([a-z][a-z0-9]+);/gi, (match, name: string) => namedEntities[name.toLowerCase()] ?? match)
+    .replace(/&amp;/g, '&');
+}
+
+function stripTags(input: string): string {
+  return input.replace(/<[^>]*>/g, '');
+}
+
+function collapseWhitespace(value: string): string {
+  return value.replace(/\s+/g, ' ').trim();
+}
+
+function ddgRealUrl(href: string): string {
+  const redirect = /[?&]uddg=([^&]+)/.exec(href ?? '');
+  if (redirect?.[1]) {
+    try {
+      return decodeURIComponent(redirect[1]);
+    } catch {
+      return href;
+    }
+  }
+  return href.startsWith('//') ? `https:${href}` : href;
+}
+
+function bingRealUrl(href: string): string {
+  const value = href ?? '';
+  const encoded = /[?&]u=([^&]+)/.exec(value)?.[1];
+  if (encoded) {
+    try {
+      const decoded = decodeURIComponent(encoded);
+      if (decoded.startsWith('a1')) {
+        const payload = decoded.slice(2).replace(/-/g, '+').replace(/_/g, '/');
+        const padded = payload.padEnd(Math.ceil(payload.length / 4) * 4, '=');
+        const target = Buffer.from(padded, 'base64').toString('utf8');
+        if (/^https?:\/\//i.test(target)) return target;
+      }
+      if (/^https?:\/\//i.test(decoded)) return decoded;
+    } catch {
+      // Keep the provider URL when redirect decoding fails.
+    }
+  }
+  return value.startsWith('//') ? `https:${value}` : value;
+}
+
+function parseDdgResults(html: string, max: number, signal?: AbortSignal): WebSearchResult[] {
+  const titles: Array<{ title: string; url: string }> = [];
+  const titleRe = /<a[^>]*class=["'][^"']*result__a[^"']*["'][^>]*href=["']([^"']*)["'][^>]*>([\s\S]*?)<\/a>/gi;
+  for (const match of html.matchAll(titleRe)) {
+    throwIfAborted(signal);
+    const title = collapseWhitespace(stripTags(decodeHtmlEntities(match[2] ?? '')));
+    if (!title) continue;
+    titles.push({ title, url: ddgRealUrl(decodeHtmlEntities(match[1] ?? '')) });
+    if (titles.length >= max) break;
+  }
+
+  const snippets: string[] = [];
+  const snippetRe = /<a[^>]*class=["'][^"']*result__snippet[^"']*["'][^>]*>([\s\S]*?)<\/a>/gi;
+  for (const match of html.matchAll(snippetRe)) {
+    snippets.push(collapseWhitespace(stripTags(decodeHtmlEntities(match[1] ?? ''))));
+    if (snippets.length >= titles.length) break;
+  }
+  return titles.map((item, index) => ({ ...item, snippet: snippets[index] ?? '' }));
+}
+
+function parseBingResults(html: string, max: number, signal?: AbortSignal): WebSearchResult[] {
+  const results: WebSearchResult[] = [];
+  const itemRe = /<li[^>]*class=["'][^"']*b_algo[^"']*["'][^>]*>([\s\S]*?)<\/li>/gi;
+  for (const item of html.matchAll(itemRe)) {
+    throwIfAborted(signal);
+    const block = item[1] ?? '';
+    const titleMatch = /<h2[^>]*>[\s\S]*?<a[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>[\s\S]*?<\/h2>/i.exec(block);
+    if (!titleMatch) continue;
+    const title = collapseWhitespace(stripTags(decodeHtmlEntities(titleMatch[2] ?? '')));
+    if (!title) continue;
+    const snippetMatch = /<p[^>]*>([\s\S]*?)<\/p>/i.exec(block);
+    results.push({
+      title,
+      url: bingRealUrl(decodeHtmlEntities(titleMatch[1] ?? '')),
+      snippet: collapseWhitespace(stripTags(decodeHtmlEntities(snippetMatch?.[1] ?? ''))),
+    });
+    if (results.length >= max) break;
+  }
+  return results;
+}
+
+interface SearchProvider {
+  name: string;
+  url: string;
+  parse: (html: string, max: number, signal?: AbortSignal) => WebSearchResult[];
+}
+
+const SEARCH_PROVIDERS: SearchProvider[] = [
+  {
+    name: 'Bing',
+    url: 'https://www.bing.com/search?q=',
+    parse: parseBingResults,
+  },
+  {
+    name: 'DuckDuckGo',
+    url: 'https://html.duckduckgo.com/html/?q=',
+    parse: parseDdgResults,
+  },
+];
+
+async function searchWeb(
+  query: string,
+  max: number,
+  signal?: AbortSignal,
+): Promise<WebSearchResult[]> {
+  const errors: string[] = [];
+  for (const provider of SEARCH_PROVIDERS) {
+    throwIfAborted(signal);
+    try {
+      const response = await resilientFetch(
+        `${provider.url}${encodeURIComponent(query)}${provider.name === 'Bing' ? `&count=${max}` : ''}`,
+        {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml',
+            'Accept-Language': 'en-US,en;q=0.8',
+          },
+          retries: 0,
+          timeout: 10_000,
+          signal,
+        },
+      );
+      const html = await response.text();
+      const results = provider.parse(html, max, signal);
+      if (results.length > 0) return results;
+      errors.push(`${provider.name}: no results returned`);
+    } catch (error: unknown) {
+      if (signal?.aborted) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${provider.name}: ${message}`);
+    }
+  }
+  throw new Error(`all web search providers failed (${errors.join('; ')})`);
+}
+
 async function executeBuiltinTool(
   name: string,
   args: Record<string, unknown>,
@@ -685,6 +923,14 @@ async function executeBuiltinTool(
         return JSON.stringify({ ok: true, results: lines, truncated: lines.length >= max });
       } catch (error: any) {
         if (error?.code === 1) return JSON.stringify({ ok: true, results: [], truncated: false });
+        if (error?.code === 'ENOENT') {
+          try {
+            const results = await searchTextFallback(root, query, glob, max, ctx?.signal);
+            return JSON.stringify({ ok: true, results, truncated: results.length >= max });
+          } catch (fallbackError: unknown) {
+            return JSON.stringify({ ok: false, error: String(fallbackError instanceof Error ? fallbackError.message : fallbackError) });
+          }
+        }
         return JSON.stringify({ ok: false, error: String(error?.message ?? error) });
       }
     }
@@ -698,7 +944,33 @@ async function executeBuiltinTool(
         return JSON.stringify({ ok: true, files, truncated: files.length >= max });
       } catch (error: any) {
         if (error?.code === 1) return JSON.stringify({ ok: true, files: [], truncated: false });
+        if (error?.code === 'ENOENT') {
+          try {
+            const files = await searchFilesFallback(root, glob, max, ctx?.signal);
+            return JSON.stringify({ ok: true, files, truncated: files.length >= max });
+          } catch (fallbackError: unknown) {
+            return JSON.stringify({ ok: false, error: String(fallbackError instanceof Error ? fallbackError.message : fallbackError) });
+          }
+        }
         return JSON.stringify({ ok: false, error: String(error?.message ?? error) });
+      }
+    }
+    case 'web_search': {
+      const query = typeof args['query'] === 'string' ? args['query'] : '';
+      if (!query) return JSON.stringify({ ok: false, error: 'query is required' });
+      const requestedMax = Number(args['max_results'] ?? 8);
+      const max = Number.isFinite(requestedMax)
+        ? Math.max(1, Math.min(Math.floor(requestedMax), 20))
+        : 8;
+      try {
+        const results = await searchWeb(query, max, ctx?.signal);
+        return JSON.stringify({ ok: true, results, truncated: results.length >= max });
+      } catch (error: unknown) {
+        const message = error instanceof Error ? error.message : String(error);
+        const friendly = /fetch failed|ECONNREFUSED|ENOTFOUND|ETIMEDOUT|EAI_AGAIN|DNS lookup failed|connection refused|connection reset|timeout|network/i.test(message)
+          ? '网络不可达，无法完成网页搜索（请检查本机网络连接或代理设置）'
+          : message;
+        return JSON.stringify({ ok: false, error: friendly });
       }
     }
     case 'git_status': {
@@ -940,7 +1212,7 @@ async function executeBuiltinTool(
       } catch (error: unknown) {
         const err = error as { stdout?: string; stderr?: string; message?: string };
         const output = [err.stdout, err.stderr].filter(Boolean).join('\n');
-        return output || `Error: ${err.message ?? String(error)}`;
+        return `Error: command failed${output ? `\n${output}` : `: ${err.message ?? String(error)}`}`;
       }
     }
 
@@ -957,84 +1229,6 @@ async function executeBuiltinTool(
         try { for (const file of await readdir(skillsDir)) if (file.endsWith('.md')) available.add(file.slice(0, -3)); } catch { /* ignore */ }
       }
       return `Error: skill "${name}" not found${available.size ? `. Available: ${[...available].sort().join(', ')}` : ''}`;
-    }
-
-    case 'spawn_subagent': {
-      if (!ctx?.spawnSubagent) return 'Error: subagent support unavailable';
-      return ctx.spawnSubagent(typeof args['prompt'] === 'string' ? args['prompt'] : '');
-    }
-
-    case 'collect_subagent': {
-      if (!ctx?.collectSubagent) return 'Error: subagent support unavailable';
-      return ctx.collectSubagent(typeof args['subagent_id'] === 'string' ? args['subagent_id'] : '');
-    }
-
-    case 'submit_patch': {
-      if (!ctx?.submitPatch) return 'Error: patch writer support unavailable';
-      const summary = typeof args['summary'] === 'string' ? args['summary'] : '';
-      let files: Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
-      let verificationCommands: string[] = [];
-      try {
-        const rawValue = args['files'];
-        if (Array.isArray(rawValue)) {
-          files = rawValue as Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
-        } else {
-          const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
-          const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-          files = JSON.parse(fenced?.[1] ?? raw) as Array<{ path: string; baseHash?: string; before?: string; after: string; diff?: string }>;
-        }
-        if (!Array.isArray(files)) return 'Error: submit_patch files must be a JSON array';
-      } catch (error) {
-        return `Error parsing submit_patch files JSON: ${String(error)}`;
-      }
-      for (const [index, file] of files.entries()) {
-        if (!file || typeof file.path !== 'string' || !file.path.trim()) return `Error: submit_patch files[${index}].path is required`;
-        if (typeof file.after !== 'string') return `Error: submit_patch files[${index}].after must be a string`;
-      }
-      for (const file of files) {
-        const pathDecision = authorizeToolCall(policy, 'write_file', { path: resolveToolPath(file.path, ctx) });
-        if (!pathDecision.ok) return formatPolicyError('submit_patch', pathDecision);
-      }
-      if (args['verificationCommands']) {
-        try {
-          const rawValue = args['verificationCommands'];
-          const parsed = Array.isArray(rawValue)
-            ? rawValue
-            : (() => {
-              const raw = typeof rawValue === 'string' ? rawValue.trim() : '';
-              const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-              return JSON.parse(fenced?.[1] ?? raw) as unknown;
-            })();
-          if (Array.isArray(parsed)) {
-            verificationCommands = parsed.filter((item): item is string => typeof item === 'string');
-          }
-        } catch {
-          verificationCommands = [];
-        }
-      }
-      return ctx.submitPatch({ summary, files, verificationCommands });
-    }
-
-    case 'request_clarification':
-    case 'ask_user': {
-      if (!ctx?.requestClarification) {
-        return 'Error: clarification requests are not available in this context';
-      }
-      let choices: string[] | undefined;
-      const rawChoices = args['choices'];
-      if (rawChoices) {
-        try {
-          const parsed = Array.isArray(rawChoices)
-            ? rawChoices
-            : JSON.parse(typeof rawChoices === 'string' ? rawChoices : JSON.stringify(rawChoices)) as unknown;
-          if (Array.isArray(parsed)) {
-            choices = parsed.filter((item): item is string => typeof item === 'string').map((item) => item.trim()).filter(Boolean);
-          }
-        } catch {
-          // Ignore malformed choices and fall back to master-generated options.
-        }
-      }
-      return ctx.requestClarification(typeof args['question'] === 'string' ? args['question'] : '', choices);
     }
 
     default:

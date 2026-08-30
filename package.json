@@ -1,10 +1,17 @@
 {
   "name": "top-tier-coding-agent-cli",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
+  "files": [
+    "dist",
+    "agents",
+    "skills",
+    "README.md",
+    "docs/architecture-revision.md"
+  ],
   "scripts": {
-    "build": "tsc -p tsconfig.json",
-    "postbuild": "node -e \"const{cpSync,mkdirSync}=require('fs');mkdirSync('dist/ui/public',{recursive:true});cpSync('src/ui/public','dist/ui/public',{recursive:true});\"",
+    "clean": "node -e \"const fs=require('fs'),path=require('path'),p=path.resolve('dist');if(path.basename(p)!=='dist')throw new Error('unsafe clean target');fs.rmSync(p,{recursive:true,force:true})\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "test": "node --import tsx/esm --test tests/*.test.ts tests/**/*.test.ts",

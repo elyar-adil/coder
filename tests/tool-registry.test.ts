@@ -8,7 +8,7 @@ import { ToolRegistry } from '../src/tools/registry.js';
 import type { ToolDefinition, ToolExecutionContext } from '../src/tools/types.js';
 import { executeTool, listTools } from '../src/infra/tools.js';
 import { defaultPolicy } from '../src/policy.js';
-import type { ToolContext } from '../src/domain/task.js';
+import type { BuiltinToolContext as ToolContext } from '../src/infra/tools.js';
 
 const definition = (name: string): ToolDefinition => ({
   type: 'function',
@@ -64,8 +64,6 @@ describe('built-in tool runtime', () => {
     context = {
       workspaceRoot: workspace,
       policy: defaultPolicy('moderate', workspace),
-      spawnSubagent: async () => 'subagent',
-      collectSubagent: async () => 'result',
     };
   });
 

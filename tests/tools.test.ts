@@ -95,8 +95,6 @@ describe('edit_file', () => {
     const artifactDir = join(tmpDir, 'edit-artifacts');
     const artifactPath = join(artifactDir, 'notes.txt');
     await executeTool('write_file', { path: 'notes.txt', content: 'draft artifact' }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
       artifactDir,
     });
 
@@ -104,8 +102,6 @@ describe('edit_file', () => {
       path: 'notes.txt',
       edits: JSON.stringify([{ search: 'draft', replace: 'final' }]),
     }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
       artifactDir,
     });
 
@@ -168,8 +164,6 @@ describe('write_file', () => {
   test('writes simple relative artifacts into the session artifact directory', async () => {
     const artifactDir = join(tmpDir, 'session-artifacts');
     const result = await executeTool('write_file', { path: 'deck.pptx', content: 'ppt' }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
       artifactDir,
     });
     const artifactPath = join(artifactDir, 'deck.pptx');
@@ -259,64 +253,10 @@ describe('bash', () => {
     const result = await executeTool('bash', {
       command: 'node -e "const fs=require(\'fs\'); fs.writeFileSync(\'artifact.txt\', process.cwd());"',
     }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
       artifactDir,
     });
     assert.equal(result, '(no output)');
     assert.equal(await readFile(join(artifactDir, 'artifact.txt'), 'utf8'), await realpath(artifactDir));
-  });
-});
-
-// ── submit_patch ─────────────────────────────────────────────────────────────
-describe('submit_patch', () => {
-  test('parses patch input and delegates to writer context', async () => {
-    const path = join(tmpDir, 'patch-target.txt');
-    let seenSummary = '';
-    let seenFiles = 0;
-    let seenCommands = 0;
-
-    const result = await executeTool('submit_patch', {
-      summary: 'patch summary',
-      files: JSON.stringify([{ path, after: 'patched' }]),
-      verificationCommands: JSON.stringify(['npm test']),
-    }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
-      submitPatch: async (patch) => {
-        seenSummary = patch.summary;
-        seenFiles = patch.files.length;
-        seenCommands = patch.verificationCommands.length;
-        return 'WriterApplied: ok';
-      },
-    });
-
-    assert.equal(result, 'WriterApplied: ok');
-    assert.equal(seenSummary, 'patch summary');
-    assert.equal(seenFiles, 1);
-    assert.equal(seenCommands, 1);
-  });
-});
-
-// ── request_clarification ───────────────────────────────────────────────────
-describe('request_clarification', () => {
-  test('accepts array choices from tool-call arguments', async () => {
-    let seenChoices: string[] | undefined;
-
-    const result = await executeTool('request_clarification', {
-      question: 'Pick one.',
-      choices: ['Option A', 'Option B'],
-    }, {
-      spawnSubagent: async () => '',
-      collectSubagent: async () => '',
-      requestClarification: async (_question, choices) => {
-        seenChoices = choices;
-        return 'Option A';
-      },
-    });
-
-    assert.equal(result, 'Option A');
-    assert.deepEqual(seenChoices, ['Option A', 'Option B']);
   });
 });
 
