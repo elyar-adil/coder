@@ -110,6 +110,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const thinkingBlockLines = new Map<string, { headerLine: number }>();
   let latestThinkingTurnId: string | undefined;
   let conversationFollowOutput = true;
+  let conversationScrollOffset = 0;
+  let restoringConversationScroll = false;
 
   const screen = blessed.screen({
     smartCSR: true, fullUnicode: true, title: 'Coder',
@@ -123,6 +125,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const conversation = blessed.box({
     parent: screen, top: 1, left: 0, width: '100%', bottom: 3,
     tags: true, scrollable: true, keys: true, vi: true, mouse: true,
+    scrollbar: {
+      ch: ' ',
+      track: { bg: COLOR.panel },
+      style: { inverse: true },
+    },
     padding: { left: 2, right: 2 },
     style: { bg: COLOR.background, fg: COLOR.text },
   });
@@ -327,9 +334,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const conversationAtBottom = (): boolean => {
-    const lpos = conversation.lpos;
-    if (!lpos) return conversationFollowOutput;
-    const viewportHeight = Math.max(0, (lpos.yl - lpos.yi) - Number(conversation.iheight));
+    const viewportHeight = Math.max(0, Number(conversation.height) - Number(conversation.iheight));
     const scrollHeight = conversation.getScrollHeight();
     if (scrollHeight <= viewportHeight) return true;
     return conversation.getScroll() >= scrollHeight - viewportHeight - 1;
@@ -337,7 +342,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const renderConversation = (): void => {
     session = runtime.getSession(sessionId) ?? session;
-    const shouldFollowOutput = conversationFollowOutput || conversationAtBottom();
+    const previousScrollOffset = conversationScrollOffset;
+    const shouldFollowOutput = conversationFollowOutput;
     const lines: string[] = [];
     const screenWidth = typeof screen.width === 'number' ? screen.width : 80;
     const markdownCols = Math.max(40, Math.min(120, screenWidth - (activityVisible ? 32 : 6)));
@@ -376,8 +382,18 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       lines.push('', `{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`, safe(renderMarkdown(text, markdownCols)), '');
     }
     conversation.setContent(lines.join('\n'));
-    if (shouldFollowOutput) conversation.setScrollPerc(100);
-    conversationFollowOutput = conversationAtBottom();
+    restoringConversationScroll = true;
+    try {
+      if (shouldFollowOutput) {
+        conversation.setScrollPerc(100);
+      } else {
+        conversation.scrollTo(Math.max(0, previousScrollOffset));
+      }
+      conversationScrollOffset = conversation.getScroll();
+    } finally {
+      restoringConversationScroll = false;
+    }
+    conversationFollowOutput = shouldFollowOutput;
   };
 
   const renderThinkingBlock = (lines: string[], block: ThinkingBlock): void => {
@@ -728,10 +744,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     refresh();
   };
 
+  const focusConversation = (): void => {
+    if (closed) return;
+    composerPinned = false;
+    if (screen.focused !== conversation) conversation.focus();
+  };
+
   conversation.on('click', (data: { x: number; y: number }) => {
-    if (!data || data.y === undefined) { focusComposer(); return; }
+    focusConversation();
+    if (!data || data.y === undefined) return;
     const lpos = conversation.lpos;
-    if (!lpos) { focusComposer(); return; }
+    if (!lpos) return;
     const contentTop = lpos.yi + Number(conversation.itop);
     const relY = data.y - contentTop;
     const row = Math.floor(relY) + Number(conversation.getScroll?.() ?? conversation.childBase ?? 0);
@@ -749,13 +772,25 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         return;
       }
     }
-    focusComposer();
   });
   screen.key(['C-y'], () => {
     if (latestThinkingTurnId) toggleThinkingBlock(latestThinkingTurnId);
   });
   activity.on('click', focusComposer);
+  conversation.on('mousedown', focusConversation);
+  conversation.on('wheelup', () => {
+    focusConversation();
+    conversationFollowOutput = false;
+    conversationScrollOffset = conversation.getScroll();
+  });
+  conversation.on('wheeldown', () => {
+    focusConversation();
+    conversationScrollOffset = conversation.getScroll();
+    conversationFollowOutput = conversationAtBottom();
+  });
   conversation.on('scroll', () => {
+    if (restoringConversationScroll) return;
+    conversationScrollOffset = conversation.getScroll();
     conversationFollowOutput = conversationAtBottom();
   });
   screen.key(['tab'], focusComposer);
