@@ -252,7 +252,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         stopSpinner();
         return;
       }
-      spinnerFrame = (spinnerFrame + 1) % 14;
+      spinnerFrame = (spinnerFrame + 1) % 20;
       refresh();
     }, 120);
     spinnerTimer.unref?.();
