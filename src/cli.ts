@@ -17,7 +17,6 @@ async function main(): Promise<void> {
 
   let config = await loadConfig();
   const selectedFromCli = (): string | undefined => program.opts<{ model?: string }>().model;
-  const resolvedDefault = resolveModelConfig(config, selectedFromCli());
   setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
 
   const registry = new AgentRegistry({ workspaceRoot: process.cwd() });
@@ -43,15 +42,23 @@ async function main(): Promise<void> {
     .requiredOption('--prompt <text>', 'message for the main agent')
     .option('--session <id>', 'session id')
     .action(async (options: { prompt: string; session?: string }) => {
-      await runtime.whenReady();
-      const sessionId = options.session ?? `run-${Date.now()}`;
-      await runtime.openSession(sessionId);
-      await runtime.submitMessage(sessionId, options.prompt);
-      await runtime.waitForIdle(sessionId);
-      const session = runtime.getSession(sessionId)!;
-      const response = [...session.messages].reverse().find((message) => message.role === 'assistant');
-      if (response) process.stdout.write(`${response.content}\n`);
-      await runtime.shutdown();
+      runtime.setDefaultModel(selectedFromCli() ?? config.model);
+      try {
+        await runtime.whenReady();
+        const sessionId = options.session ?? `run-${Date.now()}`;
+        await runtime.openSession(sessionId);
+        if (selectedFromCli()) await runtime.setSessionDefaultModel(sessionId, selectedFromCli());
+        const turnId = await runtime.submitMessage(sessionId, options.prompt);
+        await runtime.waitForIdle(sessionId);
+        const session = runtime.getSession(sessionId)!;
+        const failed = runtime.listInstances(sessionId).find((instance) => instance.status === 'failed');
+        if (failed) throw new Error(failed.lastError ?? 'Agent failed');
+        const submitted = session.messages.findIndex((message) => message.role === 'user' && message.turnId === turnId);
+        const response = session.messages.slice(submitted + 1).reverse().find((message) => message.role === 'assistant');
+        if (response) process.stdout.write(`${response.content}\n`);
+      } finally {
+        await runtime.shutdown();
+      }
     });
 
   program
@@ -66,6 +73,7 @@ async function main(): Promise<void> {
     });
 
   program.action(async () => {
+    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Interactive mode requires a terminal. Use coder run --prompt "..." for non-interactive execution.');
     await runtime.whenReady();
     const requested = selectedFromCli();
     const selected = resolveModelConfig(config, requested);

@@ -3,8 +3,12 @@ import blessed from 'blessed';
 import type { BackendConfig } from '../backend.js';
 import type { AgentConfig, AgentModelConfig } from '../config.js';
 import type { AgentEvent, AgentInstance, AgentSession } from '../domain/agent.js';
-import { renderMarkdown } from '../markdown.js';
+import { renderTuiMarkdown, toolDiff } from './markdown.js';
 import type { AgentRuntime } from '../runtime/agent-runtime.js';
+import { layoutComposer } from './composer-layout.js';
+import { renderWelcome } from './welcome.js';
+import { copyText } from './clipboard.js';
+import { commandMatches } from './commands.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 type Provider = {
@@ -21,6 +25,7 @@ type ConfigManager = {
 };
 
 export interface FullscreenTuiOptions {
+  copyToClipboard?: (text: string) => Promise<void>;
   modelName: string;
   modelAliases?: string[];
   resolveModel: (name?: string) => ResolvedModel;
@@ -40,7 +45,7 @@ const COLOR = {
   // Stick to the ANSI palette so Windows consoles do not quantize custom RGB
   // values into black. In blessed, `gray` is bright-black (color 8), so it can
   // disappear on a black background; `white` is the readable 8-color fallback.
-  background: 'black', panel: 'black', elevated: 'blue', line: 'white',
+  background: 'black', panel: 'black', elevated: 'black', line: 'gray',
   text: 'light-white', muted: 'white', accent: 'light-cyan', green: 'light-green',
   amber: 'light-yellow', red: 'light-red', violet: 'light-magenta',
 };
@@ -58,21 +63,6 @@ function oneLine(value: string | undefined, max = 72): string {
 
 function safe(value: string): string {
   return blessed.escape(value);
-}
-
-function thinkingScanIntensity(index: number, frame: number, length: number): number {
-  const position = (frame * 0.4) % length;
-  const distanceFromPosition = Math.abs(index - position);
-  const distance = Math.min(distanceFromPosition, length - distanceFromPosition);
-  return Math.max(0, Math.min(1, 1 - distance));
-}
-
-function thinkingScanColor(index: number, frame: number, length: number): string {
-  const intensity = thinkingScanIntensity(index, frame, length);
-  const base = [75, 85, 88];
-  const bright = [60, 255, 160];
-  const channels = base.map((value, channel) => Math.round(value + (bright[channel]! - value) * intensity));
-  return `#${channels.map((channel) => channel.toString(16).padStart(2, '0')).join('')}`;
 }
 
 function providerName(config: AgentModelConfig): string {
@@ -95,6 +85,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let historyDraft = '';
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | undefined;
+  let welcomeTimer: NodeJS.Timeout | undefined;
+  let welcomeFrame = 0;
   const composerChars: string[] = [];
   const inputHistory: string[] = [];
   const pendingTurns = new Set<string>();
@@ -102,6 +94,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const activityLog = new Map<string, string[]>();
   interface ThinkingBlock {
     turnId: string;
+    thinking?: string;
     expanded: boolean;
     content: string[];
     status: 'active' | 'completed';
@@ -112,34 +105,45 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let conversationFollowOutput = true;
   let conversationScrollOffset = 0;
   let restoringConversationScroll = false;
+  let composerRow = 0;
+  let composerColumn = 0;
+  let notice = '';
+  let completionIndex = 0;
+  let completionQuery = '';
+  let dismissedCompletion = '';
+  let nativeSelection = false;
+  type Point = { x: number; y: number };
+  let selection: { start: Point; end: Point; rows: string[][]; left: number; right: number; top: number; bottom: number; dragging: boolean } | undefined;
+  const hasSelection = (): boolean => Boolean(selection && (selection.start.x !== selection.end.x || selection.start.y !== selection.end.y));
 
   const screen = blessed.screen({
     smartCSR: true, fullUnicode: true, title: 'Coder',
     style: { bg: COLOR.background, fg: COLOR.text },
   });
+  const screenBuffer = screen as unknown as { lines: Array<Array<[number, string]> & { dirty: boolean }> };
 
-  const topbar = blessed.box({
-    parent: screen, top: 0, left: 0, width: '100%', height: 1, tags: true,
+  const statusbar = blessed.box({
+    parent: screen, bottom: 0, left: 0, width: '100%', height: 1, tags: true,
     padding: { left: 1, right: 1 }, style: { bg: COLOR.background, fg: COLOR.muted },
   });
   const conversation = blessed.box({
-    parent: screen, top: 1, left: 0, width: '100%', bottom: 3,
-    tags: true, scrollable: true, keys: true, vi: true, mouse: true,
+    parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
+    tags: true, scrollable: true, alwaysScroll: true, keys: true, vi: true, mouse: true, autoFocus: false,
     scrollbar: {
-      ch: ' ',
+      ch: '│',
       track: { bg: COLOR.panel },
-      style: { inverse: true },
+      style: { fg: COLOR.muted },
     },
     padding: { left: 2, right: 2 },
     style: { bg: COLOR.background, fg: COLOR.text },
   });
   const activity = blessed.list({
-    parent: screen, top: 1, right: 0, width: '28%', bottom: 2,
+    parent: screen, top: 0, right: 0, width: '28%', bottom: 2,
     tags: true, keys: true, vi: true, mouse: true,
     scrollable: true, padding: { left: 1, right: 1 },
     style: {
       bg: COLOR.background, fg: COLOR.muted,
-      selected: { bg: COLOR.elevated, fg: COLOR.text },
+      selected: { bg: COLOR.elevated, fg: COLOR.accent, bold: true },
     },
   });
   const composer = blessed.box({
@@ -147,35 +151,27 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     input: true, keys: true, mouse: true, padding: { left: 0, right: 1 },
     style: { bg: COLOR.background, fg: COLOR.text },
   });
+  const divider = blessed.box({
+    parent: screen, bottom: 3, left: 1, width: '100%-2', height: 1,
+    style: { fg: COLOR.line, bg: COLOR.background },
+  });
   const composerPrompt = blessed.box({
     parent: screen, bottom: 1, left: 1, width: 2, height: 2,
     content: '›', style: { bg: COLOR.background, fg: COLOR.accent },
   });
-  const footer = blessed.box({
-    parent: screen, bottom: 0, left: 1, width: '100%-2', height: 1, tags: true,
-    style: { bg: COLOR.background, fg: COLOR.muted },
+  const completions = blessed.list({
+    parent: screen, left: 2, bottom: 4, width: '100%-4', height: 5,
+    hidden: true, tags: true, mouse: true, keys: false, autoFocus: false,
+    style: { bg: COLOR.panel, fg: COLOR.muted, selected: { fg: COLOR.accent, bold: true } },
   });
 
-  const composerContentWidth = (): number => {
-    const lpos = composer.lpos;
-    if (lpos && lpos.xl > lpos.xi) {
-      return Math.max(1, (lpos.xl - lpos.xi) - Number(composer.iwidth));
-    }
-    const screenWidth = typeof screen.width === 'number' ? screen.width : 80;
-    return Math.max(1, screenWidth - (activityVisible ? 32 : 4));
-  };
-
-  const composerVisibleStart = (width: number): number =>
-    Math.max(0, Math.min(composerCursor - width + 1, composerChars.length - width));
+  screen.program.setMouse({ vt200Mouse: true, sgrMouse: true, utfMouse: false, cellMotion: true, allMotion: true }, true);
 
   const placeComposerCursor = (): void => {
     if (closed || screen.focused !== composer) return;
     const lpos = composer.lpos;
     if (!lpos) return;
-    const contentWidth = Math.max(1, (lpos.xl - lpos.xi) - Number(composer.iwidth));
-    const start = composerVisibleStart(contentWidth);
-    const column = Number(composer.strWidth(composerChars.slice(start, composerCursor).join('')));
-    screen.program.cursorPos(lpos.yi + Number(composer.itop), lpos.xi + Number(composer.ileft) + column);
+    screen.program.cursorPos(lpos.yi + Number(composer.itop) + composerRow, lpos.xi + Number(composer.ileft) + composerColumn);
   };
 
   const composerValue = (): string => composerChars.join('');
@@ -188,12 +184,36 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const renderComposer = (): void => {
-    const width = composerContentWidth();
-    const start = composerVisibleStart(width);
-    composer.setContent(composerChars.slice(start, start + width).join(''));
+    const width = Math.max(2, Number(screen.width) - 5);
+    const result = layoutComposer(composerValue(), composerCursor, width, (text) => Number(composer.strWidth(text)));
+    const height = Math.min(Math.max(2, result.rows.length), Math.max(2, Math.min(6, Number(screen.height) - 7)));
+    const start = Math.max(0, result.cursor.row - height + 1);
+    composer.height = height;
+    composerPrompt.height = height;
+    conversation.bottom = height + 2;
+    activity.bottom = height + 2;
+    divider.bottom = height + 1;
+    divider.setContent('─'.repeat(Math.max(0, Number(screen.width) - 2)));
+    composerRow = result.cursor.row - start;
+    composerColumn = result.cursor.column;
+    composer.setContent(result.rows.slice(start, start + height).join('\n'));
+    const query = composerValue();
+    if (query !== completionQuery) { completionIndex = 0; completionQuery = query; }
+    const matches = query === dismissedCompletion ? [] : commandMatches(query);
+    if (!matches.length) completions.hide();
+    else {
+      completions.bottom = height + 2;
+      completions.height = Math.min(matches.length, 6, Math.max(1, Number(screen.height) - height - 3));
+      completionIndex = Math.min(completionIndex, matches.length - 1);
+      completions.setItems(matches.map((item) => `${item.name.padEnd(12)} ${item.description}`));
+      completions.select(completionIndex);
+      completions.show();
+      completions.setFront();
+    }
   };
 
   const renderComposerFrame = (): void => {
+    renderComposer();
     screen.program.hideCursor();
     screen.render();
     placeComposerCursor();
@@ -212,6 +232,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (next >= inputHistory.length) {
         historyIndex = undefined;
         setComposerValue(historyDraft);
+        renderComposer();
+        renderComposerFrame();
         return;
       }
       historyIndex = next;
@@ -225,13 +247,29 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const handleComposerKey = (ch: string, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
     if (closed) return;
-    if (key.name === 'enter' || key.name === 'return') { void submit(); return; }
-    if (key.name === 'left') composerCursor = Math.max(0, composerCursor - 1);
+    const matches = completions.hidden ? [] : commandMatches(composerValue());
+    if (matches.length && (key.name === 'up' || key.name === 'down')) {
+      completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + matches.length) % matches.length;
+      renderComposerFrame(); return;
+    }
+    if (matches.length && key.name === 'escape') {
+      dismissedCompletion = composerValue(); renderComposerFrame(); return;
+    }
+    if (matches.length && (key.name === 'tab' || ((!key.meta) && (key.name === 'enter' || key.name === 'return')))) {
+      setComposerValue(matches[completionIndex]!.name + (key.name === 'tab' ? ' ' : ''));
+      if (key.name === 'tab') renderComposerFrame(); else void submit();
+      return;
+    }
+    if ((key.name === 'enter' || key.name === 'return') && !key.meta) { void submit(); return; }
+    if ((key.meta && (key.name === 'enter' || key.name === 'return')) || (key.ctrl && key.name === 'j')) {
+      composerChars.splice(composerCursor++, 0, '\n');
+    }
+    else if (key.name === 'left') composerCursor = Math.max(0, composerCursor - 1);
     else if (key.name === 'right') composerCursor = Math.min(composerChars.length, composerCursor + 1);
     else if (key.name === 'home' || (key.ctrl && key.name === 'a')) composerCursor = 0;
     else if (key.name === 'end' || (key.ctrl && key.name === 'e')) composerCursor = composerChars.length;
-    else if (key.name === 'up' && (composerChars.length === 0 || historyIndex !== undefined)) { updateHistory(-1); return; }
-    else if (key.name === 'down' && (composerChars.length === 0 || historyIndex !== undefined)) { updateHistory(1); return; }
+    else if (key.name === 'up') { updateHistory(-1); return; }
+    else if (key.name === 'down') { updateHistory(1); return; }
     else if (key.name === 'backspace') {
       if (composerCursor > 0) composerChars.splice(composerCursor - 1, 1);
       composerCursor = Math.max(0, composerCursor - 1);
@@ -259,6 +297,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         stopSpinner();
         return;
       }
+      if (nativeSelection || hasSelection()) return;
       spinnerFrame = (spinnerFrame + 1) % 20;
       refresh();
     }, 120);
@@ -280,9 +319,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const choose = (title: string, items: string[]): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
-    const width = Math.min(88, Math.max(44, ...items.map((item) => item.length + 8)));
+      const width = Math.min(Number(screen.width), 88, Math.max(32, ...items.map((item) => item.length + 8)));
     const modal = blessed.box({
-      parent: screen, top: 'center', left: 'center', width, height: Math.min(items.length + 4, 22),
+      parent: screen, top: 'center', left: 'center', width, height: Math.min(items.length + 4, 22, Number(screen.height)),
       label: ` ${title} `, border: { type: 'line' },
       style: { bg: COLOR.background, fg: COLOR.text, border: { fg: COLOR.line }, label: { fg: COLOR.accent } },
     });
@@ -305,13 +344,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     screen.render();
   });
 
-  const ask = (label: string, initial = ''): Promise<string> => new Promise((resolveAnswer) => {
+  const ask = (label: string, initial = '', secret = false): Promise<string> => new Promise((resolveAnswer) => {
     composerPinned = false;
     const prompt = blessed.prompt({
       parent: screen, top: 'center', left: 'center', width: '72%', height: 7,
       label: ` ${label} `, border: { type: 'line' },
       style: { bg: COLOR.background, fg: COLOR.text, border: { fg: COLOR.line }, label: { fg: COLOR.accent } },
     });
+    if (secret) (prompt as unknown as { _: { input: { censor: boolean } } })._.input.censor = true;
     prompt.input(label, initial, (_error, value) => {
       prompt.destroy();
       composerPinned = true;
@@ -327,40 +367,99 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     return `${'  '.repeat(instance.depth)}{${status.color}-fg}${status.icon}{/${status.color}-fg}`;
   };
 
-  const renderHeader = (): void => {
+  const renderStatus = (): void => {
     const active = instances().filter((item) => item.status === 'running' || item.status === 'waiting' || item.status === 'queued').length;
     const activityText = active ? ` · ${active} active` : '';
-    topbar.setContent(`{${COLOR.accent}-fg}coder{/${COLOR.accent}-fg}  {${COLOR.muted}-fg}${safe(sessionId)} · ${safe(activeModel)}${activityText}{/${COLOR.muted}-fg}`);
+    const width = Math.max(1, Number(screen.width) - 2);
+    const left = `coder · ${activeModel}`;
+    const right = `${sessionId}${activityText}`;
+    const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(right));
+    statusbar.setContent(gap >= 3
+      ? `{${COLOR.accent}-fg}coder{/${COLOR.accent}-fg} · ${safe(activeModel)}${' '.repeat(gap)}${safe(right)}`
+      : `{${COLOR.accent}-fg}coder{/${COLOR.accent}-fg} · ${safe(activeModel)}${activityText}`);
   };
 
   const conversationAtBottom = (): boolean => {
     const viewportHeight = Math.max(0, Number(conversation.height) - Number(conversation.iheight));
     const scrollHeight = conversation.getScrollHeight();
     if (scrollHeight <= viewportHeight) return true;
-    return conversation.getScroll() >= scrollHeight - viewportHeight - 1;
+    return conversation.childBase >= scrollHeight - viewportHeight - 1;
   };
 
   const renderConversation = (): void => {
     session = runtime.getSession(sessionId) ?? session;
+    for (const message of session.messages) {
+      if (message.thinking && message.turnId && !thinkingBlocks.has(message.turnId)) {
+        const thinking = session.messages.filter((item) => item.turnId === message.turnId).map((item) => item.thinking ?? '').join('');
+        thinkingBlocks.set(message.turnId, { turnId: message.turnId, expanded: false, content: [], status: 'completed', thinking });
+      }
+    }
     const previousScrollOffset = conversationScrollOffset;
     const shouldFollowOutput = conversationFollowOutput;
     const lines: string[] = [];
     const screenWidth = typeof screen.width === 'number' ? screen.width : 80;
-    const markdownCols = Math.max(40, Math.min(120, screenWidth - (activityVisible ? 32 : 6)));
-    if (!session.messages.length && !streams.size && thinkingBlocks.size === 0) {
-      lines.push('', `{${COLOR.muted}-fg}What would you like to build?{/${COLOR.muted}-fg}`, '',
-        `{${COLOR.muted}-fg}Talk naturally. Complex work is coordinated quietly in the background.{/${COLOR.muted}-fg}`);
+    const markdownCols = Math.max(10, Math.min(120, screenWidth - (activityVisible ? Math.min(36, Math.floor(screenWidth * 0.35)) : 0) - 6));
+    thinkingBlockLines.clear();
+    const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0;
+    if (welcomeVisible) {
+      lines.push(...renderWelcome(
+        Number(conversation.width) - Number(conversation.iwidth) - 1,
+        Number(conversation.height) - Number(conversation.iheight), Number(screen.height), welcomeFrame,
+      ));
+      if (!welcomeTimer) {
+        welcomeTimer = setInterval(() => {
+          if (nativeSelection || hasSelection() || screen.focused !== composer) return;
+          welcomeFrame = (welcomeFrame + 1) % 80;
+          refresh();
+        }, 50);
+        welcomeTimer.unref?.();
+      }
+    } else if (welcomeTimer) {
+      clearInterval(welcomeTimer);
+      welcomeTimer = undefined;
     }
     const renderedBlocks = new Set<string>();
-    for (const message of session.messages) {
+    if (session.timeline) {
+      for (const entry of session.timeline) {
+        if (entry.kind === 'message') {
+          lines.push('', entry.role === 'user' ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} ${safe(entry.content)}` : renderTuiMarkdown(entry.content, markdownCols), '');
+          continue;
+        }
+        const expanded = thinkingBlocks.get(entry.id)?.expanded ?? false;
+        const block: ThinkingBlock = { turnId: entry.id, expanded, content: [],
+          status: entry.status === 'running' ? 'active' : 'completed',
+          thinking: entry.kind === 'thinking' ? entry.content : undefined };
+        thinkingBlocks.set(entry.id, block);
+        if (entry.kind === 'thinking') {
+          renderThinkingBlock(lines, block);
+        } else {
+          const headerLine = lines.reduce((count, line) => count + line.split('\n').length, 0);
+          thinkingBlockLines.set(entry.id, { headerLine });
+          latestThinkingTurnId = entry.id;
+          const agent = entry.instanceId ? runtime.getInstance(entry.instanceId)?.agentId : undefined;
+          const icon = entry.status === 'running' ? '◌' : entry.status === 'failed' ? '✗' : entry.status === 'cancelled' ? '−' : '✓';
+          const color = entry.status === 'failed' ? COLOR.amber : COLOR.muted;
+          lines.push(`{${color}-fg}${expanded ? '▼' : '▶'} ${icon} ${safe(agent && agent !== 'main' ? `${agent} · ` : '')}${safe(entry.tool ?? '')}  ${safe(oneLine(entry.input, Math.max(20, markdownCols - 30)))}{/${color}-fg}`);
+          if (expanded) {
+            lines.push(safe(entry.input ?? ''), renderTuiMarkdown(entry.content || 'Running…', markdownCols));
+          } else {
+            const patch = toolDiff(entry.tool ?? '', entry.content);
+            if (patch) lines.push(renderTuiMarkdown(patch, markdownCols));
+            if (entry.status === 'failed') lines.push(`{${COLOR.amber}-fg}${safe(oneLine(entry.content, markdownCols))}{/${COLOR.amber}-fg}`);
+          }
+          lines.push('');
+        }
+      }
+    }
+    for (const message of session.timeline ? [] : session.messages) {
       const user = message.role === 'user';
       const prefix = user
-        ? `{${COLOR.violet}-fg}›{/${COLOR.violet}-fg} `
+        ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} `
         : message.role === 'system'
           ? `{${COLOR.amber}-fg}·{/${COLOR.amber}-fg} `
           : '';
       const content = message.role === 'assistant'
-        ? safe(renderMarkdown(message.content, markdownCols))
+        ? renderTuiMarkdown(message.content, markdownCols)
         : safe(message.content);
       lines.push('', `${prefix}${content}`, '');
       if (message.role === 'user' && message.turnId && thinkingBlocks.has(message.turnId)) {
@@ -368,7 +467,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         renderThinkingBlock(lines, thinkingBlocks.get(message.turnId)!);
       }
     }
-    if (pendingTurns.size > 0) {
+    if (!session.timeline && pendingTurns.size > 0) {
       const turnId = [...pendingTurns][0];
       if (!thinkingBlocks.has(turnId)) {
         thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
@@ -377,19 +476,22 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         renderThinkingBlock(lines, thinkingBlocks.get(turnId)!);
       }
     }
-    for (const [turnId, text] of streams.entries()) {
+    for (const [turnId, text] of session.timeline ? [] : streams.entries()) {
       if (!text.trim()) continue;
-      lines.push('', `{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`, safe(renderMarkdown(text, markdownCols)), '');
+      lines.push('', `{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`, renderTuiMarkdown(text, markdownCols), '');
     }
-    conversation.setContent(lines.join('\n'));
+    if (notice) lines.push('', `{${COLOR.amber}-fg}${safe(notice)}{/${COLOR.amber}-fg}`, '');
     restoringConversationScroll = true;
     try {
-      if (shouldFollowOutput) {
-        conversation.setScrollPerc(100);
+      conversation.setContent(lines.join('\n'));
+      if (welcomeVisible) {
+        conversation.resetScroll();
+      } else if (shouldFollowOutput) {
+        conversation.scroll(conversation.getScrollHeight(), true);
       } else {
-        conversation.scrollTo(Math.max(0, previousScrollOffset));
+        conversation.scroll(Math.max(0, previousScrollOffset) - conversation.childBase, true);
       }
-      conversationScrollOffset = conversation.getScroll();
+      conversationScrollOffset = conversation.childBase;
     } finally {
       restoringConversationScroll = false;
     }
@@ -397,30 +499,32 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const renderThinkingBlock = (lines: string[], block: ThinkingBlock): void => {
-    const headerLine = lines.length;
+    // Array entries can contain multiple source lines (messages and Markdown).
+    const headerLine = lines.reduce((count, line) => count + line.split('\n').length, 0);
     const toggle = block.expanded ? '▼' : '▶';
     const icon = block.status === 'active'
       ? ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][spinnerFrame % 10]
       : toggle;
     const color = block.status === 'active' ? COLOR.accent : COLOR.green;
-    const label = block.status === 'active' ? 'Thinking' : 'Thought';
+    const label = block.thinking
+      ? (block.status === 'active' ? 'Thinking' : 'Thought')
+      : (block.status === 'active' ? 'Working' : 'Activity');
     if (block.status === 'active') {
-      const scanLabel = [...label].map((character, index) => {
-        const shade = thinkingScanColor(index, spinnerFrame, label.length);
-        const intensity = thinkingScanIntensity(index, spinnerFrame, label.length);
-        const text = intensity > 0.7 ? `{bold}${character}{/bold}` : character;
-        return `{${shade}-fg}${text}{/${shade}-fg}`;
-      }).join('');
-      lines.push(`{${color}-fg}${icon}{/${color}-fg} ${scanLabel}`);
+      const scanLabel = `{${COLOR.accent}-fg}${label}{/${COLOR.accent}-fg}`;
+      lines.push(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}`);
     } else {
       lines.push(`{${color}-fg}${icon} ${label}{/${color}-fg}`);
     }
     thinkingBlockLines.set(block.turnId, { headerLine });
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
-      const content = block.content.length > 0 ? block.content : ['(no tool calls logged)'];
+      if (block.thinking) lines.push(...safe(block.thinking).split('\n').map((line) => `  ${line}`), '');
+      const content = block.content.length > 0 ? block.content : block.thinking ? [] : ['No thinking or tool activity received yet.'];
       for (const c of content) {
-        lines.push(`  {${COLOR.muted}-fg}${safe(c)}{/${COLOR.muted}-fg}`);
+        const rendered = c.includes('```diff\n')
+          ? renderTuiMarkdown(c, Math.max(10, Number(conversation.width) - 8))
+          : safe(c);
+        lines.push(...rendered.split('\n').map((line) => `  ${line}`));
       }
     }
     lines.push('');
@@ -437,24 +541,28 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const layout = (): void => {
     if (activityVisible) {
       activity.show();
-      conversation.width = '72%';
-      composer.width = '72%-4';
-      composerPrompt.left = '72%-3';
+      const width = Math.min(36, Math.floor(Number(screen.width) * 0.35));
+      activity.width = width;
+      conversation.width = Number(screen.width) - width;
     } else {
       activity.hide();
       conversation.width = '100%';
       composer.width = '100%-4';
       composerPrompt.left = 1;
     }
+    composer.width = '100%-4';
+    composerPrompt.left = 1;
   };
 
   const refresh = (): void => {
+    if (closed) return;
+    if (hasSelection()) return;
     layout();
-    renderHeader();
+    renderComposer();
+    renderStatus();
     renderConversation();
     renderActivity();
     renderComposer();
-    footer.setContent(`{${COLOR.muted}-fg}Enter send · Ctrl+K commands · Ctrl+B activity · Ctrl+Y expand/think · /provider · /model · Ctrl+C exit{/${COLOR.muted}-fg}`);
     const composerFocused = composerPinned;
     if (composerFocused && screen.focused !== composer) composer.focus();
     if (composerFocused) screen.program.hideCursor();
@@ -495,8 +603,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     let apiKey: string | undefined;
     if (provider.needsKey) {
       const envName = provider.id === 'openrouter' ? 'OPENROUTER_API_KEY' : provider.id === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
-      apiKey = await ask(`API key · blank uses ${envName}`) || process.env[envName];
+      apiKey = await ask(`API key · blank uses ${envName}`, '', true) || process.env[envName];
       if (!apiKey) return;
+    } else if (provider.id === 'custom') {
+      apiKey = await ask('API key · optional', '', true) || undefined;
     }
     const model = await ask('Provider model name');
     if (!model) return;
@@ -568,13 +678,22 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const switchSession = async (id: string): Promise<void> => {
+    const next = await runtime.openSession(id);
     sessionId = id;
-    session = await runtime.openSession(id);
+    session = next;
     activeModel = session.defaultModel ?? options.modelName;
     streams.clear();
     activityLog.clear();
     thinkingBlocks.clear();
     thinkingBlockLines.clear();
+    pendingTurns.clear();
+    notice = '';
+    conversationFollowOutput = true;
+    conversationScrollOffset = 0;
+    for (const instance of instances()) {
+      if (instance.instanceId === session.mainInstanceId && instance.activeTurnId) pendingTurns.add(instance.activeTurnId);
+    }
+    startSpinner();
     refresh();
   };
 
@@ -612,15 +731,20 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         streams.clear();
         thinkingBlocks.clear();
         thinkingBlockLines.clear();
+        pendingTurns.clear();
+        notice = '';
         refresh();
         break;
       case 'cancel': {
+        if (!args[0]) { await runtime.cancelSession(sessionId); notice = 'Stopped. Send a message to continue.'; refresh(); break; }
         const target = instances().find((item) => item.instanceId === args[0] || item.instanceId.startsWith(args[0] ?? ''));
         const main = runtime.getInstance(session.mainInstanceId);
         if (target && main && target.instanceId !== main.instanceId) await runtime.cancelAgent(main.instanceId, target.instanceId);
         break;
       }
       case 'help': await commandPalette(); break;
+      case 'select': setMouseInteraction(false); break;
+      case 'mouse': setMouseInteraction(nativeSelection); break;
       case 'exit': case 'quit': close(); break;
       default: await choose('Unknown command', [`/${name} is not available`, 'Close']);
     }
@@ -634,7 +758,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (index === 2) await showAgents();
     if (index === 3) await openSessions();
     if (index === 4) await switchSession(`session-${Date.now()}`);
-    if (index === 5) await runtime.clearSession(sessionId);
+    if (index === 5) await command('/clear');
     if (index === 6) { activityVisible = !activityVisible; refresh(); }
     if (index === 7) close();
   };
@@ -648,9 +772,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     try {
       if (value.startsWith('/')) await command(value);
       else {
+        notice = '';
+        conversationFollowOutput = true;
         const turnId = await runtime.submitMessage(sessionId, value);
-        pendingTurns.add(turnId);
-        if (!thinkingBlocks.has(turnId)) {
+        const main = runtime.getInstance(session.mainInstanceId);
+        if (main && ['running', 'queued', 'waiting'].includes(main.status)) pendingTurns.add(turnId);
+        if (pendingTurns.has(turnId) && !thinkingBlocks.has(turnId)) {
           thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
         }
         startSpinner();
@@ -664,36 +791,53 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const onEvent = (event: AgentEvent): void => {
-    const eventSession = 'sessionId' in event ? event.sessionId : 'instance' in event ? event.instance.sessionId : undefined;
+    const eventSession = 'sessionId' in event ? event.sessionId : 'instance' in event ? event.instance.sessionId : 'instanceId' in event && event.instanceId ? runtime.getInstance(event.instanceId)?.sessionId : event.type === 'session_opened' ? event.session.sessionId : undefined;
     if (eventSession && eventSession !== sessionId) return;
+    if (event.type === 'thinking_delta') {
+      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find((item) => item.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
+      if (block) block.thinking = `${block.thinking ?? ''}${event.text}`;
+    }
     if (event.type === 'assistant_delta') streams.set(event.turnId, `${streams.get(event.turnId) ?? ''}${event.text}`);
     if (event.type === 'assistant_message') {
       streams.delete(event.message.turnId ?? '');
-      const active = [...thinkingBlocks.values()].find((b) => b.status === 'active');
-      if (active) {
-        active.status = 'completed';
-        active.expanded = false;
-      }
-      pendingTurns.clear();
-      stopSpinner();
     }
-    if (event.type === 'tool_started' && event.instanceId === session.mainInstanceId) {
-      const block = [...thinkingBlocks.values()].find(b => b.status === 'active');
+    if (event.type === 'tool_started' || event.type === 'tool_finished') {
+      const log = activityLog.get(event.instanceId) ?? [];
+      log.push(`${event.tool}  ${oneLine(event.type === 'tool_started' ? event.input : event.output, 120)}`);
+      activityLog.set(event.instanceId, log.slice(-100));
+    }
+    if (event.type === 'tool_started') {
+      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find(b => b.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
       if (block) {
-        block.content.push(`→ ${event.tool}  ${oneLine(event.input, 60)}`);
+        const agent = runtime.getInstance(event.instanceId)?.agentId;
+        block.content.push(`→ ${agent && agent !== 'main' ? `${agent} · ` : ''}${event.tool}  ${oneLine(event.input, 60)}`);
       }
     }
-    if (event.type === 'tool_finished' && event.instanceId === session.mainInstanceId) {
-      const block = [...thinkingBlocks.values()].find(b => b.status === 'active');
+    if (event.type === 'tool_finished') {
+      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find(b => b.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
       if (block) {
         block.content.push(`✓ ${event.tool}  ${oneLine(event.output, 60)}`);
+        const patch = toolDiff(event.tool, event.output);
+        if (patch) block.content.push(patch);
       }
     }
     if (event.type === 'runtime_error') {
       if (event.sessionId === sessionId && event.instanceId === session.mainInstanceId) {
+        notice = `Error: ${event.error}`;
         pendingTurns.clear();
         stopSpinner();
       }
+    }
+    if (event.type === 'instance_updated' && event.instance.instanceId === session.mainInstanceId
+      && event.instance.activeTurnId && ['running', 'waiting'].includes(event.instance.status)) {
+      const turnId = event.instance.activeTurnId;
+      pendingTurns.clear();
+      pendingTurns.add(turnId);
+      for (const [id, block] of thinkingBlocks) {
+        if (id !== turnId) { block.status = 'completed'; streams.delete(id); }
+      }
+      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
+      startSpinner();
     }
     if (event.type === 'instance_updated'
       && event.instance.sessionId === sessionId
@@ -702,9 +846,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const block = [...thinkingBlocks.values()].find(b => b.status === 'active');
       if (block) {
         block.status = 'completed';
-        block.expanded = false;
       }
       pendingTurns.clear();
+      streams.clear();
       stopSpinner();
     }
     refresh();
@@ -717,16 +861,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (closed) return;
     closed = true;
     stopSpinner();
+    if (welcomeTimer) clearInterval(welcomeTimer);
     unsubscribe();
     screen.destroy();
     finish?.();
   }
 
   composer.on('keypress', handleComposerKey);
-  activity.key(['enter', 'space'], () => { void showActivityDetail(); });
+  completions.on('select', (_item, index: number) => {
+    const selected = commandMatches(composerValue())[index];
+    if (selected) { setComposerValue(selected.name + ' '); focusComposer(); }
+  });
+  const runAction = (action: () => Promise<void>): void => {
+    void action().catch((error) => { notice = `Error: ${error instanceof Error ? error.message : String(error)}`; refresh(); });
+  };
+  activity.key(['enter', 'space'], () => { runAction(showActivityDetail); });
   activity.on('select item', (_item, index) => { selectedActivityIndex = index; });
   const openCommandPalette = (): void => {
-    void commandPalette();
+    if (screen.focused === composer || screen.focused === conversation || screen.focused === activity) runAction(commandPalette);
   };
   const toggleActivity = (): void => {
     activityVisible = !activityVisible;
@@ -740,24 +892,42 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const toggleThinkingBlock = (turnId: string): void => {
     const block = thinkingBlocks.get(turnId);
     if (!block) return;
+    conversationFollowOutput = false;
+    conversationScrollOffset = conversation.childBase;
     block.expanded = !block.expanded;
     refresh();
   };
 
   const focusConversation = (): void => {
-    if (closed) return;
-    composerPinned = false;
-    if (screen.focused !== conversation) conversation.focus();
+    // Browsing is independent of keyboard focus: typing always goes to the draft.
+    focusComposer();
   };
 
+  const setMouseInteraction = (enabled: boolean): void => {
+    selection = undefined;
+    nativeSelection = !enabled;
+    if (nativeSelection) screen.program.disableMouse();
+    else {
+      screen.program.enableMouse();
+      if (process.platform === 'win32' || screen.program.term('windows')) {
+        screen.program.setMouse({ vt200Mouse: true, sgrMouse: true, utfMouse: false, cellMotion: true, allMotion: true }, true);
+      }
+    }
+    refresh();
+  };
+  screen.key(['f2'], () => setMouseInteraction(nativeSelection));
+
+  composer.on('click', focusComposer);
+
   conversation.on('click', (data: { x: number; y: number }) => {
+    if (hasSelection()) return;
     focusConversation();
     if (!data || data.y === undefined) return;
     const lpos = conversation.lpos;
     if (!lpos) return;
     const contentTop = lpos.yi + Number(conversation.itop);
     const relY = data.y - contentTop;
-    const row = Math.floor(relY) + Number(conversation.getScroll?.() ?? conversation.childBase ?? 0);
+    const row = Math.floor(relY) + conversation.childBase;
     // RenderThinkingBlock records indices in the raw `lines` array, but blessed
     // re-parses/wraps content into `_clines`. Translate via ftor so the click
     // still hits the header even when a preceding long line was wrapped.
@@ -779,23 +949,102 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   activity.on('click', focusComposer);
   conversation.on('mousedown', focusConversation);
   conversation.on('wheelup', () => {
+    selection = undefined;
     focusConversation();
     conversationFollowOutput = false;
-    conversationScrollOffset = conversation.getScroll();
+    conversationScrollOffset = conversation.childBase;
+    refresh();
   });
   conversation.on('wheeldown', () => {
+    selection = undefined;
     focusConversation();
-    conversationScrollOffset = conversation.getScroll();
+    conversationScrollOffset = conversation.childBase;
     conversationFollowOutput = conversationAtBottom();
+    refresh();
   });
   conversation.on('scroll', () => {
     if (restoringConversationScroll) return;
-    conversationScrollOffset = conversation.getScroll();
+    conversationScrollOffset = conversation.childBase;
     conversationFollowOutput = conversationAtBottom();
   });
-  screen.key(['tab'], focusComposer);
-  screen.key(['escape'], focusComposer);
-  screen.key(['C-c'], close);
+  screen.key(['pageup', 'pagedown'], (_ch, key) => {
+    selection = undefined;
+    if (!composerPinned && screen.focused !== conversation) return;
+    focusConversation();
+    conversation.scroll((key.name === 'pageup' ? -1 : 1) * Math.max(1, Number(conversation.height) - 2));
+    screen.render();
+  });
+  screen.key(['C-x'], () => { void command('/cancel').catch((error) => { notice = String(error); refresh(); }); });
+  screen.key(['tab', 'escape'], () => {
+    if (screen.focused === conversation || screen.focused === activity) focusComposer();
+  });
+  const orderedSelection = (): [Point, Point] | undefined => {
+    if (!selection || !hasSelection()) return;
+    const { start, end } = selection;
+    return start.y < end.y || (start.y === end.y && start.x <= end.x) ? [start, end] : [end, start];
+  };
+  conversation.on('render', () => {
+    const range = orderedSelection();
+    if (!range || !selection) return;
+    const [start, end] = range;
+    for (let y = start.y; y <= end.y; y++) {
+      const row = screenBuffer.lines[y];
+      if (!row) continue;
+      const left = y === start.y ? start.x : selection.left;
+      const right = y === end.y ? end.x : selection.right - 1;
+      for (let x = left; x <= right; x++) {
+        const cell = row[x];
+        if (cell) cell[0] = (cell[0] & ~0x3ffff) | (0 << 9) | 6;
+      }
+      row.dirty = true;
+    }
+  });
+  // Handle the raw protocol before Blessed: SGR drag reports (button 32) are
+  // misclassified as repeated presses by Blessed 0.1.x on some terminals.
+  screen.program.prependListener('mouse', (data: { action: string; button?: string; x: number; y: number; raw?: unknown[] }) => {
+    if (nativeSelection) return;
+    const bounds = conversation.lpos;
+    if (!bounds) return;
+    const rawButton = Number(data.raw?.[0]);
+    const motion = data.action === 'mousemove' || (Number.isFinite(rawButton) && (rawButton & 32) !== 0 && (rawButton & 64) === 0);
+    if (motion && selection?.dragging) {
+      data.action = 'mousemove';
+      selection.end = { x: Math.max(selection.left, Math.min(selection.right - 1, data.x)), y: Math.max(selection.top, Math.min(selection.bottom - 1, data.y)) };
+      screen.render();
+    } else if (data.action === 'mousedown' && data.button === 'left'
+      && data.x >= bounds.xi + Number(conversation.ileft) && data.x < bounds.xl - (Number(conversation.iwidth) - Number(conversation.ileft)) - 1
+      && data.y >= bounds.yi && data.y < bounds.yl) {
+      selection = {
+        start: { x: data.x, y: data.y }, end: { x: data.x, y: data.y }, dragging: true,
+        rows: screenBuffer.lines.map((row) => row.map((cell) => cell[1])),
+        left: bounds.xi + Number(conversation.ileft), right: bounds.xl - (Number(conversation.iwidth) - Number(conversation.ileft)) - 1,
+        top: bounds.yi, bottom: bounds.yl,
+      };
+    } else if (data.action === 'mouseup' && selection?.dragging) {
+      selection.dragging = false;
+    }
+  });
+  screen.key(['C-c'], () => {
+    const range = orderedSelection();
+    if (!range || !selection) { close(); return; }
+    const [start, end] = range;
+    const lines: string[] = [];
+    for (let y = start.y; y <= end.y; y++) {
+      const left = y === start.y ? start.x : selection.left;
+      const right = y === end.y ? end.x + 1 : selection.right;
+      lines.push((selection.rows[y] ?? []).slice(left, right).join('').replace(/[\x00\x03]/g, '').trimEnd());
+    }
+    runAction(async () => {
+      try { await (options.copyToClipboard ?? copyText)(lines.join('\n')); }
+      finally { selection = undefined; }
+      refresh();
+      focusComposer();
+    });
+  });
+  composer.on('keypress', (_ch, key: { name?: string; ctrl?: boolean }) => {
+    if (hasSelection() && !(key.ctrl && key.name === 'c')) { selection = undefined; refresh(); }
+  });
+  screen.key(['escape'], () => { selection = undefined; refresh(); });
   screen.on('resize', refresh);
 
   refresh();

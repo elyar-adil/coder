@@ -19,11 +19,21 @@ Inside the TUI:
 - `/sessions` switches sessions; `/new` creates one.
 - `Ctrl+K` opens the command palette.
 - `Ctrl+B` toggles Agent Activity.
+- `Ctrl+J` or `Alt+Enter` inserts a newline; `Enter` sends. Chinese text wraps by terminal width.
+- `Up` / `Down` browse input history; `Ctrl+U` clears the draft.
+- `PageUp` / `PageDown` scroll the conversation; `Tab` returns to the input.
+- `Ctrl+Y` expands the latest tool activity.
+- Click a disclosure arrow to expand Thinking, scroll with the wheel, or drag across visible conversation text to select it. `Ctrl+C` copies a selection; without a selection it exits. `Escape` clears the selection. Typing still edits the draft.
+- Selected text stays stable while generation continues in the background. Copying or clearing the selection resumes display updates. Thinking is shown when the provider returns it.
+- `F2` (or `/select`) optionally releases app mouse capture for the terminal's native selection. `F2` again restores app clicks, drag selection and wheel scrolling. `Ctrl+Y` and `PageUp` / `PageDown` also work without the mouse.
+- `Ctrl+X` or `/cancel` stops the current session's agents; send another message to continue.
+- `Ctrl+C` exits. Runtime errors appear in the conversation.
 
 For a non-interactive run:
 
 ```powershell
 coder run --prompt "Inspect this repository and fix the failing tests"
+coder --model my-model run --prompt "Explain this repository"
 ```
 
 List effective specs:
@@ -34,9 +44,11 @@ coder agents
 
 Coder intentionally has no Web UI or Web server.
 
+Interactive mode requires a terminal. Non-interactive runs report agent failures with a nonzero exit code.
+
 ## Architecture
 
-The user talks only to a lightweight `main` agent. Simple conversation stays with main; complex work is handed to one or more coordinator agents. Coordinators select specialist agents themselves.
+The user talks to `main`, whose primary responsibility is responsive conversation and coordination. Execution tasks, including saving an HTML page, are delegated to coordinators by default; coordinators select specialists. Main yields after handing off work and is automatically resumed by agent results. Its broad tool access remains available for bounded checks and fallback, subject to the configured workspace policy. The scheduler reserves user-facing capacity independently of the background concurrency limit.
 
 ```text
 user ↔ main → coordinator(s) → explorer / implement / review / custom agents

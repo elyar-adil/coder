@@ -22,6 +22,7 @@ export interface AgentToolCall {
 }
 
 export interface AgentModelMessage {
+  responseItems?: Record<string, unknown>[];
   role: string;
   content: string | null;
   tool_calls?: AgentToolCall[];
@@ -31,6 +32,7 @@ export interface AgentModelMessage {
 export type AgentInstanceStatus = 'queued' | 'running' | 'idle' | 'waiting' | 'failed' | 'cancelled';
 
 export interface AgentMailboxMessage {
+  turnId?: string;
   messageId: string;
   fromInstanceId?: string;
   content: string;
@@ -56,6 +58,7 @@ export interface AgentInstance {
 }
 
 export interface SessionMessage {
+  thinking?: string;
   messageId: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
@@ -64,6 +67,7 @@ export interface SessionMessage {
 }
 
 export interface AgentSession {
+  timeline?: SessionTimelineEntry[];
   sessionId: string;
   mainInstanceId: string;
   defaultModel?: string;
@@ -73,6 +77,18 @@ export interface AgentSession {
   updatedAt: string;
 }
 
+export interface SessionTimelineEntry {
+  id: string;
+  kind: 'message' | 'thinking' | 'tool';
+  instanceId?: string;
+  turnId?: string;
+  role?: 'user' | 'assistant' | 'system';
+  content: string;
+  tool?: string;
+  input?: string;
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+}
+
 export interface PersistedAgentSession {
   version: 1;
   session: AgentSession;
@@ -80,6 +96,7 @@ export interface PersistedAgentSession {
 }
 
 export type AgentEvent =
+  | { type: 'thinking_delta'; sessionId: string; instanceId: string; turnId: string; text: string }
   | { type: 'session_opened'; session: AgentSession }
   | { type: 'user_message'; sessionId: string; message: SessionMessage }
   | { type: 'assistant_delta'; sessionId: string; instanceId: string; turnId: string; text: string }
@@ -95,4 +112,3 @@ export interface RuntimeTool {
   definition: ToolDefinition;
   execute: (args: Record<string, unknown>) => Promise<string>;
 }
-

@@ -10,6 +10,7 @@
  */
 
 import { resilientFetch, FetchError } from './fetch.js';
+import { responsesStream } from './responses.js';
 import type { AgentModelMessage as OllamaMsg } from './domain/agent.js';
 import type { ToolDefinition } from './tools/types.js';
 type OllamaToolDef = ToolDefinition;
@@ -17,6 +18,7 @@ type OllamaToolDef = ToolDefinition;
 export type BackendType = 'openai' | 'anthropic' | 'ollama';
 
 export interface BackendConfig {
+  wireApi?: 'chat' | 'responses';
   type: BackendType;
   baseUrl: string;
   model: string;
@@ -31,7 +33,9 @@ export interface BackendConfig {
 }
 
 export interface ChatChunk {
+  responseItems?: Record<string, unknown>[];
   content: string | null;
+  thinking?: string;
   toolCalls?: OllamaMsg['tool_calls'];
   done: boolean;
 }
@@ -47,11 +51,11 @@ export function openAIChatCompletionsUrl(baseUrl: string): string {
   return `${normalizeOpenAIBaseUrl(baseUrl)}/v1/chat/completions`;
 }
 
-function parseNdjsonLine(line: string): { message?: OllamaMsg & { content: string | null }; done?: boolean } | null {
+function parseNdjsonLine(line: string): { message?: OllamaMsg & { content: string | null; thinking?: string }; done?: boolean } | null {
   const trimmed = line.trim();
   if (!trimmed) return null;
   try {
-    return JSON.parse(trimmed) as { message?: OllamaMsg & { content: string | null }; done?: boolean };
+    return JSON.parse(trimmed) as { message?: OllamaMsg & { content: string | null; thinking?: string }; done?: boolean };
   } catch {
     return null;
   }
@@ -103,13 +107,13 @@ async function* ollamaStream(
 
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
+    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
     const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
+    buffer = done ? '' : lines.pop() ?? '';
     for (const line of lines) {
       const obj = parseNdjsonLine(line);
       if (!obj) continue;
+      if (obj.message?.thinking) yield { content: null, thinking: obj.message.thinking, done: false };
       if (obj.message?.content) {
         yield { content: obj.message.content, done: false };
       }
@@ -121,6 +125,7 @@ async function* ollamaStream(
         return;
       }
     }
+    if (done) break;
   }
 }
 
@@ -167,6 +172,8 @@ interface OpenAIToolCall {
 interface OpenAIChoice {
   delta?: {
     content?: string | null;
+    reasoning_content?: string;
+    reasoning?: string;
     tool_calls?: Array<{ index: number; id?: string; function?: { name?: string; arguments?: string } }>;
   };
   finish_reason?: string | null;
@@ -302,6 +309,8 @@ async function* openaiStream(
         const choice = parsed.choices?.[0];
         if (!choice) continue;
 
+        const thinking = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
+        if (thinking) yield { content: null, thinking, done: false };
         if (choice.delta?.content) {
           yield { content: choice.delta.content, done: false };
         }
@@ -547,7 +556,7 @@ async function* anthropicStream(
       try {
         const parsed = JSON.parse(data) as {
           index?: number;
-          delta?: { type?: string; text?: string; partial_json?: string };
+          delta?: { type?: string; text?: string; thinking?: string; partial_json?: string };
           content_block?: AnthropicContentBlock;
           error?: { message?: string };
           type?: string;
@@ -568,6 +577,9 @@ async function* anthropicStream(
         }
 
         if (event === 'content_block_delta') {
+          if (parsed.delta?.type === 'thinking_delta' && parsed.delta.thinking) {
+            yield { content: null, thinking: parsed.delta.thinking, done: false };
+          }
           if (parsed.delta?.type === 'text_delta' && parsed.delta.text) {
             yield { content: parsed.delta.text, done: false };
           }
@@ -659,6 +671,7 @@ export function chatStream(
   tools?: OllamaToolDef[],
   signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
+  if (config.type === 'openai' && config.wireApi === 'responses') return responsesStream(config, systemPrompt, messages, tools, signal);
   if (config.type === 'anthropic') return anthropicStream(config, systemPrompt, messages, tools, signal);
   if (config.type === 'openai') return openaiStream(config, systemPrompt, messages, tools, signal);
   return ollamaStream(config, systemPrompt, messages, tools, signal);
@@ -670,6 +683,15 @@ export async function chatNonStream(
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
 ): Promise<ChatChunk> {
+  if (config.type === 'openai' && config.wireApi === 'responses') {
+    const result: ChatChunk = { content: '', thinking: '', toolCalls: [], done: true };
+    for await (const chunk of responsesStream(config, systemPrompt, messages, tools)) {
+      result.content += chunk.content ?? '';
+      result.thinking += chunk.thinking ?? '';
+      result.toolCalls!.push(...chunk.toolCalls ?? []);
+    }
+    return result;
+  }
   if (config.type === 'anthropic') return anthropicNonStream(config, systemPrompt, messages, tools);
   if (config.type === 'openai') return openaiNonStream(config, systemPrompt, messages, tools);
   return ollamaNonStream(config, systemPrompt, messages, tools);

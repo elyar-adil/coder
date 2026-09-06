@@ -41,6 +41,7 @@ export interface AgentConfig {
 }
 
 export interface AgentModelConfig {
+  wireApi?: 'chat' | 'responses';
   baseUrl?: string;
   model: string;
   backend?: BackendType;
@@ -107,6 +108,9 @@ function parseConfig(raw: string): AgentConfig {
   }
   if (parsed.models) {
     for (const [name, modelConfig] of Object.entries(parsed.models)) {
+      if (modelConfig.wireApi && !['chat', 'responses'].includes(modelConfig.wireApi)) {
+        throw new Error(`Invalid wireApi for model alias "${name}". Use "chat" or "responses".`);
+      }
       if (!modelConfig?.model || typeof modelConfig.model !== 'string') {
         throw new Error(`Invalid model alias "${name}" in config. Each model alias needs a string "model".`);
       }

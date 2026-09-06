@@ -17,6 +17,7 @@ import type { ToolDefinition } from '../tools/types.js';
 import { AgentRegistry, matchesAgentSelector } from './agent-registry.js';
 import { AgentRuntimeStore } from './agent-store.js';
 import { FileLockManager } from './locks.js';
+import { recordTimeline } from './session-timeline.js';
 
 type ModelStream = (
   config: BackendConfig,
@@ -57,7 +58,7 @@ function cloneInstance(instance: AgentInstance): AgentInstance {
 }
 
 function cloneSession(session: AgentSession): AgentSession {
-  return { ...session, messages: session.messages.map((message) => ({ ...message })), instanceIds: [...session.instanceIds] };
+  return { ...session, timeline: session.timeline?.map(entry => ({ ...entry })), messages: session.messages.map((message) => ({ ...message })), instanceIds: [...session.instanceIds] };
 }
 
 function parseStringList(value: unknown): string[] {
@@ -144,6 +145,9 @@ export class AgentRuntime {
   }
 
   private emit(event: AgentEvent): void {
+    const sessionId = 'sessionId' in event ? event.sessionId : 'instance' in event ? event.instance.sessionId : 'instanceId' in event && event.instanceId ? this.instances.get(event.instanceId)?.sessionId : undefined;
+    const session = sessionId ? this.sessions.get(sessionId) : undefined;
+    if (session) recordTimeline(session, event);
     for (const listener of this.subscribers) {
       try { listener(event); } catch { /* subscribers cannot break the runtime */ }
     }
@@ -244,8 +248,10 @@ export class AgentRuntime {
 
   async clearSession(sessionId: string): Promise<void> {
     if (!this.sessions.has(sessionId)) await this.openSession(sessionId);
+    await this.cancelSession(sessionId);
     const session = this.sessions.get(sessionId)!;
     session.messages = [];
+    session.timeline = [];
     session.updatedAt = now();
     const main = this.instances.get(session.mainInstanceId);
     if (main) {
@@ -253,9 +259,29 @@ export class AgentRuntime {
       main.messages = [];
       main.mailbox = [];
       main.status = 'idle';
+      main.lastError = undefined;
+      main.lastOutput = undefined;
       main.updatedAt = now();
     }
     await this.persistSession(sessionId);
+  }
+
+  async cancelSession(sessionId: string): Promise<void> {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    for (const id of session.instanceIds) {
+      const instance = this.instances.get(id);
+      if (!instance) continue;
+      this.controllers.get(id)?.abort('Stopped by user');
+      this.queued.delete(id);
+      instance.mailbox.forEach((message) => { message.status = 'delivered'; });
+      instance.status = 'cancelled';
+      instance.activeTurnId = undefined;
+      instance.updatedAt = now();
+      this.emit({ type: 'instance_updated', instance: cloneInstance(instance) });
+    }
+    await this.persistSession(sessionId);
+    this.notifyIdleWaiters();
   }
 
   async submitMessage(sessionId: string, content: string): Promise<string> {
@@ -271,7 +297,8 @@ export class AgentRuntime {
     if (main.status === 'running' || main.status === 'waiting') {
       this.controllers.get(main.instanceId)?.abort('Superseded by a newer user message');
     }
-    this.deliver(main, text, undefined);
+    if (main.status === 'cancelled') main.status = 'idle';
+    this.deliver(main, text, undefined, turnId);
     await this.persistSession(sessionId);
     this.emit({ type: 'user_message', sessionId, message: { ...message } });
     this.enqueue(main.instanceId);
@@ -339,6 +366,7 @@ export class AgentRuntime {
     const targets = ids.map((id) => this.instances.get(id));
     if (targets.some((target) => !target || target.sessionId !== requester.sessionId)) throw new Error('Related agent instance not found');
     const done = (): boolean => targets.every((target) => target && ['idle', 'failed', 'cancelled'].includes(target.status));
+    const signal = this.controllers.get(requesterId)?.signal;
     if (!done()) {
       requester.status = 'waiting';
       this.emit({ type: 'instance_updated', instance: cloneInstance(requester) });
@@ -348,26 +376,40 @@ export class AgentRuntime {
       const yieldedCapacity = this.running.delete(requester.instanceId);
       if (yieldedCapacity) this.pump();
       await new Promise<void>((resolveWait) => {
-        const timeout = setTimeout(() => { this.idleWaiters.delete(check); resolveWait(); }, Math.min(Math.max(timeoutMs, 100), 300_000));
-        const check = (): void => {
-          if (!done()) return;
+        const finish = (): void => {
           clearTimeout(timeout);
           this.idleWaiters.delete(check);
+          signal?.removeEventListener('abort', finish);
           resolveWait();
         };
+        const timeout = setTimeout(finish, Math.min(Math.max(timeoutMs, 100), 300_000));
+        const check = (): void => {
+          if (!done()) return;
+          finish();
+        };
         this.idleWaiters.add(check);
+        signal?.addEventListener('abort', finish, { once: true });
+        if (signal?.aborted) finish();
       });
+      if (signal?.aborted) return 'Wait cancelled.';
       if (yieldedCapacity) {
-        while (this.running.size >= this.maxConcurrentTurns) {
+        const hasCapacity = (): boolean => !requester.parentInstanceId || this.backgroundRunning() < this.maxConcurrentTurns;
+        while (!hasCapacity() && !signal?.aborted) {
           await new Promise<void>((resolveCapacity) => {
-            const check = (): void => {
-              if (this.running.size >= this.maxConcurrentTurns) return;
+            const finish = (): void => {
               this.idleWaiters.delete(check);
+              signal?.removeEventListener('abort', finish);
               resolveCapacity();
             };
+            const check = (): void => {
+              if (hasCapacity()) finish();
+            };
             this.idleWaiters.add(check);
+            signal?.addEventListener('abort', finish, { once: true });
+            if (signal?.aborted) finish();
           });
         }
+        if (signal?.aborted) return 'Wait cancelled.';
         this.running.add(requester.instanceId);
       }
       if (requester.status === 'waiting') requester.status = 'running';
@@ -451,8 +493,8 @@ export class AgentRuntime {
     return ids;
   }
 
-  private deliver(target: AgentInstance, content: string, fromInstanceId?: string): void {
-    const message: AgentMailboxMessage = { messageId: randomUUID(), fromInstanceId, content, createdAt: now(), status: 'pending' };
+  private deliver(target: AgentInstance, content: string, fromInstanceId?: string, turnId?: string): void {
+    const message: AgentMailboxMessage = { messageId: randomUUID(), fromInstanceId, turnId, content, createdAt: now(), status: 'pending' };
     target.mailbox.push(message);
     target.updatedAt = message.createdAt;
     if (target.status !== 'cancelled' && !this.activeTurns.has(target.instanceId)) target.status = 'queued';
@@ -469,9 +511,20 @@ export class AgentRuntime {
     queueMicrotask(() => this.pump());
   }
 
+  private backgroundRunning(): number {
+    return [...this.running].filter((id) => this.instances.get(id)?.parentInstanceId).length;
+  }
+
   private pump(): void {
-    while (!this.shuttingDown && this.running.size < this.maxConcurrentTurns && this.queue.length) {
-      const id = this.queue.shift()!;
+    while (!this.shuttingDown && this.queue.length) {
+      // User-facing entry instances have a separate lane: busy workers must
+      // never keep a new user message queued behind long-running work.
+      const mainIndex = this.queue.findIndex((id) => {
+        const candidate = this.instances.get(id);
+        return candidate && !candidate.parentInstanceId;
+      });
+      if (mainIndex < 0 && this.backgroundRunning() >= this.maxConcurrentTurns) break;
+      const id = this.queue.splice(mainIndex >= 0 ? mainIndex : 0, 1)[0]!;
       this.queued.delete(id);
       const instance = this.instances.get(id);
       if (!instance || instance.status === 'cancelled' || this.activeTurns.has(id)) continue;
@@ -545,11 +598,13 @@ export class AgentRuntime {
     const kept: AgentModelMessage[] = [];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index]!;
-      const size = String(message.content ?? '').length + JSON.stringify(message.tool_calls ?? []).length;
+      const size = String(message.content ?? '').length + JSON.stringify(message.tool_calls ?? []).length + JSON.stringify(message.responseItems ?? []).length;
       if (kept.length && total + size > budgetChars) break;
       kept.unshift(message);
       total += size;
     }
+    // Tool results must never be sent without their assistant tool-call message.
+    while (kept[0]?.role === 'tool') kept.shift();
     return kept;
   }
 
@@ -562,7 +617,7 @@ export class AgentRuntime {
     }
     const session = this.sessions.get(instance.sessionId)!;
     const controller = new AbortController();
-    const turnId = randomUUID();
+    const turnId = instance.mailbox.filter((message) => message.status === 'pending' && message.turnId).at(-1)?.turnId ?? randomUUID();
     instance.activeTurnId = turnId;
     instance.status = 'running';
     instance.updatedAt = now();
@@ -580,9 +635,16 @@ export class AgentRuntime {
         if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
         const messages = this.trimMessages(instance.messages, config);
         let text = '';
+        let thinking = '';
+        const responseItems: Record<string, unknown>[] = [];
         const calls: NonNullable<AgentModelMessage['tool_calls']> = [];
         for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), messages, tools, controller.signal)) {
           if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
+          if (chunk.responseItems) responseItems.push(...chunk.responseItems);
+          if (chunk.thinking) {
+            thinking += chunk.thinking;
+            this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
+          }
           if (chunk.content) {
             text += chunk.content;
             finalOutput += chunk.content;
@@ -592,9 +654,9 @@ export class AgentRuntime {
           }
           if (chunk.toolCalls?.length) calls.push(...chunk.toolCalls);
         }
-        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}) });
+        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });
         if (text.trim() && !instance.parentInstanceId) {
-          const visible: SessionMessage = { messageId: randomUUID(), role: 'assistant', content: text.trim(), createdAt: now(), turnId };
+          const visible: SessionMessage = { messageId: randomUUID(), role: 'assistant', content: text.trim(), createdAt: now(), turnId, ...(thinking ? { thinking } : {}) };
           session.messages.push(visible);
           session.updatedAt = visible.createdAt;
           this.emit({ type: 'assistant_message', sessionId: session.sessionId, instanceId: instance.instanceId, message: { ...visible } });
@@ -609,6 +671,7 @@ export class AgentRuntime {
           instance.messages.push({ role: 'tool', content: output, tool_use_id: call.id });
           this.emit({ type: 'tool_finished', instanceId: instance.instanceId, turnId, tool: call.function.name, output });
         }
+        if (step === 31) throw new Error('Agent reached the 32-step limit. Review the activity and send a follow-up to continue.');
       }
       if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
       instance.lastOutput = finalOutput.trim() || instance.lastOutput;
@@ -638,6 +701,14 @@ export class AgentRuntime {
         }
       }
     } finally {
+      // Interrupted tool batches still need matching results in the next request.
+      let lastAssistant = instance.messages.length - 1;
+      while (lastAssistant >= 0 && instance.messages[lastAssistant]!.role !== 'assistant') lastAssistant--;
+      const unfinished = instance.messages[lastAssistant]?.tool_calls ?? [];
+      const answered = new Set(instance.messages.slice(lastAssistant + 1).filter((message) => message.role === 'tool').map((message) => message.tool_use_id));
+      for (const call of unfinished) {
+        if (!answered.has(call.id)) instance.messages.push({ role: 'tool', tool_use_id: call.id, content: 'Tool execution interrupted. Check the workspace state before retrying.' });
+      }
       if (controller.signal.aborted && instance.activeTurnId === turnId && (instance.status as string) !== 'cancelled') {
         instance.activeTurnId = undefined;
         instance.status = instance.mailbox.some((message) => message.status === 'pending') ? 'queued' : 'idle';

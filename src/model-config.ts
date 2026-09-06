@@ -46,6 +46,7 @@ export function resolveModelConfig(fileConfig: AgentConfig, requestedModel?: str
       type: backend,
       baseUrl,
       model: modelConfig.model,
+      ...(modelConfig.wireApi ? { wireApi: modelConfig.wireApi } : {}),
       ...(apiKey ? { apiKey } : {}),
       ...(modelConfig.requestOptions ? { requestOptions: modelConfig.requestOptions } : {}),
       ...(modelConfig.contextWindow ? { contextWindow: modelConfig.contextWindow } : {}),

@@ -60,6 +60,109 @@ function textModel(): ConstructorParameters<typeof AgentRuntime>[0]['modelStream
 }
 
 describe('AgentRuntime', () => {
+  test('main responds while the background concurrency budget is fully occupied', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let started!: () => void;
+    const workerStarted = new Promise<void>(resolve => { started = resolve; });
+    let responded!: () => void;
+    const response = new Promise<void>(resolve => { responded = resolve; });
+    const { runtime, root } = await fixture(async function* (_config, system) {
+      if (system.includes('agent "coordinator"')) { started(); await gate; yield { content: 'background done', done: true }; }
+      else { yield { content: 'available now', done: true }; }
+    }, { maxConcurrentTurns: 1 });
+    runtime.subscribe(event => { if (event.type === 'assistant_message') responded(); });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const session = await runtime.openSession('responsive');
+      const child = await runtime.spawnAgent(session.mainInstanceId, 'coordinator', 'long task');
+      await workerStarted;
+      await runtime.submitMessage('responsive', 'status?');
+      await Promise.race([response, new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('main blocked behind worker')), 2000); })]);
+      assert.equal(runtime.getInstance(child)?.status, 'running');
+      release();
+      await runtime.waitForIdle('responsive', 5000);
+    } finally {
+      clearTimeout(timeout); release(); await runtime.shutdown(); await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('persists prose and tools in actual execution order', async () => {
+    let step = 0;
+    const { runtime, root, store } = await fixture(async function* () {
+      if (step++ === 0) {
+        yield { content: 'Before tool', done: false };
+        yield { content: null, toolCalls: [{ id: 'missing', function: { name: 'unknown_tool', arguments: {} } }], done: false };
+      } else { yield { content: 'After tool', done: true }; }
+    });
+    try {
+      await runtime.submitMessage('ordered', 'start');
+      await runtime.waitForIdle('ordered');
+      const entries = (await store.load('ordered'))!.session.timeline!;
+      assert.deepEqual(entries.map(entry => entry.kind), ['message', 'message', 'tool', 'message']);
+      assert.equal(entries[1]!.content, 'Before tool');
+      assert.equal(entries[3]!.content, 'After tool');
+      assert.equal(entries[2]!.status, 'failed');
+    } finally { await runtime.shutdown(); await rm(root, { recursive: true, force: true }); }
+  });
+  test('streams and persists provider thinking separately from the answer', async () => {
+    const { runtime, root, store } = await fixture(async function* () {
+      yield { content: null, thinking: 'Inspect. ', done: false };
+      yield { content: null, thinking: 'Verify.', done: false };
+      yield { content: 'Complete.', done: true };
+    });
+    const thinking: string[] = [];
+    runtime.subscribe((event) => { if (event.type === 'thinking_delta') thinking.push(event.text); });
+    try {
+      await runtime.submitMessage('thinking', 'start');
+      await runtime.waitForIdle('thinking');
+      assert.equal(thinking.join(''), 'Inspect. Verify.');
+      const answer = (await store.load('thinking'))!.session.messages.at(-1)!;
+      assert.equal(answer.content, 'Complete.');
+      assert.equal(answer.thinking, 'Inspect. Verify.');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+  test('associates generated output with the submitted user turn', async () => {
+    const { runtime, root } = await fixture(textModel());
+    try {
+      const turn = await runtime.submitMessage('association', 'hello');
+      await runtime.waitForIdle('association');
+      assert.equal(runtime.getSession('association')!.messages.at(-1)!.turnId, turn);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('stops the whole session and allows a fresh user turn', async () => {
+    let started!: () => void;
+    const ready = new Promise<void>((resolve) => { started = resolve; });
+    let first = true;
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, _tools, signal) {
+      if (first) {
+        first = false;
+        started();
+        await new Promise<void>((resolve) => signal!.addEventListener('abort', () => resolve(), { once: true }));
+      } else yield { content: 'continued', done: false };
+    });
+    try {
+      await runtime.submitMessage('stop', 'start');
+      await ready;
+      await runtime.cancelSession('stop');
+      await runtime.waitForIdle('stop');
+      assert.ok(runtime.listInstances('stop').every((instance) => instance.status === 'cancelled'));
+      await runtime.submitMessage('stop', 'continue');
+      await runtime.waitForIdle('stop');
+      assert.equal(runtime.getSession('stop')!.messages.at(-1)!.content, 'continued');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('keeps user messages in one session instead of creating tasks', async () => {
     const { runtime, root } = await fixture(textModel());
     try {
