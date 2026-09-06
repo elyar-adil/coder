@@ -5,6 +5,7 @@ import type { AgentConfig, AgentModelConfig } from '../config.js';
 import type { AgentEvent, AgentInstance, AgentSession } from '../domain/agent.js';
 import { renderTuiMarkdown, toolDiff } from './markdown.js';
 import type { AgentRuntime } from '../runtime/agent-runtime.js';
+import { resilientFetch } from '../fetch.js';
 import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
@@ -12,7 +13,7 @@ import { commandMatches } from './commands.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 type Provider = {
-  id: 'openai' | 'openrouter' | 'anthropic' | 'ollama' | 'custom';
+  id: 'openai' | 'openrouter' | 'anthropic' | 'ollama' | 'opencode-go' | 'custom';
   label: string;
   backend: AgentModelConfig['backend'];
   baseUrl: string;
@@ -37,6 +38,7 @@ const PROVIDERS: Provider[] = [
   { id: 'openai', label: 'OpenAI', backend: 'openai', baseUrl: 'https://api.openai.com/v1', needsKey: true },
   { id: 'openrouter', label: 'OpenRouter', backend: 'openai', baseUrl: 'https://openrouter.ai/api/v1', needsKey: true },
   { id: 'anthropic', label: 'Anthropic', backend: 'anthropic', baseUrl: 'https://api.anthropic.com', needsKey: true },
+  { id: 'opencode-go', label: 'OpenCode Go', backend: 'openai', baseUrl: 'https://opencode.ai/zen/go/v1', needsKey: true },
   { id: 'ollama', label: 'Ollama · local', backend: 'ollama', baseUrl: 'http://localhost:11434', needsKey: false },
   { id: 'custom', label: 'Custom · OpenAI compatible', backend: 'openai', baseUrl: '', needsKey: false },
 ];
@@ -69,7 +71,23 @@ function providerName(config: AgentModelConfig): string {
   if (config.backend === 'anthropic') return 'Anthropic';
   if (config.backend === 'ollama') return 'Ollama';
   if (config.baseUrl?.includes('openrouter.ai')) return 'OpenRouter';
+  if (config.baseUrl?.includes('opencode.ai/zen')) return 'OpenCode Go';
   return 'OpenAI compatible';
+}
+
+async function fetchRemoteModels(baseUrl: string, apiKey: string | undefined, backend: AgentModelConfig['backend']): Promise<string[]> {
+  try {
+    const trimmed = baseUrl.replace(/\/+$/, '');
+    const url = backend === 'anthropic' ? `${trimmed}/v1/models` : backend === 'ollama' ? `${trimmed}/v1/models` : `${trimmed}/models`;
+    const headers: Record<string, string> = backend === 'anthropic'
+      ? { 'x-api-key': apiKey ?? '', 'anthropic-version': '2023-06-01' }
+      : apiKey ? { authorization: `Bearer ${apiKey}` } : {};
+    const response = await resilientFetch(url, { headers, retries: 0, timeout: 15000 });
+    const body = await response.json() as { data?: Array<{ id?: string }> };
+    return [...new Set((body.data ?? []).map((model) => model.id).filter((id): id is string => Boolean(id)))].sort();
+  } catch {
+    return [];
+  }
 }
 
 export async function runFullscreenTui(runtime: AgentRuntime, options: FullscreenTuiOptions): Promise<void> {
@@ -602,13 +620,21 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!baseUrl) return;
     let apiKey: string | undefined;
     if (provider.needsKey) {
-      const envName = provider.id === 'openrouter' ? 'OPENROUTER_API_KEY' : provider.id === 'anthropic' ? 'ANTHROPIC_API_KEY' : 'OPENAI_API_KEY';
+      const envName = provider.id === 'openrouter' ? 'OPENROUTER_API_KEY' : provider.id === 'anthropic' ? 'ANTHROPIC_API_KEY' : provider.id === 'opencode-go' ? 'OPENCODE_API_KEY' : 'OPENAI_API_KEY';
       apiKey = await ask(`API key · blank uses ${envName}`, '', true) || process.env[envName];
       if (!apiKey) return;
     } else if (provider.id === 'custom') {
       apiKey = await ask('API key · optional', '', true) || undefined;
     }
-    const model = await ask('Provider model name');
+    const remoteModels = await fetchRemoteModels(baseUrl, apiKey, provider.backend);
+    let model: string;
+    if (remoteModels.length) {
+      const index = await choose('Provider model', [...remoteModels, 'Type manually…']);
+      if (index < 0) return;
+      model = index < remoteModels.length ? remoteModels[index]! : await ask('Provider model name');
+    } else {
+      model = await ask('Provider model name');
+    }
     if (!model) return;
     const suggested = provider.id === 'openrouter' ? model.split('/').at(-1)! : model.split(':')[0]!;
     const alias = await ask('Local alias', suggested);
