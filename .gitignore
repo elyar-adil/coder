@@ -6,3 +6,5 @@ __pycache__/
 .agentrc.json
 .agent-workspace/
 .workbuddy/
+.DS_Store
+.coder/
