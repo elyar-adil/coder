@@ -149,7 +149,9 @@ describe('renderMarkdown', () => {
 });
 
 describe('gfm tables', () => {
-  const strip = (text: string): string => text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+  // Renderer output mixes raw ANSI (italic/strike) with Blessed style tags;
+  // strip both so assertions measure the aligned plain text.
+  const strip = (text: string): string => text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').replace(/\{[^{}]*\}/g, '');
 
   test('renders a basic pipe table with header separator and aligned columns', () => {
     const rendered = renderMarkdown('| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |', 80);

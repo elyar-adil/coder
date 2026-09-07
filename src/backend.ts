@@ -35,7 +35,7 @@ export interface BackendConfig {
   sessionId?: string;
 }
 
-const USER_AGENT = `coder/${CODER_VERSION}`;
+const USER_AGENT = `tokenmaw/${CODER_VERSION}`;
 
 export function transportHeaders(config: BackendConfig): Record<string, string> {
   const headers: Record<string, string> = { 'user-agent': USER_AGENT };

@@ -1,6 +1,6 @@
-# Coder
+# TokenMaw
 
-Coder is a TUI-first, document-driven coding-agent runtime. The framework owns execution, tools, safety, persistence, and concurrency. Markdown Agent Specs own roles and collaboration behavior.
+TokenMaw is a TUI-first, document-driven coding-agent runtime. The framework owns execution, tools, safety, persistence, and concurrency. Markdown Agent Specs own roles and collaboration behavior.
 
 ## Quick start
 
@@ -8,7 +8,7 @@ Coder is a TUI-first, document-driven coding-agent runtime. The framework owns e
 npm install
 npm run build
 npm link
-coder
+maw
 ```
 
 Inside the TUI:
@@ -33,17 +33,17 @@ Inside the TUI:
 For a non-interactive run:
 
 ```powershell
-coder run --prompt "Inspect this repository and fix the failing tests"
-coder --model my-model run --prompt "Explain this repository"
+maw run --prompt "Inspect this repository and fix the failing tests"
+maw --model my-model run --prompt "Explain this repository"
 ```
 
 List effective specs:
 
 ```powershell
-coder agents
+maw agents
 ```
 
-Coder intentionally has no Web UI or Web server.
+TokenMaw intentionally has no Web UI or Web server.
 
 Interactive mode requires a terminal. Non-interactive runs report agent failures with a nonzero exit code.
 

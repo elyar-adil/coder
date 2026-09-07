@@ -37,6 +37,7 @@ export interface AgentConfig {
   apiKey?: string;
   policyLevel?: 'strict' | 'moderate' | 'off';
   artifactsDir?: string;
+  theme?: string;
   models?: Record<string, AgentModelConfig>;
 }
 

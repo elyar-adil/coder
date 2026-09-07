@@ -1,25 +1,74 @@
 /**
  * markdown.ts — Lightweight terminal markdown renderer.
  *
- * Exported so it can be unit-tested independently of the TUI.
- * No external dependencies — pure string transformation.
+ * Emits Blessed style tags (not raw ANSI) so the TUI renders every highlight
+ * with theme-driven colors, and exports the theme shape so unit tests and the
+ * TUI share one definition. No external dependencies — pure string transform.
  */
 
-import chalk from 'chalk';
+export type DiffKind = 'add' | 'del' | 'hunk' | 'file' | 'context';
 
-const MARKDOWN_THEME = {
+export interface MarkdownTheme {
+  text: string;
+  muted: string;
+  accent: string;
+  heading: string;
+  headingStrong: string;
+  codeBg: string;
+  codeText: string;
+  codeFence: string;
+  diffAddBg: string;
+  diffAddText: string;
+  diffDelBg: string;
+  diffDelText: string;
+}
+
+/** Blessed tags quantize hex colors to the terminal palette; chalk's
+ * truecolor SGR sequences are dropped by Blessed's attribute parser, which is
+ * why highlights previously rendered as plain white. */
+export const DEFAULT_MARKDOWN_THEME: MarkdownTheme = {
   text: '#d7e0ea',
   muted: '#7f92a6',
   accent: '#6fb1d6',
-  accentStrong: '#8ac3e6',
+  heading: '#8ac3e6',
+  headingStrong: '#d7e0ea',
   codeBg: '#16212d',
   codeText: '#c7d7e6',
   codeFence: '#5f7388',
-  codeGreen: '#8ebd93',
-  codeRed: '#c97c7c',
-} as const;
+  diffAddBg: '#10281a',
+  diffAddText: '#9fd0a6',
+  diffDelBg: '#2b1215',
+  diffDelText: '#d99f9f',
+};
 
-export type DiffKind = 'add' | 'del' | 'hunk' | 'file' | 'context';
+let currentTheme: MarkdownTheme = DEFAULT_MARKDOWN_THEME;
+
+export function setMarkdownTheme(theme: MarkdownTheme): void {
+  currentTheme = theme;
+}
+
+export function getMarkdownTheme(): MarkdownTheme {
+  return currentTheme;
+}
+
+/** Blessed reserves braces for style tags; escape literal ones. */
+export function escapeTags(text: string): string {
+  return text.replace(/{/g, '{open}').replace(/}/g, '{close}');
+}
+
+function fg(color: string, text: string): string {
+  return `{${color}-fg}${text}{/${color}-fg}`;
+}
+
+/** Italic and strikethrough are not Blessed flags; raw SGR is honored by the
+ * content parser and excluded from width measurement. */
+function italic(text: string): string {
+  return `\x1b[3m${text}\x1b[23m`;
+}
+
+function strike(text: string): string {
+  return `\x1b[9m${text}\x1b[29m`;
+}
 
 function isDiffLanguage(lang: string): boolean {
   return lang.toLowerCase() === 'diff' || lang.toLowerCase() === 'patch';
@@ -34,23 +83,24 @@ export function diffKind(line: string): DiffKind {
 }
 
 export function renderDiffLine(line: string): string {
+  const theme = getMarkdownTheme();
   switch (diffKind(line)) {
     case 'add':
-      return chalk.hex(MARKDOWN_THEME.codeGreen)(line);
+      return fg(theme.diffAddText, escapeTags(line));
     case 'del':
-      return chalk.hex(MARKDOWN_THEME.codeRed)(line);
+      return fg(theme.diffDelText, escapeTags(line));
     case 'hunk':
-      return chalk.hex(MARKDOWN_THEME.accent)(line);
+      return fg(theme.accent, escapeTags(line));
     case 'file':
-      return chalk.bold.hex(MARKDOWN_THEME.text)(line);
+      return fg(theme.text, escapeTags(line));
     case 'context':
     default:
-      return chalk.hex(MARKDOWN_THEME.muted)(line);
+      return fg(theme.muted, escapeTags(line));
   }
 }
 
 function renderCodeLine(lang: string, line: string): string {
-  return isDiffLanguage(lang) ? renderDiffLine(line) : chalk.hex(MARKDOWN_THEME.codeText)(line);
+  return isDiffLanguage(lang) ? renderDiffLine(line) : fg(getMarkdownTheme().codeText, escapeTags(line));
 }
 
 // ── GFM pipe tables ──────────────────────────────────────────────────────────
@@ -64,10 +114,12 @@ export interface GfmTable {
 }
 
 const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
+const TAG_PATTERN = /\{[^{}]*\}/g;
 
-/** Display width ignoring ANSI escapes, counting East-Asian wide chars as 2 columns. */
+/** Display width ignoring ANSI escapes and style tags, counting East-Asian
+ * wide chars as 2 columns. */
 export function displayWidth(text: string): number {
-  const clean = text.replace(ANSI_PATTERN, '');
+  const clean = text.replace(ANSI_PATTERN, '').replace(TAG_PATTERN, '');
   let width = 0;
   for (const ch of clean) {
     const code = ch.codePointAt(0)!;
@@ -144,6 +196,7 @@ function truncateToWidth(text: string, maxWidth: number): string {
 
 /** Render a parsed table as aligned monospace lines that fit within maxWidth columns. */
 export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
+  const theme = getMarkdownTheme();
   const columns = table.header.length;
   const gap = ' │ ';
   const gapWidth = displayWidth(gap);
@@ -165,42 +218,45 @@ export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
       overflow -= reduce;
     }
   }
-  const padCell = (rendered: string, width: number, align: TableAlign): string => {
-    const padding = Math.max(0, width - displayWidth(rendered));
-    if (align === 'right') return ' '.repeat(padding) + rendered;
+  const padCell = (plain: string, width: number, align: TableAlign): string => {
+    const padding = Math.max(0, width - displayWidth(plain));
+    if (align === 'right') return ' '.repeat(padding) + plain;
     if (align === 'center') {
       const left = Math.floor(padding / 2);
-      return ' '.repeat(left) + rendered + ' '.repeat(padding - left);
+      return ' '.repeat(left) + plain + ' '.repeat(padding - left);
     }
-    return rendered + ' '.repeat(padding);
+    return plain + ' '.repeat(padding);
   };
-  const renderRow = (cells: string[], style: (cell: string) => string): string => cells
+  // Pad the plain cell first, then style — so padding never measures tags.
+  const renderRow = (cells: string[], style: (plain: string) => string): string => cells
     .map((cell, index) => {
       const width = widths[index]!;
       const plain = displayWidth(cell) > width ? truncateToWidth(cell, width) : cell;
-      return padCell(style(plain), width, table.aligns[index]!);
+      return style(padCell(plain, width, table.aligns[index]!));
     })
-    .join(chalk.hex(MARKDOWN_THEME.muted)(gap));
+    .join(fg(theme.muted, gap));
 
-  const header = renderRow(table.header, (cell) => chalk.bold.hex(MARKDOWN_THEME.accent)(inlineMarkdown(cell)));
+  const header = renderRow(table.header, (plain) => fg(theme.accent, `{bold}${inlineMarkdown(plain)}{/bold}`));
   // One uniform border color for every structural character (│, ─, ┼).
-  const separator = chalk.hex(MARKDOWN_THEME.muted)(widths.map((width) => '─'.repeat(width)).join('─┼─'));
-  const body = table.rows.map((row) => renderRow(row, (cell) => inlineMarkdown(cell)));
-  return [header, chalk.hex(MARKDOWN_THEME.muted)(separator), ...body];
+  const separator = fg(theme.muted, widths.map((width) => '─'.repeat(width)).join('─┼─'));
+  const body = table.rows.map((row) => renderRow(row, (plain) => inlineMarkdown(plain)));
+  return [header, separator, ...body];
 }
 
 export function inlineMarkdown(text: string): string {
-  return text
-    .replace(/\*\*\*(.+?)\*\*\*/g, (_m, t: string) => chalk.bold.italic(t))
-    .replace(/\*\*(.+?)\*\*/g,     (_m, t: string) => chalk.bold(t))
-    .replace(/__(.+?)__/g,         (_m, t: string) => chalk.bold(t))
-    .replace(/\*(.+?)\*/g,         (_m, t: string) => chalk.italic(t))
-    .replace(/_(.+?)_/g,           (_m, t: string) => chalk.italic(t))
-    .replace(/`([^`]+)`/g,         (_m, t: string) => chalk.bgHex(MARKDOWN_THEME.codeBg).hex(MARKDOWN_THEME.codeText)(` ${t} `))
-    .replace(/~~(.+?)~~/g,         (_m, t: string) => chalk.strikethrough(t));
+  const theme = getMarkdownTheme();
+  return escapeTags(text)
+    .replace(/\*\*\*(.+?)\*\*\*/g, (_m, t: string) => `{bold}${italic(t)}{/bold}`)
+    .replace(/\*\*(.+?)\*\*/g,     (_m, t: string) => `{bold}${t}{/bold}`)
+    .replace(/__(.+?)__/g,         (_m, t: string) => `{bold}${t}{/bold}`)
+    .replace(/\*(.+?)\*/g,         (_m, t: string) => italic(t))
+    .replace(/_(.+?)_/g,           (_m, t: string) => italic(t))
+    .replace(/`([^`]+)`/g,         (_m, t: string) => `{${theme.codeBg}-bg}{${theme.codeText}-fg} ${t} {/${theme.codeText}-fg}{/${theme.codeBg}-bg}`)
+    .replace(/~~(.+?)~~/g,         (_m, t: string) => strike(t));
 }
 
 export function renderMarkdown(text: string, cols = 80): string {
+  const theme = getMarkdownTheme();
   const lines = text.split('\n');
   const out: string[] = [];
   let inCodeBlock = false;
@@ -217,12 +273,12 @@ export function renderMarkdown(text: string, cols = 80): string {
         codeLines = [];
       } else {
         inCodeBlock = false;
-        const langLabel = codeLang ? chalk.hex(MARKDOWN_THEME.muted).italic(` ${codeLang}`) : '';
-        out.push(chalk.hex(MARKDOWN_THEME.codeFence)('┌' + '─'.repeat(Math.max(2, cols - 2))) + langLabel);
+        const langLabel = codeLang ? fg(theme.muted, italic(` ${escapeTags(codeLang)}`)) : '';
+        out.push(fg(theme.codeFence, '┌' + '─'.repeat(Math.max(2, cols - 2))) + langLabel);
         for (const cl of codeLines) {
-          out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + renderCodeLine(codeLang, cl));
+          out.push(fg(theme.codeFence, '│ ') + renderCodeLine(codeLang, cl));
         }
-        out.push(chalk.hex(MARKDOWN_THEME.codeFence)('└' + '─'.repeat(Math.max(2, cols - 2))));
+        out.push(fg(theme.codeFence, '└' + '─'.repeat(Math.max(2, cols - 2))));
         codeLang = '';
         codeLines = [];
       }
@@ -233,12 +289,12 @@ export function renderMarkdown(text: string, cols = 80): string {
     const h1 = raw.match(/^# (.+)/);
     const h2 = raw.match(/^## (.+)/);
     const h3 = raw.match(/^### (.+)/);
-    if (h1) { out.push('\n' + chalk.bold.hex(MARKDOWN_THEME.accentStrong)(h1[1]!)); continue; }
-    if (h2) { out.push('\n' + chalk.bold.hex(MARKDOWN_THEME.text)(h2[1]!)); continue; }
-    if (h3) { out.push(chalk.bold(h3[1]!)); continue; }
+    if (h1) { out.push('\n' + fg(theme.heading, `{bold}${escapeTags(h1[1]!)}{/bold}`)); continue; }
+    if (h2) { out.push('\n' + fg(theme.headingStrong, `{bold}${escapeTags(h2[1]!)}{/bold}`)); continue; }
+    if (h3) { out.push(`{bold}${escapeTags(h3[1]!)}{/bold}`); continue; }
 
     if (/^---+$/.test(raw) || /^\*\*\*+$/.test(raw)) {
-      out.push(chalk.hex(MARKDOWN_THEME.muted)('─'.repeat(cols)));
+      out.push(fg(theme.muted, '─'.repeat(cols)));
       continue;
     }
 
@@ -251,7 +307,7 @@ export function renderMarkdown(text: string, cols = 80): string {
 
     const bullet = raw.match(/^(\s*)[*\-+] (.+)/);
     if (bullet) {
-      out.push((bullet[1] ?? '') + chalk.hex(MARKDOWN_THEME.accent)('•') + ' ' + inlineMarkdown(bullet[2] ?? ''));
+      out.push((bullet[1] ?? '') + fg(theme.accent, '•') + ' ' + inlineMarkdown(bullet[2] ?? ''));
       continue;
     }
 
@@ -259,7 +315,7 @@ export function renderMarkdown(text: string, cols = 80): string {
     if (numbered) {
       out.push(
         (numbered[1] ?? '') +
-          chalk.hex(MARKDOWN_THEME.accent)(numbered[2]! + '.') +
+          fg(theme.accent, escapeTags(numbered[2]! + '.')) +
           ' ' +
           inlineMarkdown(numbered[3] ?? ''),
       );
@@ -267,17 +323,17 @@ export function renderMarkdown(text: string, cols = 80): string {
     }
 
     const bq = raw.match(/^> (.+)/);
-    if (bq) { out.push(chalk.hex(MARKDOWN_THEME.muted)('│ ') + chalk.italic.hex(MARKDOWN_THEME.muted)(bq[1]!)); continue; }
+    if (bq) { out.push(fg(theme.muted, '│ ') + fg(theme.muted, italic(escapeTags(bq[1]!)))); continue; }
 
     out.push(inlineMarkdown(raw));
   }
 
   if (inCodeBlock && codeLines.length > 0) {
-    out.push(chalk.hex(MARKDOWN_THEME.codeFence)('┌─'));
+    out.push(fg(theme.codeFence, '┌─'));
     for (const cl of codeLines) {
-      out.push(chalk.hex(MARKDOWN_THEME.codeFence)('│ ') + renderCodeLine(codeLang, cl));
+      out.push(fg(theme.codeFence, '│ ') + renderCodeLine(codeLang, cl));
     }
-    out.push(chalk.hex(MARKDOWN_THEME.codeFence)('└─'));
+    out.push(fg(theme.codeFence, '└─'));
   }
 
   return out.join('\n');

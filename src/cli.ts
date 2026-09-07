@@ -12,7 +12,7 @@ import { CODER_VERSION } from './version.js';
 
 async function main(): Promise<void> {
   const program = new Command();
-  program.name('coder').description('Document-driven coding agent runtime').version(CODER_VERSION);
+  program.name('maw').description('Document-driven coding agent runtime').version(CODER_VERSION);
   program.allowExcessArguments(false).showSuggestionAfterError();
   program.option('--model <name>', 'default model name or .agentrc alias');
 
@@ -74,7 +74,7 @@ async function main(): Promise<void> {
     });
 
   program.action(async () => {
-    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Interactive mode requires a terminal. Use coder run --prompt "..." for non-interactive execution.');
+    if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Interactive mode requires a terminal. Use maw run --prompt "..." for non-interactive execution.');
     await runtime.whenReady();
     const requested = selectedFromCli();
     const selected = resolveModelConfig(config, requested);

@@ -10,6 +10,11 @@ import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
+import { diffPreview, elapsedLabel, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries } from './tui-design.js';
+import { recordTimeline } from '../runtime/session-timeline.js';
+import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
+import type { TuiThemeColors, Tone } from './theme.js';
+import { resetTuiMarkdownCache } from './markdown.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 type Provider = {
@@ -43,20 +48,9 @@ const PROVIDERS: Provider[] = [
   { id: 'custom', label: 'Custom · OpenAI compatible', backend: 'openai', baseUrl: '', needsKey: false },
 ];
 
-const COLOR = {
-  // Stick to the ANSI palette so Windows consoles do not quantize custom RGB
-  // values into black. In blessed, `gray` is bright-black (color 8), so it can
-  // disappear on a black background; `white` is the readable 8-color fallback.
-  background: 'black', panel: 'black', elevated: 'black', line: 'gray',
-  text: 'light-white', muted: 'white', accent: 'light-cyan', green: 'light-green',
-  amber: 'light-yellow', red: 'light-red', violet: 'light-magenta',
-};
+const COLOR = (): TuiThemeColors => activeTuiTheme().ui;
 
-const STATUS: Record<string, { icon: string; color: string }> = {
-  queued: { icon: '○', color: COLOR.muted }, running: { icon: '●', color: COLOR.accent },
-  idle: { icon: '✓', color: COLOR.green }, waiting: { icon: '◌', color: COLOR.amber },
-  failed: { icon: '!', color: COLOR.red }, cancelled: { icon: '×', color: COLOR.muted },
-};
+const TONE_COLOR = (tone: Tone): string => COLOR()[tone];
 
 function oneLine(value: string | undefined, max = 72): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
@@ -75,7 +69,7 @@ function providerName(config: AgentModelConfig): string {
   return 'OpenAI compatible';
 }
 
-async function fetchRemoteModels(baseUrl: string, apiKey: string | undefined, backend: AgentModelConfig['backend']): Promise<string[]> {
+async function fetchRemoteModels(baseUrl: string, apiKey: string | undefined, backend: AgentModelConfig['backend']): Promise<{ models: string[]; error?: string }> {
   try {
     const trimmed = baseUrl.replace(/\/+$/, '');
     const url = backend === 'anthropic' ? `${trimmed}/v1/models` : backend === 'ollama' ? `${trimmed}/v1/models` : `${trimmed}/models`;
@@ -84,15 +78,16 @@ async function fetchRemoteModels(baseUrl: string, apiKey: string | undefined, ba
       : apiKey ? { authorization: `Bearer ${apiKey}` } : {};
     const response = await resilientFetch(url, { headers, retries: 0, timeout: 15000 });
     const body = await response.json() as { data?: Array<{ id?: string }> };
-    return [...new Set((body.data ?? []).map((model) => model.id).filter((id): id is string => Boolean(id)))].sort();
-  } catch {
-    return [];
+    return { models: [...new Set((body.data ?? []).map((model) => model.id).filter((id): id is string => Boolean(id)))].sort() };
+  } catch (error) {
+    return { models: [], error: error instanceof Error ? error.message : String(error) };
   }
 }
 
 export async function runFullscreenTui(runtime: AgentRuntime, options: FullscreenTuiOptions): Promise<void> {
   let sessionId = `session-${Date.now()}`;
   let session = await runtime.openSession(sessionId);
+  const instanceCache = new Map(runtime.listInstances(sessionId).map((instance) => [instance.instanceId, instance]));
   let activeModel = options.modelName;
   let activityVisible = false;
   let composerPinned = true;
@@ -116,13 +111,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     expanded: boolean;
     content: string[];
     status: 'active' | 'completed';
+    startedAt?: number;
+    finishedAt?: number;
   }
   const thinkingBlocks = new Map<string, ThinkingBlock>();
   const thinkingBlockLines = new Map<string, { headerLine: number }>();
+  // Streaming events can batch: a thinking segment may be rendered only after
+  // it already finished, so the start time is tracked per turn, not per block.
+  const thinkingStartedAt = new Map<string, number>();
+  const markThinkingStart = (turnId: string): void => {
+    if (!thinkingStartedAt.has(turnId)) thinkingStartedAt.set(turnId, Date.now());
+  };
   let latestThinkingTurnId: string | undefined;
   let conversationFollowOutput = true;
   let conversationScrollOffset = 0;
   let restoringConversationScroll = false;
+  let conversationDirty = true;
+  let activityDirty = true;
+  let lastLayoutKey = '';
   let composerRow = 0;
   let composerColumn = 0;
   let notice = '';
@@ -134,54 +140,116 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let selection: { start: Point; end: Point; rows: string[][]; left: number; right: number; top: number; bottom: number; dragging: boolean } | undefined;
   const hasSelection = (): boolean => Boolean(selection && (selection.start.x !== selection.end.x || selection.start.y !== selection.end.y));
 
+  const restoreThinking = (): void => {
+    const restored = new Map<string, string>();
+    for (const message of session.messages) {
+      if (message.thinking && message.turnId) restored.set(message.turnId, `${restored.get(message.turnId) ?? ''}${message.thinking}`);
+    }
+    for (const [turnId, thinking] of restored) {
+      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'completed', thinking });
+    }
+  };
+  restoreThinking();
+  setActiveTheme(options.configManager.getConfig().theme);
+
   const screen = blessed.screen({
-    smartCSR: true, fullUnicode: true, title: 'Coder',
-    style: { bg: COLOR.background, fg: COLOR.text },
+    smartCSR: true, fullUnicode: true, title: 'TokenMaw',
+    style: { bg: COLOR().background, fg: COLOR().text },
   });
+  let fullRedrawPending = true;
+  const requestFullRedraw = (): void => { fullRedrawPending = true; };
+  const renderScreen = (): void => {
+    if (fullRedrawPending) {
+      // Blessed's smart CSR occasionally leaves the tail of a wide/long line
+      // behind when an element shrinks or disappears. Reallocating only for
+      // structural transitions clears both its current and previous buffers.
+      screen.realloc();
+      fullRedrawPending = false;
+    }
+    screen.render();
+  };
   const screenBuffer = screen as unknown as { lines: Array<Array<[number, string]> & { dirty: boolean }> };
 
   const statusbar = blessed.box({
     parent: screen, bottom: 0, left: 0, width: '100%', height: 1, tags: true,
-    padding: { left: 1, right: 1 }, style: { bg: COLOR.background, fg: COLOR.muted },
+    padding: { left: 1, right: 1 }, style: { bg: COLOR().background, fg: COLOR().muted },
   });
   const conversation = blessed.box({
     parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
     tags: true, scrollable: true, alwaysScroll: true, keys: true, vi: true, mouse: true, autoFocus: false,
     scrollbar: {
       ch: '│',
-      track: { bg: COLOR.panel },
-      style: { fg: COLOR.muted },
+      track: { bg: COLOR().panel },
+      style: { fg: COLOR().muted },
     },
     padding: { left: 2, right: 2 },
-    style: { bg: COLOR.background, fg: COLOR.text },
+    style: { bg: COLOR().background, fg: COLOR().text },
   });
   const activity = blessed.list({
-    parent: screen, top: 0, right: 0, width: '28%', bottom: 2,
+    parent: screen, top: 3, right: 0, width: '28%', bottom: 2,
     tags: true, keys: true, vi: true, mouse: true,
     scrollable: true, padding: { left: 1, right: 1 },
     style: {
-      bg: COLOR.background, fg: COLOR.muted,
-      selected: { bg: COLOR.elevated, fg: COLOR.accent, bold: true },
+      bg: COLOR().activity, fg: COLOR().muted,
+      selected: { bg: COLOR().elevated, fg: COLOR().accent, bold: true },
     },
   });
   const composer = blessed.box({
     parent: screen, bottom: 1, left: 3, width: '100%-4', height: 2,
     input: true, keys: true, mouse: true, padding: { left: 0, right: 1 },
-    style: { bg: COLOR.background, fg: COLOR.text },
+    style: { bg: COLOR().composer, fg: COLOR().text },
   });
   const divider = blessed.box({
     parent: screen, bottom: 3, left: 1, width: '100%-2', height: 1,
-    style: { fg: COLOR.line, bg: COLOR.background },
+    style: { fg: COLOR().line, bg: COLOR().background },
   });
   const composerPrompt = blessed.box({
     parent: screen, bottom: 1, left: 1, width: 2, height: 2,
-    content: '›', style: { bg: COLOR.background, fg: COLOR.accent },
+    content: '›', style: { bg: COLOR().composer, fg: COLOR().accent },
   });
   const completions = blessed.list({
     parent: screen, left: 2, bottom: 4, width: '100%-4', height: 5,
     hidden: true, tags: true, mouse: true, keys: false, autoFocus: false,
-    style: { bg: COLOR.panel, fg: COLOR.muted, selected: { fg: COLOR.accent, bold: true } },
+    padding: { left: 1, right: 1 },
+    style: { bg: COLOR().panel, fg: COLOR().muted, selected: { bg: COLOR().elevated, fg: COLOR().accent, bold: true } },
   });
+  const activityHeader = blessed.box({
+    parent: screen, top: 0, right: 0, width: '28%', height: 3, hidden: true, tags: true,
+    padding: { left: 1, right: 1 }, style: { bg: COLOR().activity, fg: COLOR().text },
+  });
+  let activityDetail: { instanceId: string; modal: blessed.Widgets.BoxElement; body: blessed.Widgets.BoxElement } | undefined;
+
+  // Persistent widgets capture style objects at creation time; a theme switch
+  // must patch them in place so the repaint picks up the new palette.
+  const applyWidgetTheme = (): void => {
+    const c = COLOR();
+    statusbar.style.bg = c.background;
+    statusbar.style.fg = c.muted;
+    conversation.style.bg = c.background;
+    conversation.style.fg = c.text;
+    const scrollbar = (conversation as unknown as { scrollbar?: { track?: { bg?: string }; style?: { fg?: string } } }).scrollbar;
+    if (scrollbar) {
+      scrollbar.track = scrollbar.track ?? {};
+      scrollbar.track.bg = c.panel;
+      scrollbar.style = scrollbar.style ?? {};
+      scrollbar.style.fg = c.muted;
+    }
+    activity.style.bg = c.activity;
+    activity.style.fg = c.muted;
+    activity.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
+    composer.style.bg = c.composer;
+    composer.style.fg = c.text;
+    divider.style.fg = c.line;
+    divider.style.bg = c.background;
+    composerPrompt.style.bg = c.composer;
+    composerPrompt.style.fg = c.accent;
+    completions.style.bg = c.panel;
+    completions.style.fg = c.muted;
+    completions.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
+    activityHeader.style.bg = c.activity;
+    activityHeader.style.fg = c.text;
+  };
+  applyWidgetTheme();
 
   screen.program.setMouse({ vt200Mouse: true, sgrMouse: true, utfMouse: false, cellMotion: true, allMotion: true }, true);
 
@@ -218,22 +286,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const query = composerValue();
     if (query !== completionQuery) { completionIndex = 0; completionQuery = query; }
     const matches = query === dismissedCompletion ? [] : commandMatches(query);
+    const completionsWereHidden = completions.hidden;
     if (!matches.length) completions.hide();
     else {
       completions.bottom = height + 2;
       completions.height = Math.min(matches.length, 6, Math.max(1, Number(screen.height) - height - 3));
       completionIndex = Math.min(completionIndex, matches.length - 1);
-      completions.setItems(matches.map((item) => `${item.name.padEnd(12)} ${item.description}`));
+      completions.setItems(matches.map((item) => `{${COLOR().accent}-fg}${safe(item.name.padEnd(12))}{/${COLOR().accent}-fg} {${COLOR().muted}-fg}${safe(item.description)}{/${COLOR().muted}-fg}`));
       completions.select(completionIndex);
       completions.show();
       completions.setFront();
     }
+    if (completionsWereHidden !== completions.hidden) requestFullRedraw();
   };
 
   const renderComposerFrame = (): void => {
     renderComposer();
     screen.program.hideCursor();
-    screen.render();
+    renderScreen();
     placeComposerCursor();
     screen.program.showCursor();
   };
@@ -317,8 +387,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       }
       if (nativeSelection || hasSelection()) return;
       spinnerFrame = (spinnerFrame + 1) % 20;
+      conversationDirty = true;
       scheduleRefresh();
-    }, 120);
+    }, 800);
     spinnerTimer.unref?.();
   };
 
@@ -335,23 +406,38 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     renderComposerFrame();
   };
 
-  const choose = (title: string, items: string[]): Promise<number> => new Promise((resolveChoice) => {
+  type ChoiceItem = string | { label: string; detail?: string };
+  const choose = (title: string, items: ChoiceItem[]): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
-      const width = Math.min(Number(screen.width), 88, Math.max(32, ...items.map((item) => item.length + 8)));
+    const renderedItems = items.map((item) => typeof item === 'string'
+      ? safe(item)
+      : `{bold}${safe(item.label)}{/bold}${item.detail ? `  {${COLOR().muted}-fg}${safe(item.detail)}{/${COLOR().muted}-fg}` : ''}`);
+    const itemWidths = items.map((item) => typeof item === 'string' ? item.length : Math.max(item.label.length, item.detail?.length ?? 0));
+    const width = Math.min(Math.max(28, Number(screen.width) - 4), 82, Math.max(36, ...itemWidths.map((item) => item + 8)));
+    const height = Math.min(items.length + 4, 22, Math.max(6, Number(screen.height) - 2));
     const modal = blessed.box({
-      parent: screen, top: 'center', left: 'center', width, height: Math.min(items.length + 4, 22, Number(screen.height)),
-      label: ` ${title} `, border: { type: 'line' },
-      style: { bg: COLOR.background, fg: COLOR.text, border: { fg: COLOR.line }, label: { fg: COLOR.accent } },
+      parent: screen, top: 'center', left: 'center', width, height,
+      tags: true, style: { bg: COLOR().modal, fg: COLOR().text },
+    });
+    const heading = blessed.box({
+      parent: modal, top: 0, left: 1, right: 1, height: 1, tags: true,
+      content: `{bold}${safe(title)}{/bold}`, style: { bg: COLOR().modal, fg: COLOR().text },
+    });
+    const rule = blessed.box({
+      parent: modal, top: 1, left: 1, right: 1, height: 1, tags: true,
+      content: `{${COLOR().modalRule}-fg}${'─'.repeat(Math.max(0, width - 2))}{/${COLOR().modalRule}-fg}`,
+      style: { bg: COLOR().modal, fg: COLOR().modalRule },
     });
     const list = blessed.list({
-      parent: modal, top: 1, left: 1, right: 1, bottom: 1, items, keys: true, vi: true, mouse: true,
-      scrollable: true, style: { bg: COLOR.background, fg: COLOR.text, selected: { bg: COLOR.elevated, fg: COLOR.text, bold: true } },
+      parent: modal, top: 2, left: 1, right: 1, bottom: 1, items: renderedItems, tags: true, keys: true, vi: true, mouse: true,
+      scrollable: true, style: { bg: COLOR().modal, fg: COLOR().text, selected: { bg: COLOR().modal, fg: COLOR().accent, bold: true } },
     });
     let done = false;
     const finish = (value: number): void => {
       if (done) return;
       done = true;
       modal.destroy();
+      requestFullRedraw();
       composerPinned = true;
       focusComposer();
       resolveChoice(value);
@@ -359,42 +445,72 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     list.on('select', (_item, index) => finish(index));
     list.key(['escape', 'q'], () => finish(-1));
     list.focus();
-    screen.render();
+    void heading;
+    void rule;
+    renderScreen();
   });
 
   const ask = (label: string, initial = '', secret = false): Promise<string> => new Promise((resolveAnswer) => {
     composerPinned = false;
-    const prompt = blessed.prompt({
-      parent: screen, top: 'center', left: 'center', width: '72%', height: 7,
-      label: ` ${label} `, border: { type: 'line' },
-      style: { bg: COLOR.background, fg: COLOR.text, border: { fg: COLOR.line }, label: { fg: COLOR.accent } },
+    const width = Math.min(76, Math.max(28, Number(screen.width) - 4));
+    const modal = blessed.box({
+      parent: screen, top: 'center', left: 'center', width, height: 7,
+      style: { bg: COLOR().modal, fg: COLOR().text },
     });
-    if (secret) (prompt as unknown as { _: { input: { censor: boolean } } })._.input.censor = true;
-    prompt.input(label, initial, (_error, value) => {
-      prompt.destroy();
+    blessed.box({
+      parent: modal, top: 0, left: 1, right: 1, height: 1, tags: true,
+      content: `{bold}${safe(label)}{/bold}`, style: { bg: COLOR().modal, fg: COLOR().text },
+    });
+    blessed.box({
+      parent: modal, top: 1, left: 1, right: 1, height: 1,
+      content: '─'.repeat(Math.max(0, width - 2)), style: { bg: COLOR().modal, fg: COLOR().modalRule },
+    });
+    const input = blessed.textbox({
+      parent: modal, top: 3, left: 1, right: 1, height: 1,
+      inputOnFocus: true, keys: true, mouse: true, censor: secret,
+      style: { bg: COLOR().modal, fg: COLOR().text, focus: { bg: COLOR().modal, fg: COLOR().text } },
+    });
+    blessed.box({
+      parent: modal, bottom: 0, left: 1, right: 1, height: 1,
+      content: 'Enter confirm  ·  Esc cancel', style: { bg: COLOR().modal, fg: COLOR().modalRule },
+    });
+    input.setValue(initial);
+    let done = false;
+    const finish = (value: string): void => {
+      if (done) return;
+      done = true;
+      modal.destroy();
+      requestFullRedraw();
       composerPinned = true;
       focusComposer();
-      resolveAnswer(String(value ?? '').trim());
-    });
+      resolveAnswer(value.trim());
+    };
+    input.on('submit', (value) => finish(String(value ?? '')));
+    input.on('cancel', () => finish(''));
+    input.key('escape', () => finish(''));
+    input.focus();
+    input.readInput();
+    renderScreen();
   });
 
-  const instances = (): AgentInstance[] => runtime.listInstances(sessionId);
+  const instances = (): AgentInstance[] => [...instanceCache.values()];
 
   const depthPrefix = (instance: AgentInstance): string => {
-    const status = STATUS[instance.status] ?? STATUS.idle!;
-    return `${'  '.repeat(instance.depth)}{${status.color}-fg}${status.icon}{/${status.color}-fg}`;
+    const status = STATUS_PRESENTATION[instance.status];
+    const color = TONE_COLOR(status.tone);
+    return `${'  '.repeat(instance.depth)}{${color}-fg}${status.icon}{/${color}-fg}`;
   };
 
   const renderStatus = (): void => {
     const active = instances().filter((item) => item.status === 'running' || item.status === 'waiting' || item.status === 'queued').length;
-    const activityText = active ? ` · ${active} active` : '';
+    const activityText = active ? `${active} active` : 'Ready';
     const width = Math.max(1, Number(screen.width) - 2);
-    const left = `coder · ${activeModel}`;
-    const right = `${sessionId}${activityText}`;
+    const left = `maw  ${activeModel}`;
+    const right = Number(screen.width) >= 78 ? `${activityText}  ·  Ctrl+K commands` : activityText;
     const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(right));
     statusbar.setContent(gap >= 3
-      ? `{${COLOR.accent}-fg}coder{/${COLOR.accent}-fg} · ${safe(activeModel)}${' '.repeat(gap)}${safe(right)}`
-      : `{${COLOR.accent}-fg}coder{/${COLOR.accent}-fg} · ${safe(activeModel)}${activityText}`);
+      ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}${' '.repeat(gap)}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(right)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
+      : `{bold}maw{/bold}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}`);
   };
 
   const conversationAtBottom = (): boolean => {
@@ -416,20 +532,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const renderConversation = (): void => {
-    session = runtime.getSession(sessionId) ?? session;
-    for (const message of session.messages) {
-      if (message.thinking && message.turnId && !thinkingBlocks.has(message.turnId)) {
-        const thinking = session.messages.filter((item) => item.turnId === message.turnId).map((item) => item.thinking ?? '').join('');
-        thinkingBlocks.set(message.turnId, { turnId: message.turnId, expanded: false, content: [], status: 'completed', thinking });
-      }
-    }
+    if (!conversationDirty) return;
     const previousScrollOffset = conversationScrollOffset;
     const shouldFollowOutput = conversationFollowOutput;
     conversationLines = [];
     lineCursor = 0;
-    const lines = conversationLines;
     const screenWidth = typeof screen.width === 'number' ? screen.width : 80;
-    const markdownCols = Math.max(10, Math.min(120, screenWidth - (activityVisible ? Math.min(36, Math.floor(screenWidth * 0.35)) : 0) - 6));
+    const metrics = tuiLayout(screenWidth, activityVisible);
+    const markdownCols = Math.max(10, Math.min(120, metrics.conversationWidth - metrics.horizontalPadding * 2 - 2));
     thinkingBlockLines.clear();
     const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0;
     if (welcomeVisible) {
@@ -451,17 +561,33 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
     const renderedBlocks = new Set<string>();
     if (session.timeline) {
-      for (const entry of session.timeline) {
+      const { entries: visibleTimeline, omitted } = visibleTimelineEntries(session.timeline);
+      if (omitted) {
+        pushConversationLine(`{${COLOR().subtle}-fg}  ${omitted} earlier activity entries omitted from this view{/${COLOR().subtle}-fg}`);
+        pushConversationLine('');
+      }
+      for (const entry of visibleTimeline) {
         if (entry.kind === 'message') {
           pushConversationLine('');
-          pushConversationLine(entry.role === 'user' ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} ${safe(entry.content)}` : renderTuiMarkdown(entry.content, markdownCols));
+          if (entry.role === 'user') {
+            pushConversationLine(`{${COLOR().accent}-fg}{bold}You{/bold}{/${COLOR().accent}-fg}`);
+            pushConversationLine(safe(entry.content));
+          } else if (entry.role === 'system') {
+            pushConversationLine(`{${COLOR().warning}-fg}! ${safe(entry.content)}{/${COLOR().warning}-fg}`);
+          } else {
+            pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
+            pushConversationLine(renderTuiMarkdown(entry.content, markdownCols));
+          }
           pushConversationLine('');
           continue;
         }
         const expanded = thinkingBlocks.get(entry.id)?.expanded ?? false;
-        const block: ThinkingBlock = { turnId: entry.id, expanded, content: [],
+        const previous = thinkingBlocks.get(entry.id);
+        const block: ThinkingBlock = { turnId: entry.id, expanded, content: previous?.content ?? [],
           status: entry.status === 'running' ? 'active' : 'completed',
-          thinking: entry.kind === 'thinking' ? entry.content : undefined };
+          thinking: entry.kind === 'thinking' ? entry.content : previous?.thinking,
+          startedAt: previous?.startedAt ?? thinkingStartedAt.get(entry.turnId ?? '') ?? (entry.status === 'running' ? Date.now() : undefined),
+          finishedAt: entry.status === 'running' ? undefined : previous?.finishedAt ?? Date.now() };
         thinkingBlocks.set(entry.id, block);
         if (entry.kind === 'thinking') {
           renderThinkingBlock(block);
@@ -469,17 +595,30 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           const headerLine = lineCursor;
           thinkingBlockLines.set(entry.id, { headerLine });
           latestThinkingTurnId = entry.id;
-          const agent = entry.instanceId ? runtime.getInstance(entry.instanceId)?.agentId : undefined;
-          const icon = entry.status === 'running' ? '◌' : entry.status === 'failed' ? '✗' : entry.status === 'cancelled' ? '−' : '✓';
-          const color = entry.status === 'failed' ? COLOR.amber : COLOR.muted;
-          pushConversationLine(`{${color}-fg}${expanded ? '▼' : '▶'} ${icon} ${safe(agent && agent !== 'main' ? `${agent} · ` : '')}${safe(entry.tool ?? '')}  ${safe(oneLine(entry.input, Math.max(20, markdownCols - 30)))}{/${color}-fg}`);
+          const agent = entry.instanceId ? instanceCache.get(entry.instanceId)?.agentId : undefined;
+          const state = entry.status === 'running'
+            ? STATUS_PRESENTATION.running
+            : entry.status === 'failed'
+              ? STATUS_PRESENTATION.failed
+              : entry.status === 'cancelled'
+                ? STATUS_PRESENTATION.cancelled
+                : STATUS_PRESENTATION.idle;
+          const color = TONE_COLOR(state.tone);
+          const presentation = toolPresentation(entry.tool ?? '', entry.input);
+          const owner = agent && agent !== 'main' ? `${agent} · ` : '';
+          const detail = presentation.detail ? `  ${oneLine(presentation.detail, Math.max(18, markdownCols - presentation.label.length - owner.length - 12))}` : '';
+          pushConversationLine(`{${color}-fg}${expanded ? '▼' : '▶'} ${state.icon}{/${color}-fg} {${COLOR().muted}-fg}${safe(owner)}${safe(presentation.label)}${safe(detail)}{/${COLOR().muted}-fg}`);
           if (expanded) {
-            pushConversationLine(safe(entry.input ?? ''));
-            pushConversationLine(renderTuiMarkdown(entry.content || 'Running…', markdownCols));
+            if (entry.input) {
+              pushConversationLine(`  {${COLOR().subtle}-fg}Input{/${COLOR().subtle}-fg}`);
+              for (const line of safe(entry.input).split('\n')) pushConversationLine(`  ${line}`);
+            }
+            pushConversationLine(`  {${COLOR().subtle}-fg}${entry.status === 'running' ? 'Output · running' : 'Output'}{/${COLOR().subtle}-fg}`);
+            for (const line of renderTuiMarkdown(entry.content || 'Waiting for output…', Math.max(10, markdownCols - 2)).split('\n')) pushConversationLine(`  ${line}`);
           } else {
             const patch = toolDiff(entry.tool ?? '', entry.content);
-            if (patch) pushConversationLine(renderTuiMarkdown(patch, markdownCols));
-            if (entry.status === 'failed') pushConversationLine(`{${COLOR.amber}-fg}${safe(oneLine(entry.content, markdownCols))}{/${COLOR.amber}-fg}`);
+            if (patch) pushConversationLine(renderTuiMarkdown(diffPreview(patch), markdownCols));
+            if (entry.status === 'failed') pushConversationLine(`  {${COLOR().error}-fg}${safe(oneLine(entry.content, markdownCols - 2))}{/${COLOR().error}-fg}`);
           }
           pushConversationLine('');
         }
@@ -487,16 +626,19 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
     for (const message of session.timeline ? [] : session.messages) {
       const user = message.role === 'user';
-      const prefix = user
-        ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} `
-        : message.role === 'system'
-          ? `{${COLOR.amber}-fg}·{/${COLOR.amber}-fg} `
-          : '';
       const content = message.role === 'assistant'
         ? renderTuiMarkdown(message.content, markdownCols)
         : safe(message.content);
       pushConversationLine('');
-      pushConversationLine(`${prefix}${content}`);
+      if (user) {
+        pushConversationLine(`{${COLOR().accent}-fg}{bold}You{/bold}{/${COLOR().accent}-fg}`);
+        pushConversationLine(content);
+      } else if (message.role === 'assistant') {
+        pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
+        pushConversationLine(content);
+      } else {
+        pushConversationLine(`{${COLOR().warning}-fg}! ${content}{/${COLOR().warning}-fg}`);
+      }
       pushConversationLine('');
       if (message.role === 'user' && message.turnId && thinkingBlocks.has(message.turnId)) {
         renderedBlocks.add(message.turnId);
@@ -506,7 +648,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!session.timeline && pendingTurns.size > 0) {
       const turnId = [...pendingTurns][0];
       if (!thinkingBlocks.has(turnId)) {
-        thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
+        thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+        markThinkingStart(turnId);
       }
       if (!renderedBlocks.has(turnId)) {
         renderThinkingBlock(thinkingBlocks.get(turnId)!);
@@ -515,13 +658,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     for (const [turnId, text] of session.timeline ? [] : streams.entries()) {
       if (!text.trim()) continue;
       pushConversationLine('');
-      pushConversationLine(`{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`);
+      pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
       pushConversationLine(renderTuiMarkdown(text, markdownCols));
       pushConversationLine('');
     }
     if (notice) {
       pushConversationLine('');
-      pushConversationLine(`{${COLOR.amber}-fg}${safe(notice)}{/${COLOR.amber}-fg}`);
+      const noticeColor = /^Error\b|failed/i.test(notice) ? COLOR().error : COLOR().warning;
+      pushConversationLine(`{${noticeColor}-fg}! ${safe(notice)}{/${noticeColor}-fg}`);
       pushConversationLine('');
     }
     restoringConversationScroll = true;
@@ -539,6 +683,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       restoringConversationScroll = false;
     }
     conversationFollowOutput = shouldFollowOutput;
+    conversationDirty = false;
   };
 
   const renderThinkingBlock = (block: ThinkingBlock): void => {
@@ -547,15 +692,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const icon = block.status === 'active'
       ? ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][spinnerFrame % 10]
       : toggle;
-    const color = block.status === 'active' ? COLOR.accent : COLOR.green;
+    const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
     const label = block.thinking
       ? (block.status === 'active' ? 'Thinking' : 'Thought')
       : (block.status === 'active' ? 'Working' : 'Activity');
+    const duration = elapsedLabel(block.startedAt, block.finishedAt);
+    const durationText = duration ? `  ${duration}` : '';
     if (block.status === 'active') {
-      const scanLabel = `{${COLOR.accent}-fg}${label}{/${COLOR.accent}-fg}`;
-      pushConversationLine(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}`);
+      const scanLabel = `{${COLOR().accent}-fg}${label}{/${COLOR().accent}-fg}`;
+      pushConversationLine(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}{${COLOR().subtle}-fg}${durationText}{/${COLOR().subtle}-fg}`);
     } else {
-      pushConversationLine(`{${color}-fg}${icon} ${label}{/${color}-fg}`);
+      pushConversationLine(`{${color}-fg}${icon} ${label}${durationText}{/${color}-fg}`);
     }
     thinkingBlockLines.set(block.turnId, { headerLine });
     latestThinkingTurnId = block.turnId;
@@ -564,7 +711,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         for (const line of safe(block.thinking).split('\n')) pushConversationLine(`  ${line}`);
         pushConversationLine('');
       }
-      const content = block.content.length > 0 ? block.content : block.thinking ? [] : ['No thinking or tool activity received yet.'];
+      const content = block.content.length > 0 ? block.content : block.thinking ? [] : ['Waiting for activity…'];
       for (const c of content) {
         const rendered = c.includes('```diff\n')
           ? renderTuiMarkdown(c, Math.max(10, Number(conversation.width) - 8))
@@ -576,24 +723,50 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const renderActivity = (): void => {
+    if (activityDetail) {
+      const instance = instanceCache.get(activityDetail.instanceId);
+      if (instance) activityDetail.body.setContent(activityDetailContent(instance));
+    }
+    if (!activityDirty) return;
     const current = instances();
+    const activeCount = current.filter((item) => ['running', 'waiting', 'queued'].includes(item.status)).length;
+    activityHeader.setContent(`{bold}Activity{/bold}{${COLOR().muted}-fg}${activeCount ? `  ${activeCount} active` : ''}{/${COLOR().muted}-fg}\n{${COLOR().subtle}-fg}Click an agent to view progress{/${COLOR().subtle}-fg}\n{${COLOR().subtle}-fg}${'─'.repeat(Math.max(0, Number(activity.width) - 2))}{/${COLOR().subtle}-fg}`);
     activity.setItems(current.map((instance) => {
-      const model = runtime.registry.get(instance.agentId)?.model;
-      return `${depthPrefix(instance)} {bold}${safe(instance.agentId)}{/bold}  {${COLOR.muted}-fg}${instance.status}${model ? ` · ${safe(model)}` : ''}{/${COLOR.muted}-fg}\n${'  '.repeat(instance.depth + 1)}${safe(oneLine(instance.lastOutput || instance.lastError || activityLog.get(instance.instanceId)?.at(-1), 36))}`;
+      const state = STATUS_PRESENTATION[instance.status];
+      const summary = instance.lastError || activityLog.get(instance.instanceId)?.at(-1) || instance.lastOutput;
+      const fixedWidth = instance.depth * 2 + instance.agentId.length + state.label.length + 6;
+      const detail = oneLine(summary, Math.max(0, Number(activity.width) - fixedWidth));
+      return `${depthPrefix(instance)} {bold}${safe(instance.agentId)}{/bold}  {${TONE_COLOR(state.tone)}-fg}${state.label}{/${TONE_COLOR(state.tone)}-fg}${detail ? `  {${COLOR().subtle}-fg}${safe(detail)}{/${COLOR().subtle}-fg}` : ''}`;
     }));
+    activityDirty = false;
   };
 
   const layout = (): void => {
-    if (activityVisible) {
+    const metrics = tuiLayout(Number(screen.width), activityVisible);
+    const layoutKey = `${metrics.activity}:${metrics.activityWidth}:${metrics.conversationWidth}:${metrics.horizontalPadding}:${Number(screen.height)}`;
+    if (layoutKey !== lastLayoutKey) {
+      lastLayoutKey = layoutKey;
+      conversationDirty = true;
+      activityDirty = true;
+      requestFullRedraw();
+    }
+    const conversationBox = conversation as blessed.Widgets.BoxElement & { padding: { left: number; right: number } };
+    conversationBox.padding.left = metrics.horizontalPadding;
+    conversationBox.padding.right = metrics.horizontalPadding;
+    if (metrics.activity !== 'hidden') {
       activity.show();
-      const width = Math.min(36, Math.floor(Number(screen.width) * 0.35));
-      activity.width = width;
-      conversation.width = Number(screen.width) - width;
+      activityHeader.show();
+      activity.width = metrics.activityWidth;
+      activityHeader.width = metrics.activityWidth;
+      conversation.width = metrics.conversationWidth;
+      if (metrics.activity === 'overlay') {
+        activity.setFront();
+        activityHeader.setFront();
+      }
     } else {
       activity.hide();
+      activityHeader.hide();
       conversation.width = '100%';
-      composer.width = '100%-4';
-      composerPrompt.left = 1;
     }
     composer.width = '100%-4';
     composerPrompt.left = 1;
@@ -622,7 +795,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const composerFocused = composerPinned;
     if (composerFocused && screen.focused !== composer) composer.focus();
     if (composerFocused) screen.program.hideCursor();
-    screen.render();
+    renderScreen();
     if (composerFocused) {
       placeComposerCursor();
       screen.program.showCursor();
@@ -645,7 +818,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!aliases.length) { await openProvider(); return; }
     const index = await choose('Model', aliases.map((alias) => {
       const entry = config.models?.[alias];
-      return `${alias}${entry ? `  ·  ${providerName(entry)}  ·  ${entry.model}` : ''}${alias === activeModel ? '  ✓' : ''}`;
+      return {
+        label: `${alias}${alias === activeModel ? '  ✓' : ''}`,
+        detail: entry ? `${providerName(entry)} · ${entry.model}` : 'Session model',
+      };
     }));
     if (index >= 0) await applyModel(aliases[index]!);
   };
@@ -664,7 +840,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     } else if (provider.id === 'custom') {
       apiKey = await ask('API key · optional', '', true) || undefined;
     }
-    const remoteModels = await fetchRemoteModels(baseUrl, apiKey, provider.backend);
+    const remoteResult = await fetchRemoteModels(baseUrl, apiKey, provider.backend);
+    const remoteModels = remoteResult.models;
+    if (remoteResult.error) notice = 'Could not load models. Enter a model name manually.';
     let model: string;
     if (remoteModels.length) {
       const index = await choose('Provider model', [...remoteModels, 'Type manually…']);
@@ -719,7 +897,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       { label: '+  Add provider', action: 'add', alias: '' },
       ...(entries.length ? [{ label: '−  Remove provider', action: 'remove', alias: '' }] : []),
     ];
-    const index = await choose('Provider', actions.map((item) => item.label));
+    const index = await choose('Provider', actions.map((item) => {
+      if (item.action === 'add') return { label: 'Add provider', detail: 'Configure a model endpoint' };
+      if (item.action === 'remove') return { label: 'Remove provider', detail: 'Delete a configured endpoint' };
+      const config = options.configManager.getConfig().models?.[item.alias];
+      return { label: `${item.alias}${item.alias === activeModel ? '  ✓' : ''}`, detail: config ? `${providerName(config)} · ${config.model}` : undefined };
+    }));
     if (index < 0) return;
     const selected = actions[index]!;
     if (selected.action === 'select') await applyModel(selected.alias);
@@ -729,7 +912,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const showAgents = async (): Promise<void> => {
     const specs = runtime.listAgentSpecs();
-    const index = await choose('Agent specs', specs.map((spec) => `${spec.id}  ·  ${spec.scope}  ·  ${spec.model ?? 'inherit'}  ·  ${oneLine(spec.description, 42)}`));
+    const index = await choose('Agent specs', specs.map((spec) => ({
+      label: spec.id,
+      detail: `${spec.scope} · ${spec.model ?? 'inherit'} · ${oneLine(spec.description, 42)}`,
+    })));
     if (index < 0) return;
     const spec = specs[index]!;
     await choose(spec.id, [
@@ -745,15 +931,21 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const next = await runtime.openSession(id);
     sessionId = id;
     session = next;
+    instanceCache.clear();
+    for (const instance of runtime.listInstances(id)) instanceCache.set(instance.instanceId, instance);
+    activityDirty = true;
     activeModel = session.defaultModel ?? options.modelName;
     streams.clear();
     activityLog.clear();
     thinkingBlocks.clear();
     thinkingBlockLines.clear();
+    thinkingStartedAt.clear();
     pendingTurns.clear();
     notice = '';
+    conversationDirty = true;
     conversationFollowOutput = true;
     conversationScrollOffset = 0;
+    restoreThinking();
     for (const instance of instances()) {
       if (instance.instanceId === session.mainInstanceId && instance.activeTurnId) pendingTurns.add(instance.activeTurnId);
     }
@@ -763,23 +955,119 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const openSessions = async (): Promise<void> => {
     const sessions = await runtime.listSessions();
-    const index = await choose('Sessions', [...sessions.map((item) => `${item.sessionId}  ·  ${item.messages} messages`), '+  New session']);
+    const index = await choose('Sessions', [
+      ...sessions.map((item) => ({ label: item.sessionId, detail: `${item.messages} messages` })),
+      { label: 'New session', detail: 'Start a blank conversation' },
+    ]);
     if (index < 0) return;
     await switchSession(index === sessions.length ? `session-${Date.now()}` : sessions[index]!.sessionId);
+  };
+
+  const activityDetailContent = (instance: AgentInstance): string => {
+    const state = STATUS_PRESENTATION[instance.status];
+    const stateColor = TONE_COLOR(state.tone);
+    const source = runtime.registry.get(instance.agentId)?.source ?? 'built in';
+    const lines = [
+      `{${stateColor}-fg}${state.icon} ${state.label}{/${stateColor}-fg}  {${COLOR().subtle}-fg}${safe(instance.instanceId.slice(0, 8))}{/${COLOR().subtle}-fg}`,
+      `{${COLOR().subtle}-fg}Source{/${COLOR().subtle}-fg}  ${safe(source)}`,
+      `{${COLOR().subtle}-fg}Updated{/${COLOR().subtle}-fg} ${safe(new Date(instance.updatedAt).toLocaleTimeString())}`,
+      '',
+      '{bold}Progress{/bold}',
+    ];
+    const entries = (session.timeline ?? []).filter((entry) => entry.instanceId === instance.instanceId && entry.kind !== 'message').slice(-30);
+    if (entries.length) {
+      for (const entry of entries) {
+        if (entry.kind === 'thinking') {
+          lines.push(`{${entry.status === 'running' ? COLOR().accent : COLOR().subtle}-fg}… Thinking{/${entry.status === 'running' ? COLOR().accent : COLOR().subtle}-fg}  ${safe(oneLine(entry.content, 140) || 'Waiting…')}`);
+          continue;
+        }
+        const itemState = entry.status === 'running'
+          ? STATUS_PRESENTATION.running
+          : entry.status === 'failed'
+            ? STATUS_PRESENTATION.failed
+            : entry.status === 'cancelled'
+              ? STATUS_PRESENTATION.cancelled
+              : STATUS_PRESENTATION.idle;
+        const presentation = toolPresentation(entry.tool ?? '', entry.input);
+        const detail = presentation.detail || oneLine(entry.content, 120);
+        lines.push(`{${TONE_COLOR(itemState.tone)}-fg}${itemState.icon} ${safe(presentation.label)}{/${TONE_COLOR(itemState.tone)}-fg}${detail ? `  {${COLOR().muted}-fg}${safe(oneLine(detail, 140))}{/${COLOR().muted}-fg}` : ''}`);
+      }
+    } else {
+      const log = activityLog.get(instance.instanceId) ?? [];
+      if (log.length) lines.push(...log.slice(-20).map((item) => `{${COLOR().muted}-fg}· ${safe(item)}{/${COLOR().muted}-fg}`));
+      else lines.push(`{${COLOR().subtle}-fg}No progress events yet.{/${COLOR().subtle}-fg}`);
+    }
+    if (instance.lastError) lines.push('', `{${COLOR().error}-fg}! ${safe(oneLine(instance.lastError, 240))}{/${COLOR().error}-fg}`);
+    else if (instance.lastOutput) lines.push('', `{${COLOR().subtle}-fg}Latest output{/${COLOR().subtle}-fg}`, safe(oneLine(instance.lastOutput, 240)));
+    return lines.join('\n');
   };
 
   const showActivityDetail = async (): Promise<void> => {
     const instance = instances()[selectedActivityIndex];
     if (!instance) return;
-    const log = activityLog.get(instance.instanceId) ?? [];
-    await choose(`${instance.agentId} · ${instance.instanceId.slice(0, 8)}`, [
-      `status  ${instance.status}`,
-      `source  ${runtime.registry.get(instance.agentId)?.source ?? ''}`,
-      ...log.slice(-12),
-      ...(instance.lastOutput ? [`output  ${oneLine(instance.lastOutput, 120)}`] : []),
-      ...(instance.lastError ? [`error   ${oneLine(instance.lastError, 120)}`] : []),
-      'Close',
-    ]);
+    activityDetail?.modal.destroy();
+    composerPinned = false;
+    const width = Math.min(88, Math.max(36, Number(screen.width) - 6));
+    const height = Math.min(24, Math.max(9, Number(screen.height) - 4));
+    const modal = blessed.box({
+      parent: screen, top: 'center', left: 'center', width, height,
+      tags: true, style: { bg: COLOR().modal, fg: COLOR().text },
+    });
+    blessed.box({
+      parent: modal, top: 0, left: 2, right: 2, height: 1, tags: true,
+      content: `{bold}${safe(instance.agentId)} progress{/bold}`,
+      style: { bg: COLOR().modal, fg: COLOR().text },
+    });
+    blessed.box({
+      parent: modal, top: 1, left: 2, right: 2, height: 1,
+      content: '─'.repeat(Math.max(0, width - 4)), style: { bg: COLOR().modal, fg: COLOR().modalRule },
+    });
+    const body = blessed.box({
+      parent: modal, top: 3, left: 2, right: 2, bottom: 2,
+      tags: true, keys: true, vi: true, mouse: true, scrollable: true, alwaysScroll: true,
+      scrollbar: { ch: '│', track: { bg: COLOR().modal }, style: { fg: COLOR().subtle } },
+      style: { bg: COLOR().modal, fg: COLOR().text },
+      content: activityDetailContent(instance),
+    });
+    blessed.box({
+      parent: modal, bottom: 0, left: 2, right: 2, height: 1,
+      content: 'Scroll to browse  ·  Esc close', style: { bg: COLOR().modal, fg: COLOR().subtle },
+    });
+    const closeDetail = (): void => {
+      if (activityDetail?.modal !== modal) return;
+      activityDetail = undefined;
+      modal.destroy();
+      requestFullRedraw();
+      composerPinned = true;
+      focusComposer();
+    };
+    body.key(['escape', 'q'], closeDetail);
+    activityDetail = { instanceId: instance.instanceId, modal, body };
+    body.focus();
+    requestFullRedraw();
+    renderScreen();
+  };
+
+  const applyTheme = async (name: string): Promise<void> => {
+    const next = setActiveTheme(name);
+    resetTuiMarkdownCache();
+    applyWidgetTheme();
+    conversationDirty = true;
+    activityDirty = true;
+    requestFullRedraw();
+    notice = `Theme set to ${next.label}`;
+    await options.configManager.saveConfig({ ...options.configManager.getConfig(), theme: next.name });
+    refresh();
+  };
+
+  const openTheme = async (): Promise<void> => {
+    const current = activeTuiTheme().name;
+    const names = themeNames();
+    const index = await choose('Theme', names.map((name) => ({
+      label: `${name}${name === current ? '  ✓' : ''}`,
+      detail: resolveTheme(name).label,
+    })));
+    if (index >= 0) await applyTheme(names[index]!);
   };
 
   const command = async (raw: string): Promise<void> => {
@@ -788,15 +1076,23 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       case 'provider': await openProvider(); break;
       case 'model': await openModel(); break;
       case 'agents': await showAgents(); break;
+      case 'theme': await openTheme(); break;
       case 'sessions': await openSessions(); break;
       case 'new': await switchSession(`session-${Date.now()}`); break;
       case 'clear':
         await runtime.clearSession(sessionId);
+        session.messages = [];
+        session.timeline = [];
+        instanceCache.clear();
+        for (const instance of runtime.listInstances(sessionId)) instanceCache.set(instance.instanceId, instance);
+        activityDirty = true;
         streams.clear();
         thinkingBlocks.clear();
         thinkingBlockLines.clear();
+        thinkingStartedAt.clear();
         pendingTurns.clear();
         notice = '';
+        conversationDirty = true;
         refresh();
         break;
       case 'cancel': {
@@ -824,17 +1120,29 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const commandPalette = async (): Promise<void> => {
-    const actions = ['Provider', 'Model', 'Agent specs', 'Sessions', 'New session', 'Clear conversation', 'Compact context', 'Toggle activity', 'Exit'];
+    const actions = [
+      { label: 'Provider', detail: 'Manage model endpoints' },
+      { label: 'Model', detail: 'Choose the session model' },
+      { label: 'Theme', detail: 'Switch the color theme' },
+      { label: 'Agent specs', detail: 'Inspect effective roles and permissions' },
+      { label: 'Sessions', detail: 'Open a saved conversation' },
+      { label: 'New session', detail: 'Start a blank conversation' },
+      { label: 'Clear conversation', detail: 'Remove messages from this session' },
+      { label: 'Compact context', detail: 'Archive older model context' },
+      { label: 'Toggle activity', detail: 'Show or hide the agent tree' },
+      { label: 'Exit', detail: 'Close TokenMaw' },
+    ];
     const index = await choose('Command palette', actions);
     if (index === 0) await openProvider();
     if (index === 1) await openModel();
-    if (index === 2) await showAgents();
-    if (index === 3) await openSessions();
-    if (index === 4) await switchSession(`session-${Date.now()}`);
-    if (index === 5) await command('/clear');
-    if (index === 6) await command('/compact');
-    if (index === 7) { activityVisible = !activityVisible; refresh(); }
-    if (index === 8) close();
+    if (index === 2) await openTheme();
+    if (index === 3) await showAgents();
+    if (index === 4) await openSessions();
+    if (index === 5) await switchSession(`session-${Date.now()}`);
+    if (index === 6) await command('/clear');
+    if (index === 7) await command('/compact');
+    if (index === 8) { activityVisible = !activityVisible; refresh(); }
+    if (index === 9) close();
   };
 
   const submit = async (): Promise<void> => {
@@ -852,7 +1160,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         const main = runtime.getInstance(session.mainInstanceId);
         if (main && ['running', 'queued', 'waiting'].includes(main.status)) pendingTurns.add(turnId);
         if (pendingTurns.has(turnId) && !thinkingBlocks.has(turnId)) {
-          thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
+          thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+          markThinkingStart(turnId);
         }
         startSpinner();
         refresh();
@@ -865,17 +1174,36 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const onEvent = (event: AgentEvent): void => {
-    const eventSession = 'sessionId' in event ? event.sessionId : 'instance' in event ? event.instance.sessionId : 'instanceId' in event && event.instanceId ? runtime.getInstance(event.instanceId)?.sessionId : event.type === 'session_opened' ? event.session.sessionId : undefined;
+    const eventSession = 'sessionId' in event ? event.sessionId : 'instance' in event ? event.instance.sessionId : 'instanceId' in event && event.instanceId ? instanceCache.get(event.instanceId)?.sessionId ?? runtime.getInstance(event.instanceId)?.sessionId : event.type === 'session_opened' ? event.session.sessionId : undefined;
     if (eventSession && eventSession !== sessionId) return;
+    if (event.type === 'instance_created' || event.type === 'instance_updated') {
+      instanceCache.set(event.instance.instanceId, event.instance);
+      activityDirty = true;
+    }
+    if (event.type === 'user_message' && !session.messages.some((message) => message.messageId === event.message.messageId)) {
+      session.messages.push({ ...event.message });
+    }
+    if (event.type === 'assistant_message' && !session.messages.some((message) => message.messageId === event.message.messageId)) {
+      session.messages.push({ ...event.message });
+    }
+    recordTimeline(session, event);
     if (event.type === 'thinking_delta') {
+      conversationDirty = true;
+      markThinkingStart(event.turnId);
       const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find((item) => item.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
       if (block) block.thinking = `${block.thinking ?? ''}${event.text}`;
     }
-    if (event.type === 'assistant_delta') streams.set(event.turnId, `${streams.get(event.turnId) ?? ''}${event.text}`);
+    if (event.type === 'assistant_delta') {
+      conversationDirty = true;
+      streams.set(event.turnId, `${streams.get(event.turnId) ?? ''}${event.text}`);
+    }
     if (event.type === 'assistant_message') {
+      conversationDirty = true;
       streams.delete(event.message.turnId ?? '');
     }
     if (event.type === 'tool_started' || event.type === 'tool_finished') {
+      conversationDirty = true;
+      activityDirty = true;
       const log = activityLog.get(event.instanceId) ?? [];
       log.push(`${event.tool}  ${oneLine(event.type === 'tool_started' ? event.input : event.output, 120)}`);
       activityLog.set(event.instanceId, log.slice(-100));
@@ -896,12 +1224,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       }
     }
     if (event.type === 'context_compacted' && event.sessionId === sessionId) {
+      conversationDirty = true;
       const label = event.instanceId === session.mainInstanceId
         ? 'Context compacted'
         : `${runtime.getInstance(event.instanceId)?.agentId ?? 'agent'} context compacted`;
       notice = `${label} (${event.reason}): archived ${event.archivedMessages} messages, ${event.charsBefore} → ${event.charsAfter} chars.`;
     }
     if (event.type === 'runtime_error') {
+      conversationDirty = true;
       if (event.sessionId === sessionId && event.instanceId === session.mainInstanceId) {
         notice = `Error: ${event.error}`;
         pendingTurns.clear();
@@ -911,12 +1241,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (event.type === 'instance_updated' && event.instance.instanceId === session.mainInstanceId
       && event.instance.activeTurnId && ['running', 'waiting'].includes(event.instance.status)) {
       const turnId = event.instance.activeTurnId;
+      conversationDirty = true;
       pendingTurns.clear();
       pendingTurns.add(turnId);
       for (const [id, block] of thinkingBlocks) {
-        if (id !== turnId) { block.status = 'completed'; streams.delete(id); }
+        if (id !== turnId) { block.status = 'completed'; block.finishedAt = Date.now(); streams.delete(id); }
       }
-      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
+      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+      markThinkingStart(turnId);
       startSpinner();
     }
     if (event.type === 'instance_updated'
@@ -924,8 +1256,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       && event.instance.instanceId === session.mainInstanceId
       && ['idle', 'failed', 'cancelled'].includes(event.instance.status)) {
       const block = [...thinkingBlocks.values()].find(b => b.status === 'active');
+      conversationDirty = true;
       if (block) {
         block.status = 'completed';
+        block.finishedAt = Date.now();
       }
       pendingTurns.clear();
       streams.clear();
@@ -962,6 +1296,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
   const toggleActivity = (): void => {
     activityVisible = !activityVisible;
+    requestFullRedraw();
     refresh();
     focusComposer();
   };
@@ -975,6 +1310,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     conversationFollowOutput = false;
     conversationScrollOffset = conversation.childBase;
     block.expanded = !block.expanded;
+    conversationDirty = true;
+    requestFullRedraw();
     refresh();
   };
 
@@ -1026,7 +1363,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   screen.key(['C-y'], () => {
     if (latestThinkingTurnId) toggleThinkingBlock(latestThinkingTurnId);
   });
-  activity.on('click', focusComposer);
+  activity.on('click', (data: { y?: number }) => {
+    const list = activity as unknown as { items: blessed.Widgets.BlessedElement[]; selected: number };
+    const selectedItem = list.items[list.selected];
+    const bounds = selectedItem?.lpos;
+    if (!bounds || data.y === undefined || data.y < bounds.yi || data.y >= bounds.yl) return;
+    selectedActivityIndex = list.selected;
+    runAction(showActivityDetail);
+  });
+  // Blessed routes clicks that land on a rendered list row to the row element
+  // itself; the list only sees the bubbled `element click`. Resolve the row
+  // back to its agent so a click opens that agent's progress directly.
+  activity.on('element click', (el: blessed.Widgets.BlessedElement) => {
+    const list = activity as unknown as { items: blessed.Widgets.BlessedElement[] };
+    const index = list.items.indexOf(el);
+    if (index < 0) return;
+    selectedActivityIndex = index;
+    runAction(showActivityDetail);
+  });
   conversation.on('mousedown', focusConversation);
   conversation.on('wheelup', () => {
     selection = undefined;

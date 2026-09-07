@@ -172,7 +172,7 @@ Web UI 将被完全删除，项目只保留现代化 TUI。
 TUI 不再模拟任务管理器，而采用现代桌面聊天应用布局：
 
 ```text
-┌ Coder · session · model ───────────────────────────────┐
+┌ TokenMaw · session · model ───────────────────────────────┐
 │                                                        │
 │  对话时间线                                             │
 │  用户与 main 的消息、流式输出、轻量状态提示              │
@@ -201,8 +201,8 @@ TUI 不再模拟任务管理器，而采用现代桌面聊天应用布局：
 - 删除 `reception/brain/worker` 和 `roleModels`。
 - `/model` 设置 Session 默认模型；Agent Spec 的 `model` 可以覆盖它。
 - 保留 `/provider` 的用户级 provider 配置。
-- 默认执行 `coder` 进入 TUI。
-- 提供 `coder run --prompt <text>` 作为一次性非交互会话。
+- 默认执行 `maw` 进入 TUI。
+- 提供 `maw run --prompt <text>` 作为一次性非交互会话。
 - 删除 `coder web`、Web API、SSE、静态前端和 Web 测试。
 - 删除旧 `submit/get/execute-plan` 任务协议。
 
@@ -251,7 +251,7 @@ TUI 不再模拟任务管理器，而采用现代桌面聊天应用布局：
 6. [x] 将 CLI 和现代 TUI 切换到新 Runtime。
 7. [x] 删除 Web、旧 coordinator/planner/task 工作流和角色模型配置。
 8. [x] 更新 README、测试和 benchmark 入口。
-9. [x] 执行 typecheck、build、全量测试并重新全局链接 `coder`。
+9. [x] 执行 typecheck、build、全量测试并重新全局链接 `maw`。
 
 以上清单表示本轮已完成。仍未完成的长期事项单独列在下一节，不得把它们误读为已实现。
 

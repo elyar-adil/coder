@@ -1,6 +1,6 @@
-# Coder 自用审计记录（dogfooding issues）
+# TokenMaw 自用审计记录（dogfooding issues）
 
-> 来源：在真实任务中把 Coder 当作日常 agent 使用后的切身体会。
+> 来源：在真实任务中把 TokenMaw 当作日常 agent 使用后的切身体会。
 > 背景：一个"为 TUI 加 Thinking 计时显示"的小任务中，暴露了 edit/搜索/反馈层的多个可靠性问题。
 > 日期：2026-09-07 · 基于 HEAD `8929856`
 

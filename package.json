@@ -1,5 +1,5 @@
 {
-  "name": "top-tier-coding-agent-cli",
+  "name": "tokenmaw",
   "version": "0.3.0",
   "type": "module",
   "files": [
@@ -38,7 +38,10 @@
     "typescript": "^5.6.3"
   },
   "bin": {
+    "maw": "dist/cli.js",
+    "tokenmaw": "dist/cli.js",
     "coder": "dist/cli.js",
     "coding-agent": "dist/cli.js"
-  }
+  },
+  "description": "TUI-first, document-driven multi-agent coding runtime"
 }

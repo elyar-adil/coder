@@ -8,6 +8,150 @@ import blessed from 'blessed';
 import { AgentRuntime } from '../src/runtime/agent-runtime.js';
 import { AgentRuntimeStore } from '../src/runtime/agent-store.js';
 import { runFullscreenTui } from '../src/ui/fullscreen-tui.js';
+import type { AgentConfig } from '../src/config.js';
+
+type TestStream = Generator<{ content: string | null; thinking?: string; done: boolean }> | AsyncGenerator<{ content: string | null; thinking?: string; done: boolean }>;
+
+const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function startTui(options: {
+  modelStream: () => TestStream;
+  config?: AgentConfig;
+}): Promise<{
+  screen: blessed.Widgets.Screen;
+  input: PassThrough & { isTTY: boolean; setRawMode: () => void };
+  savedConfigs: AgentConfig[];
+  finish: () => void;
+  cleanup: () => Promise<void>;
+}> {
+  const root = await mkdtemp(join(tmpdir(), 'coder-tui-'));
+  const input = new PassThrough() as PassThrough & { isTTY: boolean; setRawMode: () => void };
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  const output = new PassThrough() as PassThrough & { columns: number; rows: number; isTTY: boolean };
+  output.columns = 80; output.rows = 24; output.isTTY = true;
+  output.resume();
+  const original = blessed.screen;
+  let screen: blessed.Widgets.Screen | undefined;
+  blessed.screen = ((screenOptions: blessed.Widgets.IScreenOptions) => {
+    screen = original({ ...screenOptions, input, output, terminal: 'windows-ansi' });
+    return screen;
+  }) as typeof blessed.screen;
+  const runtime = new AgentRuntime({
+    store: new AgentRuntimeStore(root),
+    resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+    modelStream: options.modelStream,
+  });
+  let config = options.config ?? {};
+  const savedConfigs: AgentConfig[] = [];
+  let done: Promise<void> | undefined;
+  try {
+    await runtime.whenReady();
+    done = runFullscreenTui(runtime, {
+      modelName: 'test',
+      resolveModel: () => ({ name: 'test', config: { type: 'ollama', baseUrl: 'http://test', model: 'test' } }),
+      configManager: { getConfig: () => config, saveConfig: async (next) => { savedConfigs.push(next); config = next; } },
+    });
+    for (let attempt = 0; !screen && attempt < 100; attempt++) await wait(10);
+    assert.ok(screen);
+    const lockedScreen = screen;
+    return {
+      screen: lockedScreen,
+      input,
+      savedConfigs,
+      finish: () => lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true }),
+      cleanup: async () => {
+        lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+        blessed.screen = original;
+        await runtime.shutdown();
+        input.destroy(); output.destroy();
+        await rm(root, { recursive: true, force: true });
+        await done;
+      },
+    };
+  } catch (error) {
+    blessed.screen = original;
+    await runtime.shutdown();
+    input.destroy(); output.destroy();
+    await rm(root, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+const plainText = (value: string): string => value.replace(/\x1b\[[0-9;]*m/g, '');
+
+test('a finished Thought freezes its duration instead of counting while the turn continues', async () => {
+  let finishGeneration!: () => void;
+  const generationGate = new Promise<void>((resolve) => { finishGeneration = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      yield { content: null, thinking: 'Inspecting the repository. ', done: false };
+      yield { content: 'Working on it.', done: false };
+      await generationGate;
+      yield { content: ' Done', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Thought') && attempt < 100; attempt++) await wait(10);
+    const firstDuration = plainText(conversation.getContent()).match(/Thought\s+(\d+s|\d+m\s+\d+s)/)?.[1];
+    assert.ok(firstDuration, `completed Thought must display its duration, got: ${JSON.stringify(plainText(conversation.getContent()).split('\n').filter((line) => line.includes('Thought')))}`);
+    // Two spinner ticks force re-renders; the frozen duration must not grow.
+    await wait(1700);
+    const secondDuration = plainText(conversation.getContent()).match(/Thought\s+(\d+s|\d+m\s+\d+s)/)?.[1];
+    assert.equal(secondDuration, firstDuration, 'Thought duration must freeze when reasoning completes');
+    finishGeneration();
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Done') && attempt < 100; attempt++) await wait(10);
+  } finally {
+    finishGeneration();
+    await tui.cleanup();
+  }
+});
+
+test('the /theme command repaints every surface with the chosen palette and persists it', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+    config: { theme: 'midnight' },
+  });
+  try {
+    const { screen, input, savedConfigs } = tui;
+    const activity = screen.children.find((child) => child.type === 'list' && child.style.bg === '#11161c') as blessed.Widgets.ListElement;
+    assert.equal(activity.style.bg, '#11161c', 'test setup must start on the midnight theme');
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('/theme');
+    await tick();
+    const suggestions = screen.children.at(-1) as blessed.Widgets.ListElement;
+    assert.ok(suggestions.items.some((item) => item.getContent().includes('/theme')));
+    input.write('\t');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let themeList: blessed.Widgets.ListElement | undefined;
+    for (let attempt = 0; !themeList && attempt < 100; attempt++) {
+      await wait(10);
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => item.getContent().includes('midnight'))) themeList = nested;
+      }
+    }
+    assert.ok(themeList, 'choosing /theme must open the theme picker');
+    themeList.emit('keypress', '', { name: 'down' });
+    await tick();
+    themeList.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; activity.style.bg !== '#333b47' && attempt < 100; attempt++) await wait(10);
+    assert.equal(activity.style.bg, '#333b47', 'activity surface must adopt the nord palette');
+    const composer = screen.children.find((child) => child.style.bg === '#3b4252');
+    assert.ok(composer, 'composer surface must adopt the nord palette');
+    assert.equal(savedConfigs.at(-1)?.theme, 'nord', 'theme choice must persist to config');
+  } finally {
+    await tui.cleanup();
+  }
+});
 
 test('Windows terminal negotiates mouse reporting and handles raw wheel/click input', async () => {
   const root = await mkdtemp(join(tmpdir(), 'coder-tui-'));
@@ -53,6 +197,9 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     });
     for (let attempt = 0; !screen && attempt < 100; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
     assert.ok(screen);
+    let structuralRedraws = 0;
+    const originalRealloc = screen.realloc.bind(screen);
+    screen.realloc = () => { structuralRedraws++; originalRealloc(); };
     screen.program.flush();
     assert.ok(terminalOutput.includes('\x1b[?1000h'), 'Windows terminals must be asked to report mouse buttons and wheel events');
     assert.ok(terminalOutput.includes('\x1b[?1006h'), 'Windows terminals must use SGR mouse coordinates');
@@ -82,8 +229,26 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     screen.emit('key C-b', '', { full: 'C-b', name: 'b', ctrl: true });
     assert.equal(editor.left, 3);
     assert.equal(Number(editor.width), 76);
+    const activity = screen.children.find((child) => child.type === 'list' && child.style.bg === '#11161c') as blessed.Widgets.ListElement;
+    const prompt = screen.children.find((child) => child.getContent() === '›') as blessed.Widgets.BoxElement;
+    assert.equal(editor.style.bg, '#171c23');
+    assert.equal(prompt.style.bg, editor.style.bg, 'prompt and editor paint one continuous input surface');
+    assert.equal(activity.style.bg, '#11161c', 'activity uses a distinct surface color');
+    assert.ok(structuralRedraws > 0, 'opening a structural pane must clear stale terminal cells');
     const conversation = screen.children[1] as blessed.Widgets.BoxElement;
     assert.ok(conversation.getContent().includes('C O D E R'));
+    await mouse(0, 79 - 2, 3);
+    await mouse(0, 79 - 2, 3, true);
+    assert.ok(screen.lines.some((row) => row.map((cell) => cell[1]).join('').includes('main progress')), 'clicking an activity row opens its progress');
+    input.write('\x1b');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    // Dynamic modal rules must be parsed by Blessed rather than displayed as
+    // literal style tags.
+    screen.emit('key C-k', '', { full: 'C-k', name: 'k', ctrl: true });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.doesNotMatch(screen.lines.map((row) => row.map((cell) => cell[1]).join('')).join('\n'), /\{gray-fg\}|\{\/gray-fg\}/);
+    input.write('\x1b');
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.doesNotMatch(conversation.getContent(), /Welcome to Coder|Describe a change|Configure a provider|Commands and shortcuts/);
     editor.emit('keypress', '', { name: 'enter' });
     for (let attempt = 0; !conversation.getContent().includes('History line 79') && attempt < 100; attempt++) await new Promise((resolve) => setTimeout(resolve, 10));
