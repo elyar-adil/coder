@@ -42,6 +42,32 @@ function now(): string {
   return new Date().toISOString();
 }
 
+// ── Context compaction ───────────────────────────────────────────────────────
+
+const COMPACT_SYSTEM_PROMPT = 'You are a context compaction assistant. Produce a faithful, information-dense digest of the archived conversation so a coding agent can continue the work without the original messages. Never invent facts; keep file paths, ids, decisions, and pending work exact.';
+const DEFAULT_COMPACT_KEEP_RECENT = 12;
+const COMPACT_MIN_ARCHIVED_MESSAGES = 6;
+const AUTO_COMPACT_MIN_MESSAGES = 12;
+const DEFAULT_AUTO_COMPACT_RATIO = 0.75;
+const SUMMARY_MESSAGE_SNIPPET_LIMIT = 4000;
+
+function messageSize(message: AgentModelMessage): number {
+  return String(message.content ?? '').length
+    + JSON.stringify(message.tool_calls ?? []).length
+    + JSON.stringify(message.responseItems ?? []).length;
+}
+
+function formatMessageForSummary(index: number, message: AgentModelMessage): string {
+  const header = `[message ${index + 1}] ${message.role}`;
+  const parts: string[] = [];
+  if (message.content) parts.push(String(message.content).slice(0, SUMMARY_MESSAGE_SNIPPET_LIMIT));
+  if (message.tool_calls?.length) {
+    parts.push(message.tool_calls.map((call) => `tool call ${call.function.name}(${String(JSON.stringify(call.function.arguments ?? {})).slice(0, 2000)})`).join('\n'));
+  }
+  if (message.role === 'tool' && message.tool_use_id) parts.push(`(tool result for ${message.tool_use_id})`);
+  return parts.length ? `${header}\n${parts.join('\n')}` : header;
+}
+
 function cloneInstance(instance: AgentInstance): AgentInstance {
   return {
     ...instance,
@@ -97,6 +123,19 @@ const AGENT_TOOL_DEFINITIONS: ToolDefinition[] = [
   toolDefinition('cancel_agent', 'Cancel a related agent instance.', {
     instance_id: { type: 'string', description: 'Target agent instance id.' },
   }, ['instance_id']),
+];
+
+const COMPACT_TOOL_DEFINITIONS: ToolDefinition[] = [
+  toolDefinition('compact_context', 'Compact the conversation context of this agent (default) or a descendant agent instance: older messages are replaced by a model-generated digest, the original messages are archived, and the digest stays in context. Use after completing a major milestone to free context for the next phase.', {
+    instance_id: { type: 'string', description: 'Target agent instance id. Omit to compact your own context.' },
+    focus: { type: 'string', description: 'What the digest should emphasize (goals, decisions, file changes, pending work). Omit for a general digest.' },
+    keep_recent: { type: 'number', description: 'Approximate number of recent messages to keep verbatim. Default 12.' },
+  }, []),
+  toolDefinition('search_history', 'Search the archived (compacted-away) context of this agent (default) or a descendant agent instance. Use this to recall details that were summarized out of context.', {
+    query: { type: 'string', description: 'Case-insensitive text to search for.' },
+    instance_id: { type: 'string', description: 'Target agent instance id. Omit to search your own archives.' },
+    limit: { type: 'number', description: 'Maximum number of matches to return. Default 8.' },
+  }, ['query']),
 ];
 
 export class AgentRuntime {
@@ -259,6 +298,7 @@ export class AgentRuntime {
       main.messages = [];
       main.mailbox = [];
       main.status = 'idle';
+      main.compactionCount = 0;
       main.lastError = undefined;
       main.lastOutput = undefined;
       main.updatedAt = now();
@@ -589,16 +629,17 @@ export class AgentRuntime {
     if (spec.agents.length > 0 && this.registry.allowedAgents(spec).length > 0) {
       tools.push(...AGENT_TOOL_DEFINITIONS);
     }
+    tools.push(...COMPACT_TOOL_DEFINITIONS);
     return tools;
   }
 
   private trimMessages(messages: AgentModelMessage[], config: BackendConfig): AgentModelMessage[] {
-    const budgetChars = Math.max(16_000, Math.floor((config.contextWindow ?? 131_072) * 4 * 0.72));
+    const budgetChars = this.contextBudgetChars(config);
     let total = 0;
     const kept: AgentModelMessage[] = [];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
       const message = messages[index]!;
-      const size = String(message.content ?? '').length + JSON.stringify(message.tool_calls ?? []).length + JSON.stringify(message.responseItems ?? []).length;
+      const size = messageSize(message);
       if (kept.length && total + size > budgetChars) break;
       kept.unshift(message);
       total += size;
@@ -606,6 +647,158 @@ export class AgentRuntime {
     // Tool results must never be sent without their assistant tool-call message.
     while (kept[0]?.role === 'tool') kept.shift();
     return kept;
+  }
+
+  private contextBudgetChars(config: BackendConfig): number {
+    return Math.max(16_000, Math.floor((config.contextWindow ?? 131_072) * 4 * 0.72));
+  }
+
+  private shouldAutoCompact(messages: AgentModelMessage[], config: BackendConfig): boolean {
+    if (messages.length < AUTO_COMPACT_MIN_MESSAGES) return false;
+    const size = messages.reduce((total, message) => total + messageSize(message), 0);
+    const ratio = Number(process.env.AGENT_AUTO_COMPACT_RATIO ?? DEFAULT_AUTO_COMPACT_RATIO);
+    return size > this.contextBudgetChars(config) * ratio;
+  }
+
+  /**
+   * Index where the kept tail must start: at or after `keepRecent` messages back,
+   * advanced to the next `user` message so the tail never begins with a tool
+   * result detached from its assistant tool-call message.
+   */
+  private compactBoundary(messages: AgentModelMessage[], keepRecent: number): number {
+    const start = Math.max(0, messages.length - Math.max(1, keepRecent));
+    for (let index = start; index < messages.length; index += 1) {
+      if (messages[index]!.role === 'user') return index;
+    }
+    return messages.length;
+  }
+
+  private async compactInstanceMessages(
+    instance: AgentInstance,
+    config: BackendConfig,
+    options: { focus?: string; keepRecent?: number; reason: 'auto' | 'manual' },
+    signal?: AbortSignal,
+  ): Promise<{ compacted: boolean; detail: string }> {
+    delete instance.pendingCompact;
+    const keepRecent = Math.max(1, Math.floor(options.keepRecent ?? DEFAULT_COMPACT_KEEP_RECENT));
+    const boundary = this.compactBoundary(instance.messages, keepRecent);
+    const archived = instance.messages.slice(0, boundary);
+    const tail = instance.messages.slice(boundary);
+    if (archived.length < COMPACT_MIN_ARCHIVED_MESSAGES) {
+      return { compacted: false, detail: `Context is too short to compact (need at least ${COMPACT_MIN_ARCHIVED_MESSAGES} older messages before the recent tail).` };
+    }
+    const charsBefore = instance.messages.reduce((total, message) => total + messageSize(message), 0);
+    const transcript = archived
+      .map((message, index) => formatMessageForSummary(index, message))
+      .join('\n');
+    const request = [
+      'Summarize the following earlier conversation for a coding agent that will continue the work with only this digest in context.',
+      'Preserve: the user goals, decisions made, files/paths touched with what changed, important tool results, open questions, and pending work.',
+      options.focus?.trim() ? `Emphasize: ${options.focus.trim()}` : '',
+      'Write the digest in the same language as the conversation. Be thorough but concise.',
+      '',
+      '<archived-conversation>',
+      transcript,
+      '</archived-conversation>',
+    ].filter(Boolean).join('\n');
+
+    let summary = '';
+    for await (const chunk of this.modelStream(config, COMPACT_SYSTEM_PROMPT, [{ role: 'user', content: request }], [], signal)) {
+      if (signal?.aborted) return { compacted: false, detail: 'Compaction cancelled.' };
+      if (chunk.content) summary += chunk.content;
+    }
+    summary = summary.trim();
+    if (!summary) return { compacted: false, detail: 'Compaction produced no summary; context left unchanged.' };
+
+    const seq = (instance.compactionCount ?? 0) + 1;
+    await this.store.saveArchive(instance.sessionId, instance.instanceId, seq, JSON.parse(JSON.stringify(archived)) as unknown[]);
+
+    const digest: AgentModelMessage = {
+      role: 'user',
+      content: [
+        `<context-digest instance="${instance.instanceId}" archive-seq="${seq}">`,
+        'Earlier conversation was compacted. The original messages are archived and searchable with the search_history tool.',
+        options.focus?.trim() ? `Focus requested: ${options.focus.trim()}` : '',
+        '',
+        summary,
+        '</context-digest>',
+      ].filter((line) => line !== undefined).join('\n'),
+    };
+    instance.messages = [digest, ...tail];
+    instance.compactionCount = seq;
+    instance.updatedAt = now();
+    const charsAfter = instance.messages.reduce((total, message) => total + messageSize(message), 0);
+    this.emit({
+      type: 'context_compacted',
+      sessionId: instance.sessionId,
+      instanceId: instance.instanceId,
+      agentId: instance.agentId,
+      reason: options.reason,
+      archivedMessages: archived.length,
+      charsBefore,
+      charsAfter,
+    });
+    this.emit({ type: 'instance_updated', instance: cloneInstance(instance) });
+    await this.persistSession(instance.sessionId);
+    return {
+      compacted: true,
+      detail: `Archived ${archived.length} older messages (archive seq ${seq}) and replaced them with a digest. Context shrank from ${charsBefore} to ${charsAfter} chars. Use search_history to recall archived details.`,
+    };
+  }
+
+  private resolveConfigFor(instance: AgentInstance): BackendConfig {
+    const session = this.sessions.get(instance.sessionId)!;
+    const spec = this.registry.get(instance.agentId);
+    return { ...this.resolveModel(spec?.model ?? session.defaultModel ?? this.defaultModel), sessionId: instance.sessionId };
+  }
+
+  private isSelfOrDescendant(fromInstanceId: string, targetInstanceId: string): boolean {
+    if (fromInstanceId === targetInstanceId) return true;
+    let current = this.instances.get(targetInstanceId);
+    while (current?.parentInstanceId) {
+      if (current.parentInstanceId === fromInstanceId) return true;
+      current = this.instances.get(current.parentInstanceId);
+    }
+    return false;
+  }
+
+  /** Compact an instance on demand. Used by /compact and the compact_context tool for idle targets. */
+  async compactInstance(instanceId: string, options: { focus?: string; keepRecent?: number; reason?: 'auto' | 'manual' } = {}): Promise<string> {
+    await this.ready;
+    const instance = this.instances.get(instanceId);
+    if (!instance) throw new Error(`Agent instance ${instanceId} not found`);
+    if (instance.status === 'running' || instance.status === 'waiting') throw new Error('Agent is running. Stop it first (/cancel) or compact a descendant agent instead.');
+    const result = await this.compactInstanceMessages(instance, this.resolveConfigFor(instance), { ...options, reason: options.reason ?? 'manual' });
+    return result.detail;
+  }
+
+  /** Search archived (compacted-away) messages of an instance. */
+  async searchArchivedContext(instanceId: string, query: string, limit = 8): Promise<string> {
+    await this.ready;
+    const instance = this.instances.get(instanceId);
+    if (!instance) throw new Error(`Agent instance ${instanceId} not found`);
+    const needle = query.trim().toLowerCase();
+    if (!needle) return 'Search query is empty.';
+    const archives = await this.store.loadArchives(instance.sessionId, instance.instanceId);
+    if (!archives.length) return 'No archived context yet — this instance has never been compacted.';
+    const matches: string[] = [];
+    for (const archive of archives) {
+      for (let index = 0; index < archive.messages.length; index += 1) {
+        const message = archive.messages[index]! as AgentModelMessage;
+        const haystack = formatMessageForSummary(index, message).toLowerCase();
+        const at = haystack.indexOf(needle);
+        if (at === -1) continue;
+        const label = message.role === 'tool' ? `tool result${message.tool_use_id ? ` for ${message.tool_use_id}` : ''}` : message.role;
+        const content = String(message.content ?? (message.tool_calls ? JSON.stringify(message.tool_calls) : ''));
+        const start = Math.max(0, Math.min(at - 120, content.length - 320));
+        const snippet = `${start > 0 ? '…' : ''}${content.slice(start, start + 320)}${content.length > start + 320 ? '…' : ''}`;
+        matches.push(`[archive seq ${archive.seq}, message ${index + 1}, ${label}]\n${snippet}`);
+        if (matches.length >= Math.max(1, limit)) break;
+      }
+      if (matches.length >= Math.max(1, limit)) break;
+    }
+    if (!matches.length) return `No archived context matches ${JSON.stringify(query)}. ${archives.length} archive file(s) exist for this instance.`;
+    return matches.join('\n\n');
   }
 
   private async runTurn(instance: AgentInstance): Promise<void> {
@@ -633,6 +826,16 @@ export class AgentRuntime {
       let finalOutput = '';
       for (let step = 0; step < 32; step += 1) {
         if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
+        if (instance.pendingCompact || this.shouldAutoCompact(instance.messages, config)) {
+          const reason = instance.pendingCompact?.reason ?? 'auto';
+          try {
+            await this.compactInstanceMessages(instance, config, {
+              focus: instance.pendingCompact?.focus,
+              keepRecent: instance.pendingCompact?.keepRecent,
+              reason,
+            }, controller.signal);
+          } catch { /* Compaction is best-effort; trimMessages remains the fallback. */ }
+        }
         const messages = this.trimMessages(instance.messages, config);
         let text = '';
         let thinking = '';
@@ -670,6 +873,15 @@ export class AgentRuntime {
           if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
           instance.messages.push({ role: 'tool', content: output, tool_use_id: call.id });
           this.emit({ type: 'tool_finished', instanceId: instance.instanceId, turnId, tool: call.function.name, output });
+        }
+        if (instance.pendingCompact && !controller.signal.aborted && instance.activeTurnId === turnId) {
+          try {
+            await this.compactInstanceMessages(instance, config, {
+              focus: instance.pendingCompact.focus,
+              keepRecent: instance.pendingCompact.keepRecent,
+              reason: instance.pendingCompact.reason,
+            }, controller.signal);
+          } catch { /* Compaction is best-effort. */ }
         }
         if (step === 31) throw new Error('Agent reached the 32-step limit. Review the activity and send a follow-up to continue.');
       }
@@ -735,6 +947,14 @@ export class AgentRuntime {
         await this.cancelAgent(instance.instanceId, String(args.instance_id ?? ''));
         return 'Agent cancelled.';
       }
+      if (name === 'compact_context') {
+        return await this.handleCompactContextTool(instance, args);
+      }
+      if (name === 'search_history') {
+        const targetId = typeof args.instance_id === 'string' && args.instance_id.trim() ? args.instance_id.trim() : instance.instanceId;
+        if (!this.isSelfOrDescendant(instance.instanceId, targetId)) return `Error: agent instance ${targetId} is not you or one of your descendants.`;
+        return await this.searchArchivedContext(targetId, String(args.query ?? ''), Number(args.limit ?? 8) || 8);
+      }
       const spec = this.registry.get(instance.agentId)!;
       if (!spec.tools.includes('*') && !spec.tools.includes(name)) return `Error: tool ${name} is not allowed by agent spec ${spec.id}`;
       return executeTool(name, args, {
@@ -747,6 +967,27 @@ export class AgentRuntime {
     } catch (error) {
       return `Error: ${error instanceof Error ? error.message : String(error)}`;
     }
+  }
+
+  private async handleCompactContextTool(instance: AgentInstance, args: Record<string, unknown>): Promise<string> {
+    const requestedId = typeof args.instance_id === 'string' && args.instance_id.trim() ? args.instance_id.trim() : instance.instanceId;
+    if (!this.isSelfOrDescendant(instance.instanceId, requestedId)) {
+      return `Error: agent instance ${requestedId} is not you or one of your descendants.`;
+    }
+    const focus = typeof args.focus === 'string' ? args.focus : undefined;
+    const keepRecent = Number.isFinite(Number(args.keep_recent)) ? Number(args.keep_recent) : undefined;
+    if (requestedId === instance.instanceId) {
+      // Compacting your own context mid-turn would tear the current tool-call
+      // batch apart; apply it at the next safe boundary (end of this batch).
+      instance.pendingCompact = { focus, keepRecent, reason: 'manual' };
+      return 'Compaction scheduled. Your older messages will be summarized and archived right after this tool batch completes; the digest stays in context and search_history can recall archived details.';
+    }
+    const target = this.instances.get(requestedId)!;
+    if (target.status === 'running' || target.status === 'waiting') {
+      return `Error: agent instance ${requestedId} is still running. Compact it after it becomes idle (wait_agent can help).`;
+    }
+    const result = await this.compactInstanceMessages(target, this.resolveConfigFor(target), { focus, keepRecent, reason: 'manual' });
+    return result.detail;
   }
 
   private async persistSession(sessionId: string): Promise<void> {

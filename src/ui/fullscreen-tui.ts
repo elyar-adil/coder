@@ -768,6 +768,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         if (target && main && target.instanceId !== main.instanceId) await runtime.cancelAgent(main.instanceId, target.instanceId);
         break;
       }
+      case 'compact': {
+        try {
+          notice = await runtime.compactInstance(session.mainInstanceId, { focus: args.length ? args.join(' ') : undefined });
+        } catch (error) {
+          notice = `Compact failed: ${error instanceof Error ? error.message : String(error)}`;
+        }
+        refresh();
+        break;
+      }
       case 'help': await commandPalette(); break;
       case 'select': setMouseInteraction(false); break;
       case 'mouse': setMouseInteraction(nativeSelection); break;
@@ -777,7 +786,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   const commandPalette = async (): Promise<void> => {
-    const actions = ['Provider', 'Model', 'Agent specs', 'Sessions', 'New session', 'Clear conversation', 'Toggle activity', 'Exit'];
+    const actions = ['Provider', 'Model', 'Agent specs', 'Sessions', 'New session', 'Clear conversation', 'Compact context', 'Toggle activity', 'Exit'];
     const index = await choose('Command palette', actions);
     if (index === 0) await openProvider();
     if (index === 1) await openModel();
@@ -785,8 +794,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (index === 3) await openSessions();
     if (index === 4) await switchSession(`session-${Date.now()}`);
     if (index === 5) await command('/clear');
-    if (index === 6) { activityVisible = !activityVisible; refresh(); }
-    if (index === 7) close();
+    if (index === 6) await command('/compact');
+    if (index === 7) { activityVisible = !activityVisible; refresh(); }
+    if (index === 8) close();
   };
 
   const submit = async (): Promise<void> => {
@@ -846,6 +856,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         const patch = toolDiff(event.tool, event.output);
         if (patch) block.content.push(patch);
       }
+    }
+    if (event.type === 'context_compacted' && event.sessionId === sessionId) {
+      const label = event.instanceId === session.mainInstanceId
+        ? 'Context compacted'
+        : `${runtime.getInstance(event.instanceId)?.agentId ?? 'agent'} context compacted`;
+      notice = `${label} (${event.reason}): archived ${event.archivedMessages} messages, ${event.charsBefore} → ${event.charsAfter} chars.`;
     }
     if (event.type === 'runtime_error') {
       if (event.sessionId === sessionId && event.instanceId === session.mainInstanceId) {

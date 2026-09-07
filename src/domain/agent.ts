@@ -55,6 +55,10 @@ export interface AgentInstance {
   lastOutput?: string;
   lastError?: string;
   activeTurnId?: string;
+  /** Number of times this instance's context has been compacted. */
+  compactionCount?: number;
+  /** Scheduled compaction, applied at the next safe boundary (end of the current tool batch). */
+  pendingCompact?: { focus?: string; keepRecent?: number; reason: 'auto' | 'manual' };
 }
 
 export interface SessionMessage {
@@ -106,6 +110,7 @@ export type AgentEvent =
   | { type: 'mailbox_message'; instanceId: string; message: AgentMailboxMessage }
   | { type: 'tool_started'; instanceId: string; turnId: string; tool: string; input: string }
   | { type: 'tool_finished'; instanceId: string; turnId: string; tool: string; output: string }
+  | { type: 'context_compacted'; sessionId: string; instanceId: string; agentId: string; reason: 'auto' | 'manual'; archivedMessages: number; charsBefore: number; charsAfter: number }
   | { type: 'runtime_error'; sessionId?: string; instanceId?: string; error: string };
 
 export interface RuntimeTool {

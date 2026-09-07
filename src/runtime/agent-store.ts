@@ -100,6 +100,44 @@ export class AgentRuntimeStore {
     const path = this.path(sessionId);
     await writes.get(path.toLowerCase())?.catch(() => undefined);
     await rm(path, { force: true }).catch(() => undefined);
+    await this.removeArchives(sessionId);
+  }
+
+  // ── Compaction archives ─────────────────────────────────────────────────────
+
+  private archivesDir(sessionId: string): string {
+    validSessionId(sessionId);
+    return resolve(this.dir, 'archives', sessionId);
+  }
+
+  /** Persist the messages removed by compaction so agents can search them later. */
+  async saveArchive(sessionId: string, instanceId: string, seq: number, messages: unknown[]): Promise<void> {
+    const dir = this.archivesDir(sessionId);
+    const path = resolve(dir, `${instanceId}.${String(seq).padStart(4, '0')}.json`);
+    const payload = `${JSON.stringify({ version: 1, instanceId, seq, messages }, null, 2)}\n`;
+    await mkdir(dir, { recursive: true });
+    await writeFile(path, payload, 'utf8');
+  }
+
+  /** Load archived messages for one instance (or all instances of a session). */
+  async loadArchives(sessionId: string, instanceId?: string): Promise<Array<{ instanceId: string; seq: number; messages: any[] }>> {
+    const dir = this.archivesDir(sessionId);
+    let files: string[] = [];
+    try { files = await readdir(dir); } catch { return []; }
+    const archives: Array<{ instanceId: string; seq: number; messages: any[] }> = [];
+    for (const file of files.filter((name) => name.endsWith('.json')).sort()) {
+      if (instanceId && !file.startsWith(`${instanceId}.`)) continue;
+      try {
+        const parsed = JSON.parse(await readFile(resolve(dir, file), 'utf8')) as { version: number; instanceId: string; seq: number; messages: any[] };
+        if (parsed.version !== 1 || !Array.isArray(parsed.messages)) continue;
+        archives.push({ instanceId: parsed.instanceId, seq: parsed.seq, messages: parsed.messages });
+      } catch { /* skip invalid archives */ }
+    }
+    return archives;
+  }
+
+  async removeArchives(sessionId: string): Promise<void> {
+    await rm(this.archivesDir(sessionId), { recursive: true, force: true }).catch(() => undefined);
   }
 
   async flush(): Promise<void> {

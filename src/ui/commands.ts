@@ -5,6 +5,7 @@ export const SLASH_COMMANDS = [
   { name: '/sessions', description: 'Open a saved conversation' },
   { name: '/new', description: 'Start a conversation' },
   { name: '/clear', description: 'Clear this conversation' },
+  { name: '/compact', description: 'Summarize and archive older context' },
   { name: '/cancel', description: 'Stop current work' },
   { name: '/select', description: 'Native terminal selection' },
   { name: '/mouse', description: 'Toggle app mouse interaction' },
