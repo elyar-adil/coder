@@ -147,3 +147,73 @@ describe('renderMarkdown', () => {
     assert.ok(result.includes('─'.repeat(40)));
   });
 });
+
+describe('gfm tables', () => {
+  const strip = (text: string): string => text.replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+
+  test('renders a basic pipe table with header separator and aligned columns', () => {
+    const rendered = renderMarkdown('| Name | Age |\n| --- | --- |\n| Alice | 30 |\n| Bob | 25 |', 80);
+    const lines = strip(rendered).split('\n');
+    assert.equal(lines.length, 4);
+    assert.ok(lines[0]!.includes('Name') && lines[0]!.includes('Age'));
+    assert.ok(lines[0]!.includes('│'));
+    assert.ok(lines[1]!.includes('┼'));
+    assert.ok(lines[2]!.includes('Alice') && lines[3]!.includes('Bob'));
+  });
+
+  test('aligns columns when cells contain CJK wide characters', () => {
+    const rendered = renderMarkdown('| 名字 | Age |\n| --- | --- |\n| 张三 | 30 |', 80);
+    const lines = strip(rendered).split('\n');
+    const bodyLine = lines[2]!;
+    // CJK characters occupy two columns: 名字/张三 cells must line up with the
+    // header and the pipe separators, and nothing may be truncated.
+    const headerPipe = lines[0]!.indexOf('│');
+    const bodyPipe = bodyLine.indexOf('│');
+    assert.ok(bodyLine.includes('张三'));
+    assert.ok(!bodyLine.includes('…'));
+    assert.equal(bodyPipe, headerPipe);
+    // CJK chars count as 2 display columns but 1 char, so the separator's ┼
+    // sits two chars after the pipe position — proof of width-aware layout.
+    assert.equal(lines[1]!.indexOf('┼'), bodyPipe + 2);
+  });
+
+  test('honors alignment markers for center and right', () => {
+    const rendered = renderMarkdown('| A | B |\n| :-: | --: |\n| x | 12345 |', 80);
+    const lines = strip(rendered).split('\n');
+    const body = lines[2]!;
+    assert.ok(body.includes(' x ') || body.startsWith(' '), `center alignment should pad, got: ${JSON.stringify(body)}`);
+    assert.ok(body.trimEnd().endsWith('12345'));
+  });
+
+  test('truncates wide tables to the available columns', () => {
+    const cell = 'x'.repeat(60);
+    const rendered = renderMarkdown(`| Col |\n| --- |\n| ${cell} |`, 40);
+    const lines = strip(rendered).split('\n');
+    const bodyLine = lines[2]!;
+    assert.ok(bodyLine.length <= 42, `expected truncation, got ${bodyLine.length}`);
+    assert.ok(bodyLine.includes('…'));
+  });
+
+  test('does not treat a pipe line without a delimiter row as a table', () => {
+    const rendered = renderMarkdown('just | pipes | here\n\nmore text', 80);
+    const lines = strip(rendered).split('\n');
+    assert.ok(lines[0]!.includes('just | pipes | here'));
+    assert.ok(!lines[0]!.includes('│'));
+  });
+
+  test('supports escaped pipes inside cells', () => {
+    const rendered = renderMarkdown('| A | B |\n| --- | --- |\n| a\\|b | c |', 80);
+    const lines = strip(rendered).split('\n');
+    assert.ok(lines[2]!.includes('a|b'));
+    assert.ok(lines[2]!.includes(' c ') || lines[2]!.endsWith('c'));
+    assert.ok(!lines[0]!.includes('\\|'));
+  });
+
+  test('stops consuming rows at a blank line', () => {
+    const rendered = renderMarkdown('| A |\n| --- |\n| 1 |\n\n| B | not table\n| x | y |', 80);
+    const lines = strip(rendered).split('\n');
+    assert.equal(lines.length, 6);
+    assert.ok(lines[2]!.includes('1'));
+    assert.ok(lines[4]!.includes('| B | not table'));
+  });
+});

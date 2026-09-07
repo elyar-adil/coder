@@ -53,6 +53,142 @@ function renderCodeLine(lang: string, line: string): string {
   return isDiffLanguage(lang) ? renderDiffLine(line) : chalk.hex(MARKDOWN_THEME.codeText)(line);
 }
 
+// ── GFM pipe tables ──────────────────────────────────────────────────────────
+
+export type TableAlign = 'left' | 'center' | 'right';
+
+export interface GfmTable {
+  header: string[];
+  aligns: TableAlign[];
+  rows: string[][];
+}
+
+const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
+
+/** Display width ignoring ANSI escapes, counting East-Asian wide chars as 2 columns. */
+export function displayWidth(text: string): number {
+  const clean = text.replace(ANSI_PATTERN, '');
+  let width = 0;
+  for (const ch of clean) {
+    const code = ch.codePointAt(0)!;
+    const wide = (code >= 0x1100 && code <= 0x115F)
+      || (code >= 0x2E80 && code <= 0x303E)
+      || (code >= 0x3130 && code <= 0x4DBF)
+      || (code >= 0x4E00 && code <= 0x9FFF)
+      || (code >= 0xA000 && code <= 0xA4CF)
+      || (code >= 0xAC00 && code <= 0xD7A3)
+      || (code >= 0xF900 && code <= 0xFAFF)
+      || (code >= 0xFE30 && code <= 0xFE4F)
+      || (code >= 0xFF00 && code <= 0xFF60)
+      || (code >= 0xFFE0 && code <= 0xFFE6)
+      || (code >= 0x1F300 && code <= 0x1FAFF)
+      || (code >= 0x20000 && code <= 0x3FFFD);
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
+function splitCells(line: string): string[] {
+  let trimmed = line.trim();
+  if (trimmed.startsWith('|')) trimmed = trimmed.slice(1);
+  if (trimmed.endsWith('|') && !trimmed.endsWith('\\|')) trimmed = trimmed.slice(0, -1);
+  return trimmed
+    .split(/(?<!\\)\|/)
+    .map((cell) => cell.trim().replace(/\\\|/g, '|'));
+}
+
+function delimiterCells(line: string): string[] | null {
+  const trimmed = line.trim();
+  if (!trimmed.includes('|')) return null;
+  const cells = splitCells(trimmed);
+  if (!cells.length || !cells.every((cell) => /^:?-+:?$/.test(cell))) return null;
+  return cells;
+}
+
+/** Match a GFM pipe table starting at lines[start]. Returns null when absent. */
+export function matchGfmTable(lines: string[], start: number): { table: GfmTable; end: number } | null {
+  const headerLine = lines[start];
+  const delimiterLine = lines[start + 1];
+  if (!headerLine || !delimiterLine) return null;
+  if (!headerLine.includes('|')) return null;
+  const alignCells = delimiterCells(delimiterLine);
+  if (!alignCells) return null;
+  const header = splitCells(headerLine);
+  if (header.length !== alignCells.length) return null;
+  const aligns = alignCells.map((cell) => (cell.startsWith(':') && cell.endsWith(':') ? 'center' : cell.endsWith(':') ? 'right' : 'left') as TableAlign);
+  const rows: string[][] = [];
+  let end = start + 2;
+  while (end < lines.length) {
+    const line = lines[end]!;
+    if (!line.includes('|') || !line.trim() || /^```/.test(line) || /^#{1,6} /.test(line)) break;
+    const cells = splitCells(line);
+    while (cells.length < header.length) cells.push('');
+    rows.push(cells.slice(0, header.length));
+    end += 1;
+  }
+  return { table: { header, aligns, rows }, end };
+}
+
+function truncateToWidth(text: string, maxWidth: number): string {
+  if (displayWidth(text) <= maxWidth) return text;
+  let out = '';
+  let width = 0;
+  for (const ch of text) {
+    const w = displayWidth(ch);
+    if (width + w > maxWidth - 1) break;
+    out += ch;
+    width += w;
+  }
+  return `${out}…`;
+}
+
+/** Render a parsed table as aligned monospace lines that fit within maxWidth columns. */
+export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
+  const columns = table.header.length;
+  const gap = ' │ ';
+  const gapWidth = displayWidth(gap);
+  const minWidth = 4;
+  const widths = table.header.map((cell, index) => Math.max(
+    displayWidth(cell),
+    ...table.rows.map((row) => displayWidth(row[index] ?? '')),
+    minWidth,
+  ));
+  const totalWidth = (): number => widths.reduce((sum, width) => sum + width, 0) + gapWidth * (columns - 1);
+  if (totalWidth() > maxWidth) {
+    const shrinkable = widths.map((_, index) => index).filter((index) => widths[index]! > minWidth);
+    shrinkable.sort((a, b) => widths[b]! - widths[a]!);
+    let overflow = totalWidth() - maxWidth;
+    for (const index of shrinkable) {
+      if (overflow <= 0) break;
+      const reduce = Math.min(overflow, widths[index]! - minWidth);
+      widths[index] = widths[index]! - reduce;
+      overflow -= reduce;
+    }
+  }
+  const padCell = (rendered: string, width: number, align: TableAlign): string => {
+    const padding = Math.max(0, width - displayWidth(rendered));
+    if (align === 'right') return ' '.repeat(padding) + rendered;
+    if (align === 'center') {
+      const left = Math.floor(padding / 2);
+      return ' '.repeat(left) + rendered + ' '.repeat(padding - left);
+    }
+    return rendered + ' '.repeat(padding);
+  };
+  const renderRow = (cells: string[], style: (cell: string) => string): string => cells
+    .map((cell, index) => {
+      const width = widths[index]!;
+      const plain = displayWidth(cell) > width ? truncateToWidth(cell, width) : cell;
+      return padCell(style(plain), width, table.aligns[index]!);
+    })
+    .join(chalk.hex(MARKDOWN_THEME.muted)(gap));
+
+  const header = renderRow(table.header, (cell) => chalk.bold.hex(MARKDOWN_THEME.accent)(inlineMarkdown(cell)));
+  // One uniform border color for every structural character (│, ─, ┼).
+  const separator = chalk.hex(MARKDOWN_THEME.muted)(widths.map((width) => '─'.repeat(width)).join('─┼─'));
+  const body = table.rows.map((row) => renderRow(row, (cell) => inlineMarkdown(cell)));
+  return [header, chalk.hex(MARKDOWN_THEME.muted)(separator), ...body];
+}
+
 export function inlineMarkdown(text: string): string {
   return text
     .replace(/\*\*\*(.+?)\*\*\*/g, (_m, t: string) => chalk.bold.italic(t))
@@ -71,7 +207,8 @@ export function renderMarkdown(text: string, cols = 80): string {
   let codeLang = '';
   let codeLines: string[] = [];
 
-  for (const raw of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const raw = lines[index]!;
     const fenceMatch = raw.match(/^```(\w*)$/);
     if (fenceMatch) {
       if (!inCodeBlock) {
@@ -102,6 +239,13 @@ export function renderMarkdown(text: string, cols = 80): string {
 
     if (/^---+$/.test(raw) || /^\*\*\*+$/.test(raw)) {
       out.push(chalk.hex(MARKDOWN_THEME.muted)('─'.repeat(cols)));
+      continue;
+    }
+
+    const tableMatch = matchGfmTable(lines, index);
+    if (tableMatch) {
+      out.push(...renderGfmTable(tableMatch.table, cols));
+      index = tableMatch.end - 1;
       continue;
     }
 
