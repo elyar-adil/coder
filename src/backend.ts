@@ -11,6 +11,7 @@
 
 import { resilientFetch, FetchError } from './fetch.js';
 import { responsesStream } from './responses.js';
+import { CODER_VERSION } from './version.js';
 import type { AgentModelMessage as OllamaMsg } from './domain/agent.js';
 import type { ToolDefinition } from './tools/types.js';
 type OllamaToolDef = ToolDefinition;
@@ -30,6 +31,16 @@ export interface BackendConfig {
     maxTokens?: number;
   };
   contextWindow?: number;
+  /** Stable per-conversation identifier, forwarded as x-opencode-session to providers that require it. */
+  sessionId?: string;
+}
+
+const USER_AGENT = `coder/${CODER_VERSION}`;
+
+export function transportHeaders(config: BackendConfig): Record<string, string> {
+  const headers: Record<string, string> = { 'user-agent': USER_AGENT };
+  if (config.sessionId) headers['x-opencode-session'] = config.sessionId;
+  return headers;
 }
 
 export interface ChatChunk {
@@ -91,7 +102,7 @@ async function* ollamaStream(
 
   const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/api/chat`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...transportHeaders(config) },
     body: JSON.stringify(body),
     retries: 2,
     timeout: 120_000,
@@ -144,7 +155,7 @@ async function ollamaNonStream(
 
   const response = await resilientFetch(`${config.baseUrl.replace(/\/$/, '')}/api/chat`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...transportHeaders(config) },
     body: JSON.stringify(body),
     retries: 2,
     timeout: 120_000,
@@ -253,7 +264,7 @@ async function* openaiStream(
   tools?: OllamaToolDef[],
   signal?: AbortSignal,
 ): AsyncGenerator<ChatChunk> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...transportHeaders(config) };
   if (config.apiKey) headers['authorization'] = `Bearer ${config.apiKey}`;
 
   const body: Record<string, unknown> = {
@@ -356,7 +367,7 @@ async function openaiNonStream(
   messages: OllamaMsg[],
   tools?: OllamaToolDef[],
 ): Promise<ChatChunk> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...transportHeaders(config) };
   if (config.apiKey) headers['authorization'] = `Bearer ${config.apiKey}`;
 
   const body: Record<string, unknown> = {
@@ -461,6 +472,7 @@ function buildAnthropicHeaders(config: BackendConfig): Record<string, string> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
     'anthropic-version': ANTHROPIC_VERSION,
+    ...transportHeaders(config),
   };
   if (config.apiKey) headers['x-api-key'] = config.apiKey;
   return headers;

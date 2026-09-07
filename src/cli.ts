@@ -8,10 +8,11 @@ import { defaultPolicy } from './policy.js';
 import { AgentRegistry } from './runtime/agent-registry.js';
 import { AgentRuntime } from './runtime/agent-runtime.js';
 import { runFullscreenTui } from './ui/fullscreen-tui.js';
+import { CODER_VERSION } from './version.js';
 
 async function main(): Promise<void> {
   const program = new Command();
-  program.name('coder').description('Document-driven coding agent runtime').version('0.3.0');
+  program.name('coder').description('Document-driven coding agent runtime').version(CODER_VERSION);
   program.allowExcessArguments(false).showSuggestionAfterError();
   program.option('--model <name>', 'default model name or .agentrc alias');
 

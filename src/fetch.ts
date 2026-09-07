@@ -51,6 +51,18 @@ function getErrorMessage(status: number | null, cause: unknown): string {
   return String(cause);
 }
 
+const MAX_ERROR_BODY_LENGTH = 512;
+
+async function errorResponseBody(response: Response): Promise<string> {
+  try {
+    const text = (await response.text()).trim();
+    if (!text) return '';
+    return text.length > MAX_ERROR_BODY_LENGTH ? `${text.slice(0, MAX_ERROR_BODY_LENGTH)}…` : text;
+  } catch {
+    return '';
+  }
+}
+
 /**
  * Resilient fetch with retry, timeout, and backoff.
  */
@@ -88,8 +100,9 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
           await sleep(delay);
           continue;
         }
+        const body = await errorResponseBody(response);
         throw new FetchError(
-          getErrorMessage(response.status, null),
+          getErrorMessage(response.status, null) + (body ? `: ${body}` : ''),
           response.status,
           false,
         );

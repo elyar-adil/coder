@@ -1,4 +1,4 @@
-import type { BackendConfig, ChatChunk } from './backend.js';
+import { transportHeaders, type BackendConfig, type ChatChunk } from './backend.js';
 import type { AgentModelMessage } from './domain/agent.js';
 import type { ToolDefinition } from './tools/types.js';
 import { resilientFetch, FetchError } from './fetch.js';
@@ -27,7 +27,7 @@ export async function* responsesStream(config: BackendConfig, instructions: stri
   };
   const base = config.baseUrl.replace(/\/+$/, '').replace(/\/v1$/, '');
   const response = await resilientFetch(`${base}/v1/responses`, {
-    method: 'POST', headers: { 'content-type': 'application/json', ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}) },
+    method: 'POST', headers: { 'content-type': 'application/json', ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}), ...transportHeaders(config) },
     body: JSON.stringify(body), signal, timeout: 120_000, retries: 2,
   });
   if (!response.ok) throw new FetchError(`Responses HTTP ${response.status}: ${await response.text()}`, response.status, false);

@@ -627,7 +627,7 @@ export class AgentRuntime {
     await this.persistSession(instance.sessionId);
 
     try {
-      const config = this.resolveModel(spec.model ?? session.defaultModel ?? this.defaultModel);
+      const config = { ...this.resolveModel(spec.model ?? session.defaultModel ?? this.defaultModel), sessionId: session.sessionId };
       if (!config.model) throw new Error('No model configured. Use /provider or /model first.');
       const tools = this.toolsFor(instance, spec);
       let finalOutput = '';
