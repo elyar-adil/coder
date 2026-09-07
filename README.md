@@ -27,6 +27,7 @@ Inside the TUI:
 - Selected text stays stable while generation continues in the background. Copying or clearing the selection resumes display updates. Thinking is shown when the provider returns it.
 - `F2` (or `/select`) optionally releases app mouse capture for the terminal's native selection. `F2` again restores app clicks, drag selection and wheel scrolling. `Ctrl+Y` and `PageUp` / `PageDown` also work without the mouse.
 - `Ctrl+X` or `/cancel` stops the current session's agents; send another message to continue.
+- `/compact` summarizes and archives older context of the main agent; an optional argument focuses the digest (e.g. `/compact file changes and pending work`).
 - `Ctrl+C` exits. Runtime errors appear in the conversation.
 
 For a non-interactive run:
@@ -101,6 +102,16 @@ Specs can reduce capabilities but cannot bypass global tool policy, path boundar
 - New user input interrupts only main's current generation. Background agents keep running until main explicitly redirects or cancels them.
 - Only main output enters the user-visible conversation.
 - Sessions and instances persist under `~/.coder/runtime/` and recover after restart.
+
+### Context compaction
+
+Long-running agents keep their context bounded in three ways:
+
+- **`compact_context` tool** — every agent can compact its own context (applied at the next safe tool boundary) or the context of one of its descendant agent instances (immediately, when idle). Older messages are replaced by a model-generated digest; pass `focus` to steer the digest and `keep_recent` to control the verbatim tail.
+- **`search_history` tool** — compacted-away messages are archived under `~/.coder/runtime/archives/<session>/` and remain searchable by keyword, so nothing is lost for good.
+- **Auto-compact** — when an instance's context exceeds ~75% of its character budget (override with `AGENT_AUTO_COMPACT_RATIO`), it compacts automatically before the next model call; hard tail truncation remains the last-resort fallback.
+
+Visible conversation history is never modified; compaction only affects what gets sent to the model.
 
 ## Model configuration
 
