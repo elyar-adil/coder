@@ -4,9 +4,21 @@
 > 背景：一个"为 TUI 加 Thinking 计时显示"的小任务中，暴露了 edit/搜索/反馈层的多个可靠性问题。
 > 日期：2026-09-07 · 基于 HEAD `8929856`
 
+## 修复进度（2026-09-07）
+
+| 问题 | 状态 | 说明 |
+| --- | --- | --- |
+| 1. edit_file fuzzy 错位 | ✅ 已修复 | 删除全部阈值类模糊策略，对齐 Claude Code / pi 的纯确定性匹配 |
+| 2. edit 反馈失真 | ✅ 已修复 | diff 由写入后真实内容生成 + readback 验证 + 行数/sha 上报 + no-op 显式状态 |
+| 3. Windows 搜索薄弱 | ✅ 已修复 | rg 任意失败退化纯 JS fallback + 正则回归测试 + win32 bash 能力声明 |
+| 4. usage/token 统计 | ⏸ 暂缓 | 方案已调研定稿（见下文），暂不实施 |
+| 5. write_file 无防呆 | ✅ 已修复 | 覆盖前自动快照（`.coder/snapshots/`），对齐 OpenCode/Claude Code 的快照+回滚模式 |
+
+验证基线：`npm run typecheck` 无错误 + `npm test` 135 pass / 0 fail。
+
 ## 问题清单（按优先级）
 
-### 1. `edit_file` fuzzy match 存在静默错位风险 — 🔴 最高优先级
+### 1. `edit_file` fuzzy match 存在静默错位风险 — 🔴 最高优先级 ✅ 已修复
 
 **现象**
 在 `src/backend.ts` 中修改一个 `return { ... }` 块时，文件里存在两段几乎相同的代码
@@ -18,25 +30,27 @@
 - fuzzy 容忍度越高，多处近似代码时越危险。
 - 修正错位本身又要多次 edit，进一步放大风险面。
 
-**修复建议**
-1. search 命中多个位置时**不要猜测**，返回错误并给出各候选项的行号，让 agent 换更长锚点。
-2. 替换后校验：结果必须包含 `replace` 文本、且旧文本只出现预期次数。
-3. 提供 `expectedReplacements`（默认 1）参数，超出即失败。
-4. fuzzy 仅作为"找不到精确匹配"时的最后手段，且必须报告匹配距离与位置。
+**修复建议**（已实施，见文末"修复进度"）
 
-### 2. edit 工具的结果反馈不可信 — 🔴 高
+**实施说明（2026-09-07）**：调研 Claude Code（泄漏源码）/ pi / OpenCode 后确认：SOTA 实现已淘汰相似度阈值类模糊匹配（Claude Code 纯精确匹配、零 fuzzy；OpenCode 的 BlockAnchor fuzzy 正被社区视为可靠性负债）。据此：
+1. 删除 `fuzzyFind` 的策略 7/8（BlockAnchor + Levenshtein，0.7/0.3/0.5 阈值全部作废），保留 6 个确定性归一化层（精确 / read_file 行号剥离 / 行 trim / 空白归一 / 缩进弹性 / 转义归一），替换为 `findUniqueMatch`（src/infra/tools.ts:239）。
+2. 每层强制唯一命中（`indexOf === lastIndexOf`）；多命中报错并列出候选行号；找不到报错并给出最接近位置提示（pi 风格）。
+3. 新增 `expectedReplacements`（默认 1）与 `replaceAll`，超出即失败。
+4. 写后 readback 验证（确认 replace 文本存在且次数正确）。
+回归测试：tests/edit-file-sota.test.ts（11 例）+ tests/tools.test.ts。
+
+### 2. edit 工具的结果反馈不可信 — 🔴 高 ✅ 已修复
 
 **现象**
 - 一次 edit 实际只改了约 5 行，返回 diff 却显示 "621 more changed lines"（虚假扩展）。
 - 有一次报告成功，但实际内容未变化，需要 agent 额外 `git diff` 自查。
 - 结论：工具返回值不能作为"已成功"的依据，agent 被迫花额外轮次验证。
 
-**修复建议**
-1. diff 摘要与实际文件变化一致（由写入后的真实内容重新生成，而非编辑意图）。
-2. 返回中带上文件的新 sha/行数变化，方便 agent 校验。
-3. "no-op edit"（search 未找到任何差异）应明确返回状态，而不是含混的成功。
+**修复建议**（已实施，见文末"修复进度"）
 
-### 3. Windows 下搜索能力薄弱 — 🟠 中
+**实施说明（2026-09-07）**：diff 由写入锁下重新读取的写前内容 vs 实际写入内容生成（不再依赖可能过期的变量）；成功返回带 `old → new` 行数与 12 位 sha256；no-op edit（search === replace 或内容无变化）显式返回 "OK: no changes made"，不写文件不出 diff。
+
+### 3. Windows 下搜索能力薄弱 — 🟠 中 ✅ 已修复
 
 **现象**
 - 没有 grep/ripgrep 工具；`rg`、`head`、`tail`、`Get-Content` 在内置 bash 里均不可用
@@ -45,12 +59,11 @@
   正则路径疑似失效或被转义破坏。
 - agent 只能退化为逐文件 `read_file`，多轮浪费。
 
-**修复建议**
-1. `search_text` 的正则分支加回归测试（含 `\.`、`\d` 等常见转义）。
-2. 内置一个纯 JS 的 ripgrep 替代（递归 + glob + 正则），不依赖 shell。
-3. bash 工具在 Windows 上明确暴露"可用 shell 能力"，避免 agent 反复试错。
+**修复建议**（已实施，见文末"修复进度"）
 
-### 4. usage / token 统计缺失 — 🟠 中
+**实施说明（2026-09-07）**：rg 除"成功 + exit 1（无匹配）"外的任何失败（ENOENT、exit ≥ 2 的坏正则、spawn 错误、Windows .cmd shim 等）均退化到纯 JS `searchTextFallback`（已导出便于测试），两级错误信息合并上报；fallback 正则回归测试覆盖 `\.`、`\d`、非法正则字面量退化、glob 过滤、`m` 锚定、上限截断（tests/search-text.test.ts，6 例）；bash 工具在 win32 下于描述与结果中声明 cmd.exe 能力边界并建议改用 search_text/read_file。
+
+### 4. usage / token 统计缺失 — 🟠 中 ⏸ 暂缓（方案已定，随时可重启）
 
 **现象**
 用户与 agent 都看不到每次 turn 花了多少 token。四个后端（Anthropic / Ollama /
@@ -61,22 +74,23 @@ OpenAI Chat / Responses）的流式协议其实都返回 usage：
 - OpenAI Chat：`usage`（需 `stream_options: { include_usage: true }`）
 - Responses：`response.completed` 的 `usage`（含 `reasoning_tokens`）
 
-**修复建议**（方案已调研，可随时重启）
+**修复建议**（方案已调研定稿，暂缓实施）
+
 1. `ChatChunk` 增加 `usage?: { inputTokens; outputTokens; reasoningTokens? }`，各后端解析。
 2. runtime 聚合每 turn 用量，写入 SessionMessage 与 timeline（持久化）。
 3. TUI 在状态栏或 Agent Activity 显示 per-turn / per-session 消耗。
 
-### 5. `write_file` 无防呆 — 🟡 低
+（附注：实施时顺带修复 backend.ts SSE 仅按 `\n\n` 分割、不兼容 CRLF 的问题；responses.ts 已做 CRLF 归一。）
+
+### 5. `write_file` 无防呆 — 🟡 低 ✅ 已修复
 
 **现象**
 整文件覆盖写，没有备份、没有冲突检测。agent 对现有文件理解有偏差时，
 一次 `write_file` 就会静默毁掉用户内容。
 
-**修复建议**
-1. 覆盖已有文件时，若旧内容超过阈值行数（如 >50 行），要求 `expectedOldLines`
-   或 `createBackup: true` 之类的显式确认参数。
-2. 或自动生成 `.bak` / 写入 git stash 式快照后再覆盖。
-3. 至少在返回信息中报告"覆盖了已有 N 行的文件"。
+**修复建议**（已实施，见文末"修复进度"）
+
+**实施说明（2026-09-07）**：调研确认 Claude Code / OpenCode 的 Write 均不设阻断式防呆，保护手段是"写前自动快照 + 回滚"。据此放弃 `expectedOldLines` 硬阻断方案，改为：`write_file` 覆盖已有文件前自动把旧内容存入 `<workspaceRoot>/.coder/snapshots/`（`src/infra/file-snapshot.ts` 的 `snapshotBeforeWrite`，文件名含时间戳+随机后缀，绝不阻塞写入、失败优雅降级）；结果信息标注"覆盖了 N 行的文件，快照位于 X"或"快照不可用（原因）"；新建文件不产生快照。回归测试：tests/write-file-snapshot.test.ts（6 例）。
 
 ## 本次审计的经验教训
 

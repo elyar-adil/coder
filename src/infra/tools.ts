@@ -1,5 +1,5 @@
 import { readFile, writeFile, readdir, mkdir, stat, rename, rm } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -7,6 +7,7 @@ import { ToolRegistry } from '../tools/registry.js';
 import type { ToolDefinition, ToolExecutionContext, ToolMetadata } from '../tools/types.js';
 import { unifiedDiff } from '../diff.js';
 import { resilientFetch } from '../fetch.js';
+import { snapshotBeforeWrite } from './file-snapshot.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -177,31 +178,36 @@ async function walkDir(
   return results;
 }
 
-// ── Fuzzy edit matching (inspired by OpenCode's multi-strategy approach) ──────
+// ── Deterministic edit matching ──────────────────────────────────────────────
 //
 // LLMs frequently produce search strings with minor whitespace or indentation
-// drift. Rather than hard-failing, we attempt progressively looser strategies
-// in order, mirroring the 9-level approach described in the OpenCode analysis.
+// drift. We attempt deterministic normalization strategies in order — never
+// similarity guessing — and require every candidate match to be unique in the
+// file, reporting actionable errors on no-match or ambiguity.
 
-function levenshtein(a: string, b: string): number {
-  const m = a.length;
-  const n = b.length;
-  const dp: number[][] = Array.from({ length: m + 1 }, (_, i) =>
-    Array.from({ length: n + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)),
-  );
-  for (let i = 1; i <= m; i++) {
-    for (let j = 1; j <= n; j++) {
-      dp[i]![j] = a[i - 1] === b[j - 1]
-        ? dp[i - 1]![j - 1]!
-        : 1 + Math.min(dp[i - 1]![j]!, dp[i]![j - 1]!, dp[i - 1]![j - 1]!);
-    }
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  for (let idx = haystack.indexOf(needle); idx !== -1; idx = haystack.indexOf(needle, idx + 1)) {
+    count += 1;
   }
-  return dp[m]![n]!;
+  return count;
 }
 
-function similarity(a: string, b: string): number {
-  const maxLen = Math.max(a.length, b.length);
-  return maxLen === 0 ? 1 : 1 - levenshtein(a, b) / maxLen;
+function lineNumbersOf(haystack: string, needle: string, limit: number): number[] {
+  const lines: number[] = [];
+  for (let idx = haystack.indexOf(needle); idx !== -1 && lines.length < limit; idx = haystack.indexOf(needle, idx + 1)) {
+    lines.push(haystack.slice(0, idx).split('\n').length);
+  }
+  return lines;
+}
+
+function closestLineHints(content: string, search: string): number[] {
+  const firstLine = search.split('\n').find((line) => line.trim())?.trim() ?? '';
+  if (!firstLine) return [];
+  const hints = lineNumbersOf(content, firstLine, 3);
+  if (hints.length > 0 || firstLine.length <= 24) return hints;
+  return lineNumbersOf(content, firstLine.slice(0, 24), 3);
 }
 
 function stripReadFileLineNumbers(search: string): string | undefined {
@@ -213,86 +219,54 @@ function stripReadFileLineNumbers(search: string): string | undefined {
   return contentLines.map((line) => line.replace(/^\d{5}\|/, '')).join('\n');
 }
 
-/** Try to locate `search` in `content` using progressively looser strategies.
- *  Returns the best matching substring of `content` at the same length, or
- *  undefined if no strategy succeeds. */
-function fuzzyFind(content: string, search: string): string | undefined {
-  // Strategy 1: exact
-  if (content.includes(search)) return search;
+function stripCommonIndent(s: string): string {
+  const lines = s.split('\n');
+  const minIndent = lines
+    .filter((l) => l.trim())
+    .reduce((min, l) => Math.min(min, l.match(/^\s*/)?.[0].length ?? 0), Infinity);
+  return lines.map((l) => l.slice(minIndent === Infinity ? 0 : minIndent)).join('\n');
+}
 
-  // Strategy 2: line-trimmed — trim each line, compare trimmed blocks
-  const trimLines = (s: string) => s.split('\n').map((l) => l.trim()).join('\n');
-  const searchTrimmed = trimLines(search);
+function unescapeEscapes(s: string): string {
+  return s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+type UniqueMatchResult =
+  | { kind: 'ok'; matched: string; strategy: string }
+  | { kind: 'ambiguous'; matched: string; count: number; lines: number[] }
+  | { kind: 'none' };
+
+function findUniqueMatch(content: string, search: string): UniqueMatchResult {
+  const exactCount = countOccurrences(content, search);
+  if (exactCount === 1) return { kind: 'ok', matched: search, strategy: 'exact' };
+  if (exactCount > 1) {
+    return { kind: 'ambiguous', matched: search, count: exactCount, lines: lineNumbersOf(content, search, 5) };
+  }
+
   const contentLines = content.split('\n');
   const searchLineCount = search.split('\n').length;
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (trimLines(window) === searchTrimmed) return window;
-  }
-
-  // Strategy 3: whitespace-normalized — collapse all whitespace runs
-  const normWS = (s: string) => s.replace(/[\t ]+/g, ' ').trim();
-  const searchNorm = normWS(search);
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (normWS(window) === searchNorm) return window;
-  }
-
-  // Strategy 4: indentation-flexible — strip common leading indent from search
-  const stripIndent = (s: string) => {
-    const lines = s.split('\n');
-    const minIndent = lines
-      .filter((l) => l.trim())
-      .reduce((min, l) => Math.min(min, l.match(/^\s*/)?.[0].length ?? 0), Infinity);
-    return lines.map((l) => l.slice(minIndent === Infinity ? 0 : minIndent)).join('\n');
-  };
-  const searchStripped = stripIndent(search);
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (stripIndent(window) === searchStripped) return window;
-  }
-
-  // Strategy 5: escape-normalized — resolve common escape sequences
-  const normEscape = (s: string) =>
-    s.replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
-  const searchEsc = normEscape(search);
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (normEscape(window) === searchEsc) return window;
-  }
-
-  // Strategy 6: trim boundaries — trim leading/trailing whitespace of the whole block
+  const searchTrimmed = search.split('\n').map((l) => l.trim()).join('\n');
+  const searchNorm = search.replace(/[\t ]+/g, ' ').trim();
+  const searchStripped = stripCommonIndent(search);
+  const searchEsc = unescapeEscapes(search);
   const searchTrimBound = search.trim();
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (window.trim() === searchTrimBound) return window;
-  }
-
-  // Strategy 7: block-anchor with similarity — anchor on first+last line,
-  // accept the window if its Levenshtein similarity to search is >= 0.7.
-  const searchFirstLine = search.split('\n')[0]?.trim() ?? '';
-  const searchLastLine = search.split('\n').at(-1)?.trim() ?? '';
-  const candidates: string[] = [];
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    const firstMatch = contentLines[i]?.trim() === searchFirstLine;
-    const lastMatch = contentLines[i + searchLineCount - 1]?.trim() === searchLastLine;
-    if (firstMatch && lastMatch) candidates.push(window);
-  }
-  const ANCHOR_THRESHOLD = candidates.length === 1 ? 0 : 0.3;
-  for (const c of candidates) {
-    if (similarity(c, search) >= ANCHOR_THRESHOLD) return c;
-  }
-
-  // Strategy 8: context-aware — looser block anchor, 50% similarity threshold
-  for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
-    const window = contentLines.slice(i, i + searchLineCount).join('\n');
-    if (contentLines[i]?.trim() === searchFirstLine && similarity(window, search) >= 0.5) {
-      return window;
+  const strategies: Array<{ name: string; matches: (window: string) => boolean }> = [
+    { name: 'line-trimmed', matches: (w) => w.split('\n').map((l) => l.trim()).join('\n') === searchTrimmed },
+    { name: 'whitespace-normalized', matches: (w) => w.replace(/[\t ]+/g, ' ').trim() === searchNorm },
+    { name: 'indentation-flexible', matches: (w) => stripCommonIndent(w) === searchStripped },
+    { name: 'escape-normalized', matches: (w) => unescapeEscapes(w) === searchEsc },
+    { name: 'trim-boundaries', matches: (w) => w.trim() === searchTrimBound },
+  ];
+  for (const { name, matches } of strategies) {
+    for (let i = 0; i <= contentLines.length - searchLineCount; i++) {
+      const window = contentLines.slice(i, i + searchLineCount).join('\n');
+      if (!matches(window)) continue;
+      const count = countOccurrences(content, window);
+      if (count === 1) return { kind: 'ok', matched: window, strategy: name };
+      return { kind: 'ambiguous', matched: window, count, lines: lineNumbersOf(content, window, 5) };
     }
   }
-
-  return undefined;
+  return { kind: 'none' };
 }
 
 let defaultToolPolicy: ToolPolicy = defaultPolicy();
@@ -343,19 +317,25 @@ export const TOOLS: OllamaToolDef[] = [
     function: {
       name: 'edit_file',
       description: `Apply one or more targeted search-replace edits to an existing file.
-Each edit finds an EXACT string match and replaces it. Use this instead of write_file
-when modifying an existing file — it is safer and preserves surrounding context.
+Each edit must match the file exactly; every match is required to be unique.
+Use this instead of write_file when modifying an existing file — it is safer
+and preserves surrounding context.
 
 Format: provide a JSON array of {search, replace} pairs.
 - "search" must be an exact substring of the current file content (including indentation/newlines).
+  Minor whitespace/indentation drift and literal \\n escapes are normalized deterministically,
+  but near-miss guesses are never accepted.
 - "replace" is the new content that replaces it.
 - Edits are applied in order; each operates on the result of the previous.
-- To delete a block, set "replace" to "".`,
+- To delete a block, set "replace" to "".
+- Multiple matches fail; add surrounding context to disambiguate, or set replaceAll to true.`,
       parameters: {
         type: 'object',
         properties: {
           path: { type: 'string', description: 'Path to the file to edit' },
           edits: { type: 'string', description: 'JSON array of {search, replace} objects' },
+          expectedReplacements: { type: 'number', description: 'Expected number of occurrences to replace per edit (default 1). The actual count must equal this or the edit fails with the actual count.' },
+          replaceAll: { type: 'boolean', description: 'Replace every occurrence of each search string (default false)' },
         },
         required: ['path', 'edits'],
       },
@@ -524,7 +504,9 @@ understand the codebase structure without reading every file. Returns a compact 
     type: 'function',
     function: {
       name: 'bash',
-      description: 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
+      description: process.platform === 'win32'
+        ? 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. NOTE: on Windows this runs cmd.exe — Unix tools like grep/sed/awk/ripgrep are unavailable; use the built-in search_text/read_file tools instead.'
+        : 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
       parameters: {
         type: 'object',
         properties: {
@@ -670,7 +652,7 @@ async function walkAllFiles(root: string, signal?: AbortSignal, maxFiles = 200_0
   return files;
 }
 
-async function searchTextFallback(
+export async function searchTextFallback(
   root: string,
   query: string,
   glob: string | undefined,
@@ -923,15 +905,14 @@ async function executeBuiltinTool(
         return JSON.stringify({ ok: true, results: lines, truncated: lines.length >= max });
       } catch (error: any) {
         if (error?.code === 1) return JSON.stringify({ ok: true, results: [], truncated: false });
-        if (error?.code === 'ENOENT') {
-          try {
-            const results = await searchTextFallback(root, query, glob, max, ctx?.signal);
-            return JSON.stringify({ ok: true, results, truncated: results.length >= max });
-          } catch (fallbackError: unknown) {
-            return JSON.stringify({ ok: false, error: String(fallbackError instanceof Error ? fallbackError.message : fallbackError) });
-          }
+        try {
+          const results = await searchTextFallback(root, query, glob, max, ctx?.signal);
+          return JSON.stringify({ ok: true, results, truncated: results.length >= max });
+        } catch (fallbackError: unknown) {
+          const rgMessage = error?.message ?? String(error);
+          const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+          return JSON.stringify({ ok: false, error: fallbackMessage ? `${fallbackMessage} (rg: ${rgMessage})` : rgMessage });
         }
-        return JSON.stringify({ ok: false, error: String(error?.message ?? error) });
       }
     }
     case 'search_files': {
@@ -1043,6 +1024,8 @@ async function executeBuiltinTool(
       const editsArg = args['edits'];
       if (!path) return 'Error: edit_file requires "path"';
       if (editsArg === undefined || editsArg === null || editsArg === '') return 'Error: edit_file requires "edits"';
+      const globalExpected = typeof args['expectedReplacements'] === 'number' ? args['expectedReplacements'] : undefined;
+      const globalReplaceAll = args['replaceAll'] === true;
       const targetPath = resolveWriteTarget(path, ctx);
       const readDecision = authorizeToolCall(policy, 'read_file', { path: targetPath });
       if (!readDecision.ok) return formatPolicyError('edit_file', readDecision);
@@ -1057,50 +1040,119 @@ async function executeBuiltinTool(
           return `Error reading file for edit: ${String(error)}`;
         }
 
-        let parsed: Array<{ search: string; replace: string }>;
+        let parsed: Array<{ search: string; replace?: string; expectedReplacements?: number; replaceAll?: boolean }>;
         try {
           if (Array.isArray(editsArg)) {
-            parsed = editsArg as Array<{ search: string; replace: string }>;
+            parsed = editsArg as Array<{ search: string; replace?: string; expectedReplacements?: number; replaceAll?: boolean }>;
           } else {
             const raw = String(editsArg).trim();
             const fenced = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-            parsed = JSON.parse(fenced?.[1] ?? raw) as Array<{ search: string; replace: string }>;
+            parsed = JSON.parse(fenced?.[1] ?? raw) as Array<{ search: string; replace?: string; expectedReplacements?: number; replaceAll?: boolean }>;
           }
           if (!Array.isArray(parsed)) return 'Error: edits must be a JSON array';
         } catch (error) {
           return `Error parsing edits JSON: ${String(error)}`;
         }
 
+        const noMatchError = (index: number, search: string): string => {
+          const hints = closestLineHints(src, search);
+          const hint = hints.length > 0 ? `\nFirst line of the search loosely appears near lines: ${hints.join(', ')}.` : '';
+          return `Error: edit[${index}]: Could not find old text in ${path}. It must match exactly, including whitespace, indentation, and line endings.\nSearch string was:\n${search}${hint}`;
+        };
+
         let content = src;
         const log: string[] = [];
+        const applied: Array<{ search: string; replace: string; made: number }> = [];
         for (let i = 0; i < parsed.length; i += 1) {
-          const { search, replace } = parsed[i]!;
+          const entry = parsed[i]!;
+          const search = entry.search;
+          const replace = entry.replace ?? '';
           if (typeof search !== 'string') return `Error: edit[${i}].search must be a string`;
-          if (replace !== undefined && typeof replace !== 'string') return `Error: edit[${i}].replace must be a string`;
+          if (entry.replace !== undefined && typeof entry.replace !== 'string') return `Error: edit[${i}].replace must be a string`;
+          const replaceAll = entry.replaceAll === true || globalReplaceAll;
+          const expected = typeof entry.expectedReplacements === 'number' ? entry.expectedReplacements : globalExpected;
+
+          if (search === replace) {
+            log.push(`edit[${i}]: no-op (search equals replace)`);
+            continue;
+          }
+
           const numberedSearch = stripReadFileLineNumbers(search);
-          const searchVariants = numberedSearch && numberedSearch !== search ? [search, numberedSearch] : [search];
-          let matched: string | undefined;
-          let normalizedLineNumbers = false;
-          for (const candidate of searchVariants) {
-            matched = fuzzyFind(content, candidate);
-            if (matched !== undefined) {
-              normalizedLineNumbers = candidate !== search;
-              break;
+          const unescapedSearch = unescapeEscapes(search);
+          const variants = [search];
+          if (numberedSearch !== undefined && numberedSearch !== search && !variants.includes(numberedSearch)) variants.push(numberedSearch);
+          if (unescapedSearch !== search && !variants.includes(unescapedSearch)) variants.push(unescapedSearch);
+
+          if (replaceAll) {
+            let usedVariant: string | undefined;
+            let count = 0;
+            for (const variant of variants) {
+              count = countOccurrences(content, variant);
+              if (count > 0) {
+                usedVariant = variant;
+                break;
+              }
             }
+            if (!usedVariant) return noMatchError(i, search);
+            if (expected !== undefined && count !== expected) {
+              return `Error: edit[${i}]: expected ${expected} occurrence(s) of old text in ${path} but found ${count}.`;
+            }
+            const effectiveReplace = usedVariant === unescapedSearch ? unescapeEscapes(replace) : replace;
+            content = content.split(usedVariant).join(effectiveReplace);
+            applied.push({ search: usedVariant, replace: effectiveReplace, made: count });
+            log.push(`edit[${i}]: replaced ${count} occurrence(s)`);
+            continue;
           }
-          if (matched === undefined) {
-            return `Error: edit[${i}] search string not found in file (tried 8 fuzzy strategies plus read_file line-number normalization). Make sure the block exists in the file.\nSearch string was:\n${search}`;
+
+          let outcome = findUniqueMatch(content, variants[0]!);
+          let matchedVariant = variants[0]!;
+          for (const variant of variants.slice(1)) {
+            if (outcome.kind !== 'none') break;
+            outcome = findUniqueMatch(content, variant);
+            if (outcome.kind !== 'none') matchedVariant = variant;
           }
-          const usedFuzzy = matched !== (normalizedLineNumbers ? numberedSearch : search);
-          content = content.replace(matched, replace ?? '');
-          log.push(`edit[${i}]: replaced ${matched.length} chars${usedFuzzy || normalizedLineNumbers ? ` (${[normalizedLineNumbers ? 'line-number normalized' : '', usedFuzzy ? 'fuzzy match' : ''].filter(Boolean).join(', ')})` : ''}`);
+
+          if (outcome.kind === 'none') {
+            return noMatchError(i, search);
+          }
+          if (outcome.kind === 'ambiguous') {
+            const expectedNote = expected !== undefined && expected !== outcome.count ? ` (expectedReplacements was ${expected})` : '';
+            return `Error: edit[${i}]: Found ${outcome.count} matches of old text in ${path} at lines ${outcome.lines.join(', ')}. Provide more surrounding context to make the match unique${expectedNote}.`;
+          }
+          if (expected !== undefined && expected !== 1) {
+            return `Error: edit[${i}]: expected ${expected} occurrence(s) of old text in ${path} but found 1. Set replaceAll: true to replace every occurrence.`;
+          }
+
+          const matched = outcome.matched;
+          const effectiveReplace = matchedVariant === unescapedSearch ? unescapeEscapes(replace) : replace;
+          content = content.replace(matched, effectiveReplace);
+          applied.push({ search: matched, replace: effectiveReplace, made: 1 });
+          const normalizedLineNumbers = numberedSearch !== undefined && matchedVariant === numberedSearch;
+          log.push(`edit[${i}]: replaced ${matched.length} chars via ${outcome.strategy}${normalizedLineNumbers ? ' (line-number normalized)' : ''}`);
+        }
+
+        if (content === src) {
+          return `OK: no changes made to ${path}${log.length > 0 ? ` (${log.join('; ')})` : ''}`;
         }
 
         try {
           const writtenPath = await writeViaWorkspace(path, content, ctx);
-          await gitAutoCommit(writtenPath, `edit: ${path} (${parsed.length} change${parsed.length === 1 ? '' : 's'})`, ctx);
+          const written = await readFile(writtenPath, 'utf8');
+          for (const edit of applied) {
+            if (edit.replace === '') {
+              if (countOccurrences(written, edit.search) !== 0) {
+                return `Error: readback verification failed for ${path}: deleted text is still present after write.`;
+              }
+            } else if (countOccurrences(written, edit.replace) < edit.made) {
+              return `Error: readback verification failed for ${path}: expected at least ${edit.made} occurrence(s) of the replaced text in the written file.`;
+            }
+          }
+          await gitAutoCommit(writtenPath, `edit: ${path} (${applied.length} change${applied.length === 1 ? '' : 's'})`, ctx);
           const diff = unifiedDiff(path, src, content);
-          return [`OK: ${log.join('; ')} (${writtenPath})`, diff].filter(Boolean).join('\n\n');
+          const sha256 = createHash('sha256').update(written).digest('hex').slice(0, 12);
+          const linesBefore = src.split('\n').length;
+          const linesAfter = written.split('\n').length;
+          return [`OK: ${log.join('; ')} (${writtenPath}); ${linesBefore} → ${linesAfter} lines; sha256:${sha256}`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing edited file: ${String(error)}`;
         }
@@ -1140,15 +1192,25 @@ async function executeBuiltinTool(
       return withWriteLock(ctx, targetPath, async () => {
         try {
           let previous = '';
+          let existed = false;
           try {
             previous = await readFile(targetPath, 'utf8');
+            existed = true;
           } catch {
             previous = '';
           }
+          const snapshot = existed ? await snapshotBeforeWrite(targetPath, workspaceRoot(ctx)) : { path: null as string | null };
           const writtenPath = await writeViaWorkspace(path, content, ctx);
           await gitAutoCommit(writtenPath, `write: ${path}`, ctx);
           const diff = unifiedDiff(path, previous, content);
-          return [`OK: wrote ${writtenPath} (${content.length} chars)`, diff].filter(Boolean).join('\n\n');
+          let note = 'created new file';
+          if (existed) {
+            const lineCount = previous === '' ? 0 : previous.replace(/\n$/, '').split('\n').length;
+            note = snapshot.path
+              ? `overwrote existing file (${lineCount} lines); snapshot saved to ${snapshot.path}`
+              : `overwrote existing file (${lineCount} lines); snapshot unavailable (${snapshot.reason ?? 'unknown'})`;
+          }
+          return [`OK: wrote ${writtenPath} (${content.length} chars); ${note}`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing file: ${String(error)}`;
         }
@@ -1208,7 +1270,10 @@ async function executeBuiltinTool(
           signal: ctx?.signal,
         });
         const output = [stdout, stderr].filter(Boolean).join('\n--- stderr ---\n');
-        return boundedOutput(output || '(no output)');
+        const win32Note = process.platform === 'win32'
+          ? '\n(Note: shell is cmd.exe — grep/ripgrep-like Unix utilities are unavailable; use search_text/read_file instead.)'
+          : '';
+        return boundedOutput(output || '(no output)') + win32Note;
       } catch (error: unknown) {
         const err = error as { stdout?: string; stderr?: string; message?: string };
         const output = [err.stdout, err.stderr].filter(Boolean).join('\n');
