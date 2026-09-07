@@ -2,8 +2,20 @@ import blessed from 'blessed';
 import { diffKind, renderMarkdown } from '../markdown.js';
 import { highlightCode } from './syntax.js';
 
+// Historical messages re-render on every frame; memoize the (expensive) result.
+// Entries are keyed by content+width and evicted least-recently-used.
+const renderCache = new Map<string, string>();
+const RENDER_CACHE_LIMIT = 600;
+
 /** Blessed tags keep patch colors independent of Chalk's stdout/NO_COLOR detection. */
 export function renderTuiMarkdown(content: string, columns: number): string {
+  const cacheKey = `${columns}\u0000${content}`;
+  const cached = renderCache.get(cacheKey);
+  if (cached !== undefined) {
+    renderCache.delete(cacheKey);
+    renderCache.set(cacheKey, cached);
+    return cached;
+  }
   const out: string[] = [];
   let prose: string[] = [];
   let diff = false;
@@ -20,9 +32,12 @@ export function renderTuiMarkdown(content: string, columns: number): string {
     } else if (diff) {
       const kind = diffKind(line);
       if (kind === 'add' || kind === 'del') {
-        const background = kind === 'add' ? '#d9eadc' : '#f1dcdc';
+        // Deep, near-black tinted backgrounds keep the code readable while
+        // still signaling added/removed lines.
+        const background = kind === 'add' ? '#10281a' : '#2b1215';
+        const base = kind === 'add' ? '#9fd0a6' : '#d99f9f';
         const width = (blessed as unknown as { unicode: { strWidth(text: string): number } }).unicode.strWidth(line);
-        out.push(`{${background}-bg}{#25352c-fg}${highlightCode(line, true)}${' '.repeat(Math.max(0, columns - width))}{/#25352c-fg}{/${background}-bg}`);
+        out.push(`{${background}-bg}{${base}-fg}${highlightCode(line)}${' '.repeat(Math.max(0, columns - width))}{/${base}-fg}{/${background}-bg}`);
       } else {
         const color = kind === 'hunk' ? 'cyan' : 'white';
         out.push(`{${color}-fg}${kind === 'context' ? highlightCode(line) : blessed.escape(line)}{/${color}-fg}`);
@@ -34,7 +49,12 @@ export function renderTuiMarkdown(content: string, columns: number): string {
     }
   }
   flush();
-  return out.join('\n');
+  const rendered = out.join('\n');
+  renderCache.set(cacheKey, rendered);
+  if (renderCache.size > RENDER_CACHE_LIMIT) {
+    renderCache.delete(renderCache.keys().next().value!);
+  }
+  return rendered;
 }
 
 export function toolDiff(tool: string, output: string): string | undefined {

@@ -317,7 +317,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       }
       if (nativeSelection || hasSelection()) return;
       spinnerFrame = (spinnerFrame + 1) % 20;
-      refresh();
+      scheduleRefresh();
     }, 120);
     spinnerTimer.unref?.();
   };
@@ -404,6 +404,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     return conversation.childBase >= scrollHeight - viewportHeight - 1;
   };
 
+  // Conversation transcript buffer for the frame in flight. lineCursor tracks
+  // the total number of rendered lines (split-aware) pushed so far, giving
+  // O(1) anchors for click-to-expand hit-testing instead of rescanning the
+  // whole buffer per entry.
+  let conversationLines: string[] = [];
+  let lineCursor = 0;
+  const pushConversationLine = (line: string): void => {
+    lineCursor += line.split('\n').length;
+    conversationLines.push(line);
+  };
+
   const renderConversation = (): void => {
     session = runtime.getSession(sessionId) ?? session;
     for (const message of session.messages) {
@@ -414,21 +425,23 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
     const previousScrollOffset = conversationScrollOffset;
     const shouldFollowOutput = conversationFollowOutput;
-    const lines: string[] = [];
+    conversationLines = [];
+    lineCursor = 0;
+    const lines = conversationLines;
     const screenWidth = typeof screen.width === 'number' ? screen.width : 80;
     const markdownCols = Math.max(10, Math.min(120, screenWidth - (activityVisible ? Math.min(36, Math.floor(screenWidth * 0.35)) : 0) - 6));
     thinkingBlockLines.clear();
     const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0;
     if (welcomeVisible) {
-      lines.push(...renderWelcome(
+      for (const line of renderWelcome(
         Number(conversation.width) - Number(conversation.iwidth) - 1,
         Number(conversation.height) - Number(conversation.iheight), Number(screen.height), welcomeFrame,
-      ));
+      )) pushConversationLine(line);
       if (!welcomeTimer) {
         welcomeTimer = setInterval(() => {
           if (nativeSelection || hasSelection() || screen.focused !== composer) return;
           welcomeFrame = (welcomeFrame + 1) % 80;
-          refresh();
+          scheduleRefresh();
         }, 50);
         welcomeTimer.unref?.();
       }
@@ -440,7 +453,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (session.timeline) {
       for (const entry of session.timeline) {
         if (entry.kind === 'message') {
-          lines.push('', entry.role === 'user' ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} ${safe(entry.content)}` : renderTuiMarkdown(entry.content, markdownCols), '');
+          pushConversationLine('');
+          pushConversationLine(entry.role === 'user' ? `{${COLOR.accent}-fg}›{/${COLOR.accent}-fg} ${safe(entry.content)}` : renderTuiMarkdown(entry.content, markdownCols));
+          pushConversationLine('');
           continue;
         }
         const expanded = thinkingBlocks.get(entry.id)?.expanded ?? false;
@@ -449,23 +464,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           thinking: entry.kind === 'thinking' ? entry.content : undefined };
         thinkingBlocks.set(entry.id, block);
         if (entry.kind === 'thinking') {
-          renderThinkingBlock(lines, block);
+          renderThinkingBlock(block);
         } else {
-          const headerLine = lines.reduce((count, line) => count + line.split('\n').length, 0);
+          const headerLine = lineCursor;
           thinkingBlockLines.set(entry.id, { headerLine });
           latestThinkingTurnId = entry.id;
           const agent = entry.instanceId ? runtime.getInstance(entry.instanceId)?.agentId : undefined;
           const icon = entry.status === 'running' ? '◌' : entry.status === 'failed' ? '✗' : entry.status === 'cancelled' ? '−' : '✓';
           const color = entry.status === 'failed' ? COLOR.amber : COLOR.muted;
-          lines.push(`{${color}-fg}${expanded ? '▼' : '▶'} ${icon} ${safe(agent && agent !== 'main' ? `${agent} · ` : '')}${safe(entry.tool ?? '')}  ${safe(oneLine(entry.input, Math.max(20, markdownCols - 30)))}{/${color}-fg}`);
+          pushConversationLine(`{${color}-fg}${expanded ? '▼' : '▶'} ${icon} ${safe(agent && agent !== 'main' ? `${agent} · ` : '')}${safe(entry.tool ?? '')}  ${safe(oneLine(entry.input, Math.max(20, markdownCols - 30)))}{/${color}-fg}`);
           if (expanded) {
-            lines.push(safe(entry.input ?? ''), renderTuiMarkdown(entry.content || 'Running…', markdownCols));
+            pushConversationLine(safe(entry.input ?? ''));
+            pushConversationLine(renderTuiMarkdown(entry.content || 'Running…', markdownCols));
           } else {
             const patch = toolDiff(entry.tool ?? '', entry.content);
-            if (patch) lines.push(renderTuiMarkdown(patch, markdownCols));
-            if (entry.status === 'failed') lines.push(`{${COLOR.amber}-fg}${safe(oneLine(entry.content, markdownCols))}{/${COLOR.amber}-fg}`);
+            if (patch) pushConversationLine(renderTuiMarkdown(patch, markdownCols));
+            if (entry.status === 'failed') pushConversationLine(`{${COLOR.amber}-fg}${safe(oneLine(entry.content, markdownCols))}{/${COLOR.amber}-fg}`);
           }
-          lines.push('');
+          pushConversationLine('');
         }
       }
     }
@@ -479,10 +495,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const content = message.role === 'assistant'
         ? renderTuiMarkdown(message.content, markdownCols)
         : safe(message.content);
-      lines.push('', `${prefix}${content}`, '');
+      pushConversationLine('');
+      pushConversationLine(`${prefix}${content}`);
+      pushConversationLine('');
       if (message.role === 'user' && message.turnId && thinkingBlocks.has(message.turnId)) {
         renderedBlocks.add(message.turnId);
-        renderThinkingBlock(lines, thinkingBlocks.get(message.turnId)!);
+        renderThinkingBlock(thinkingBlocks.get(message.turnId)!);
       }
     }
     if (!session.timeline && pendingTurns.size > 0) {
@@ -491,17 +509,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active' });
       }
       if (!renderedBlocks.has(turnId)) {
-        renderThinkingBlock(lines, thinkingBlocks.get(turnId)!);
+        renderThinkingBlock(thinkingBlocks.get(turnId)!);
       }
     }
     for (const [turnId, text] of session.timeline ? [] : streams.entries()) {
       if (!text.trim()) continue;
-      lines.push('', `{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`, renderTuiMarkdown(text, markdownCols), '');
+      pushConversationLine('');
+      pushConversationLine(`{${COLOR.muted}-fg}…{/${COLOR.muted}-fg}`);
+      pushConversationLine(renderTuiMarkdown(text, markdownCols));
+      pushConversationLine('');
     }
-    if (notice) lines.push('', `{${COLOR.amber}-fg}${safe(notice)}{/${COLOR.amber}-fg}`, '');
+    if (notice) {
+      pushConversationLine('');
+      pushConversationLine(`{${COLOR.amber}-fg}${safe(notice)}{/${COLOR.amber}-fg}`);
+      pushConversationLine('');
+    }
     restoringConversationScroll = true;
     try {
-      conversation.setContent(lines.join('\n'));
+      conversation.setContent(conversationLines.join('\n'));
       if (welcomeVisible) {
         conversation.resetScroll();
       } else if (shouldFollowOutput) {
@@ -516,9 +541,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     conversationFollowOutput = shouldFollowOutput;
   };
 
-  const renderThinkingBlock = (lines: string[], block: ThinkingBlock): void => {
-    // Array entries can contain multiple source lines (messages and Markdown).
-    const headerLine = lines.reduce((count, line) => count + line.split('\n').length, 0);
+  const renderThinkingBlock = (block: ThinkingBlock): void => {
+    const headerLine = lineCursor;
     const toggle = block.expanded ? '▼' : '▶';
     const icon = block.status === 'active'
       ? ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][spinnerFrame % 10]
@@ -529,23 +553,26 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       : (block.status === 'active' ? 'Working' : 'Activity');
     if (block.status === 'active') {
       const scanLabel = `{${COLOR.accent}-fg}${label}{/${COLOR.accent}-fg}`;
-      lines.push(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}`);
+      pushConversationLine(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}`);
     } else {
-      lines.push(`{${color}-fg}${icon} ${label}{/${color}-fg}`);
+      pushConversationLine(`{${color}-fg}${icon} ${label}{/${color}-fg}`);
     }
     thinkingBlockLines.set(block.turnId, { headerLine });
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
-      if (block.thinking) lines.push(...safe(block.thinking).split('\n').map((line) => `  ${line}`), '');
+      if (block.thinking) {
+        for (const line of safe(block.thinking).split('\n')) pushConversationLine(`  ${line}`);
+        pushConversationLine('');
+      }
       const content = block.content.length > 0 ? block.content : block.thinking ? [] : ['No thinking or tool activity received yet.'];
       for (const c of content) {
         const rendered = c.includes('```diff\n')
           ? renderTuiMarkdown(c, Math.max(10, Number(conversation.width) - 8))
           : safe(c);
-        lines.push(...rendered.split('\n').map((line) => `  ${line}`));
+        for (const line of rendered.split('\n')) pushConversationLine(`  ${line}`);
       }
     }
-    lines.push('');
+    pushConversationLine('');
   };
 
   const renderActivity = (): void => {
@@ -572,6 +599,18 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     composerPrompt.left = 1;
   };
 
+  // Streaming chunks, spinner ticks, and animation frames can fire many times
+  // per macrotask; coalesce them into at most one full repaint per tick.
+  let refreshScheduled = false;
+  const scheduleRefresh = (): void => {
+    if (refreshScheduled || closed) return;
+    refreshScheduled = true;
+    setImmediate(() => {
+      refreshScheduled = false;
+      refresh();
+    });
+  };
+
   const refresh = (): void => {
     if (closed) return;
     if (hasSelection()) return;
@@ -580,7 +619,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     renderStatus();
     renderConversation();
     renderActivity();
-    renderComposer();
     const composerFocused = composerPinned;
     if (composerFocused && screen.focused !== composer) composer.focus();
     if (composerFocused) screen.program.hideCursor();
@@ -893,7 +931,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       streams.clear();
       stopSpinner();
     }
-    refresh();
+    scheduleRefresh();
   };
 
   const unsubscribe = runtime.subscribe(onEvent);
