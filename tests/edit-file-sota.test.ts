@@ -10,7 +10,7 @@
 
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeTool } from '../src/infra/tools.js';
@@ -169,5 +169,67 @@ describe('edit_file SOTA semantics', () => {
     assert.match(result, /3 → 4 lines/);
     assert.match(result, /sha256:[0-9a-f]{12}/);
     assert.equal(await readFile(path, 'utf8'), 'one\ntwo\nextra\nthree');
+  });
+
+  test('session edit lease requires a prior read and rejects stale content', async () => {
+    const path = join(tmpDir, 'leased.txt');
+    await writeFile(path, 'before\n', 'utf8');
+    const versions = new Map<string, string>();
+    const context = {
+      requirePriorRead: true,
+      getReadVersion: (target: string) => versions.get(target),
+      recordReadVersion: (target: string, version: string) => versions.set(target, version),
+    };
+    const missing = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: 'before', replace: 'after' }]),
+    }, context);
+    assert.match(missing, /requires a prior read_file/);
+    await executeTool('read_file', { path }, context);
+    await writeFile(path, 'changed\n', 'utf8');
+    const stale = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: 'changed', replace: 'after' }]),
+    }, context);
+    assert.match(stale, /read lease is stale/);
+  });
+
+  test('no-match diagnostics include the closest window and diff', async () => {
+    const path = join(tmpDir, 'closest.txt');
+    await writeFile(path, 'function run() {\n  return 42;\n}\n', 'utf8');
+    const result = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: 'function run() {\n return 41;\n}', replace: 'x' }]),
+    });
+    assert.match(result, /Closest normalized window: lines 1-3/);
+    assert.match(result, /```diff/);
+    assert.match(result, /Next action: resubmit the exact matched text/);
+  });
+
+  test('failed edits leave no staging residue and keep the target unchanged', async () => {
+    const path = join(tmpDir, 'staging.txt');
+    const original = 'alpha\nbeta\n';
+    await writeFile(path, original, 'utf8');
+    const failed = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: 'gamma', replace: 'x' }]),
+    });
+    assert.match(failed, /Could not find old text/);
+    assert.equal(await readFile(path, 'utf8'), original);
+    const residue = (await readdir(tmpDir)).filter((name) => name.includes('.staging'));
+    assert.deepEqual(residue, []);
+  });
+
+  test('successful edits leave no staging residue', async () => {
+    const path = join(tmpDir, 'staging-ok.txt');
+    await writeFile(path, 'alpha\nbeta\n', 'utf8');
+    const result = await executeTool('edit_file', {
+      path,
+      edits: JSON.stringify([{ search: 'alpha', replace: 'gamma' }]),
+    });
+    assert.match(result, /^OK:/);
+    assert.equal(await readFile(path, 'utf8'), 'gamma\nbeta\n');
+    const residue = (await readdir(tmpDir)).filter((name) => name.includes('.staging'));
+    assert.deepEqual(residue, []);
   });
 });

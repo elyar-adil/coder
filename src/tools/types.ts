@@ -40,6 +40,11 @@ export interface ToolExecutionContext<TPolicy = unknown> {
   policy?: TPolicy;
   acquireWriteLock?: (path: string) => Promise<() => void | Promise<void>>;
   checkpoint?: (note: string) => Promise<void>;
+  /** Session-scoped file lease used by edit_file's read-before-edit invariant. */
+  requirePriorRead?: boolean;
+  getReadVersion?: (path: string) => string | undefined;
+  recordReadVersion?: (path: string, version: string) => void;
+  recordWriteVersion?: (path: string, version: string) => void;
 }
 
 export type ToolArguments = Record<string, unknown>;

@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { chatStream, type BackendConfig, type ChatChunk } from '../backend.js';
@@ -38,6 +38,8 @@ export interface AgentRuntimeOptions {
   maxConcurrentTurns?: number;
   maxAgentDepth?: number;
   maxChildrenPerTurn?: number;
+  /** Maximum model/tool steps per turn. Main defaults to 64, child agents to 48. */
+  maxSteps?: number;
 }
 
 function now(): string {
@@ -60,6 +62,9 @@ function mergeAgentUsage(previous: AgentInstance['usage'], usage: ModelUsage | u
 function sessionChildren(instances: Map<string, AgentInstance>, parentId: string): AgentInstance[] {
   return [...instances.values()].filter((instance) => instance.parentInstanceId === parentId);
 }
+
+/** Tools whose success constitutes real progress (state changed on disk). */
+const PROGRESS_TOOLS = new Set(['edit_file', 'write_file']);
 
 // ── Context compaction ───────────────────────────────────────────────────────
 
@@ -166,6 +171,9 @@ export class AgentRuntime {
   private readonly maxConcurrentTurns: number;
   private readonly maxAgentDepth: number;
   private readonly maxChildrenPerTurn: number;
+  private readonly maxSteps?: number;
+  private readonly readVersions = new Map<string, Map<string, string>>();
+  private readonly failureCounts = new Map<string, Map<string, number>>();
   private defaultModel?: string;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly instances = new Map<string, AgentInstance>();
@@ -192,6 +200,7 @@ export class AgentRuntime {
     this.maxConcurrentTurns = Math.max(1, options.maxConcurrentTurns ?? Number(process.env.AGENT_MAX_CONCURRENT_TURNS ?? 4));
     this.maxAgentDepth = Math.max(1, options.maxAgentDepth ?? Number(process.env.AGENT_MAX_DEPTH ?? 4));
     this.maxChildrenPerTurn = Math.max(1, options.maxChildrenPerTurn ?? Number(process.env.AGENT_MAX_CHILDREN_PER_TURN ?? 3));
+    this.maxSteps = options.maxSteps;
     this.ready = Promise.all([this.registry.load(), this.store.init()]).then(() => this.validateSpecs());
   }
 
@@ -838,6 +847,7 @@ export class AgentRuntime {
     instance.activeTurnId = turnId;
     instance.status = 'running';
     instance.updatedAt = now();
+    this.failureCounts.delete(instance.instanceId);
     this.controllers.set(instance.instanceId, controller);
     this.absorbMailbox(instance);
     this.emit({ type: 'instance_updated', instance: cloneInstance(instance) });
@@ -852,7 +862,8 @@ export class AgentRuntime {
       let turnUsage: ModelUsage | undefined;
       let firstTokenMs: number | undefined;
       let requestCount = 0;
-      for (let step = 0; step < 32; step += 1) {
+      const stepLimit = Math.max(1, this.maxSteps ?? (instance.parentInstanceId ? 48 : 64));
+      for (let step = 0; step < stepLimit; step += 1) {
         if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
         if (instance.pendingCompact || this.shouldAutoCompact(instance.messages, config)) {
           const reason = instance.pendingCompact?.reason ?? 'auto';
@@ -904,6 +915,30 @@ export class AgentRuntime {
           if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
           instance.messages.push({ role: 'tool', content: output, tool_use_id: call.id });
           this.emit({ type: 'tool_finished', instanceId: instance.instanceId, turnId, tool: call.function.name, output });
+          const fingerprint = createHash('sha256')
+            .update(call.function.name)
+            .update('\0')
+            .update(JSON.stringify(args))
+            .update('\0')
+            .update(output)
+            .digest('hex');
+          const failed = /^Error:/i.test(output) || /PolicyError/.test(output);
+          if (failed) {
+            // Progress, not recency, resets the failure chain: counts are kept
+            // per fingerprint, so interleaved successful reads (which prove
+            // nothing changed) cannot launder a repeating failure.
+            const counts = this.failureCounts.get(instance.instanceId) ?? new Map<string, number>();
+            const repeats = (counts.get(fingerprint) ?? 0) + 1;
+            counts.set(fingerprint, repeats);
+            this.failureCounts.set(instance.instanceId, counts);
+            if (repeats >= 3) {
+              throw new Error(`Doom loop detected: ${call.function.name} produced the same failure ${repeats} times without progress. Change approach or inspect the diagnostic before retrying.`);
+            }
+          } else if (PROGRESS_TOOLS.has(call.function.name)) {
+            // Only a state-changing success (an actual write) counts as
+            // progress; read-only successes leave the failure chain intact.
+            this.failureCounts.delete(instance.instanceId);
+          }
         }
         if (instance.pendingCompact && !controller.signal.aborted && instance.activeTurnId === turnId) {
           try {
@@ -914,7 +949,7 @@ export class AgentRuntime {
             }, controller.signal);
           } catch { /* Compaction is best-effort. */ }
         }
-        if (step === 31) throw new Error('Agent reached the 32-step limit. Review the activity and send a follow-up to continue.');
+        if (step === stepLimit - 1) throw new Error(`Agent reached the ${stepLimit}-step safety limit. Review the activity and send a follow-up to continue.`);
       }
       if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
       instance.lastOutput = finalOutput.trim() || instance.lastOutput;
@@ -997,6 +1032,19 @@ export class AgentRuntime {
         signal,
         policy: getToolPolicy(),
         acquireWriteLock: (path) => this.fileLocks.acquire(path),
+        requirePriorRead: true,
+        getReadVersion: (path) => this.readVersions.get(instance.instanceId)?.get(resolve(path)),
+        recordReadVersion: (path, version) => {
+          let versions = this.readVersions.get(instance.instanceId);
+          if (!versions) {
+            versions = new Map();
+            this.readVersions.set(instance.instanceId, versions);
+          }
+          versions.set(resolve(path), version);
+        },
+        recordWriteVersion: (path, _version) => {
+          this.readVersions.get(instance.instanceId)?.delete(resolve(path));
+        },
       });
     } catch (error) {
       return `Error: ${error instanceof Error ? error.message : String(error)}`;

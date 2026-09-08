@@ -61,6 +61,67 @@ function textModel(): ConstructorParameters<typeof AgentRuntime>[0]['modelStream
 }
 
 describe('AgentRuntime', () => {
+  test('stops repeated identical tool failures as a doom loop', async () => {
+    let call = 0;
+    const { runtime, root } = await fixture(async function* () {
+      call += 1;
+      yield {
+        content: null,
+        toolCalls: [{ id: `failed-${call}`, function: { name: 'unknown_tool', arguments: { same: true } } }],
+        done: false,
+      };
+      yield { content: null, done: true };
+    });
+    try {
+      const session = await runtime.openSession('doom-loop');
+      await runtime.submitMessage('doom-loop', 'start');
+      await runtime.waitForIdle('doom-loop');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'failed');
+      assert.match(main.lastError ?? '', /Doom loop detected/);
+      assert.equal(call, 3);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('interleaved read-only successes do not reset the doom-loop failure chain', async () => {
+    let call = 0;
+    let editCalls = 0;
+    const { runtime, root } = await fixture(async function* () {
+      call += 1;
+      if (call % 2 === 1) {
+        editCalls += 1;
+        yield {
+          content: null,
+          toolCalls: [{ id: `edit-${call}`, function: { name: 'edit_file', arguments: { path: 'target.txt', edits: JSON.stringify([{ search: 'absent text', replace: 'x' }]) } } }],
+          done: false,
+        };
+      } else {
+        yield {
+          content: null,
+          toolCalls: [{ id: `read-${call}`, function: { name: 'read_file', arguments: { path: 'target.txt' } } }],
+          done: false,
+        };
+      }
+      yield { content: null, done: true };
+    });
+    await writeFile(join(root, 'target.txt'), 'real content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('doom-loop-oscillation');
+      await runtime.submitMessage('doom-loop-oscillation', 'start');
+      await runtime.waitForIdle('doom-loop-oscillation');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'failed');
+      assert.match(main.lastError ?? '', /Doom loop detected/);
+      assert.equal(editCalls, 3);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('main responds while the background concurrency budget is fully occupied', async () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });

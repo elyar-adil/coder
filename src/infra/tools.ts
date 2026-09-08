@@ -74,6 +74,41 @@ async function writeViaWorkspace(targetPath: string, content: string, ctx?: Buil
   return absoluteTarget;
 }
 
+/**
+ * Staged, all-or-nothing write: content goes to a staging file next to the
+ * target, is verified from disk, and only then is atomically swapped in via
+ * rename. The target is never observable in a partially written or unverified
+ * state, and any failure (including failed readback verification) leaves the
+ * target byte-for-byte unchanged — no post-failure restore pass needed.
+ */
+async function stagedWrite(
+  path: string,
+  content: string,
+  ctx: BuiltinToolContext | undefined,
+  verify: (written: string) => Promise<void> | void,
+): Promise<string> {
+  const absoluteTarget = resolveWriteTarget(path, ctx);
+  const root = workspaceRoot(ctx);
+  const rel = absoluteTarget.startsWith(root)
+    ? relative(root, absoluteTarget)
+    : join('__external__', absoluteTarget.replace(/^([a-zA-Z]:)?[/\\]+/, ''));
+  const workspacePath = join(root, '.agent-workspace', rel);
+  const staging = `${absoluteTarget}.${process.pid}.${randomUUID()}.staging`;
+  await mkdir(dirname(absoluteTarget), { recursive: true });
+  try {
+    await writeFile(staging, content, 'utf8');
+    const written = await readFile(staging, 'utf8');
+    await verify(written);
+    await mkdir(dirname(workspacePath), { recursive: true });
+    await atomicWrite(workspacePath, content);
+    await rename(staging, absoluteTarget);
+  } catch (error) {
+    await rm(staging, { force: true }).catch(() => undefined);
+    throw error;
+  }
+  return absoluteTarget;
+}
+
 async function atomicWrite(path: string, content: string): Promise<void> {
   const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   await writeFile(temp, content, 'utf8');
@@ -208,6 +243,57 @@ function closestLineHints(content: string, search: string): number[] {
   const hints = lineNumbersOf(content, firstLine, 3);
   if (hints.length > 0 || firstLine.length <= 24) return hints;
   return lineNumbersOf(content, firstLine.slice(0, 24), 3);
+}
+
+function normalizedForSimilarity(value: string): string {
+  return value.replace(/\r\n/g, '\n').replace(/[\t ]+/g, ' ').trim();
+}
+
+function editDistance(a: string, b: string): number {
+  if (a === b) return 0;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+  let previous = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current[j] = Math.min(
+        current[j - 1]! + 1,
+        previous[j]! + 1,
+        previous[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+    }
+    previous = current;
+  }
+  return previous[b.length]!;
+}
+
+function closestMatch(content: string, search: string): { line: number; matched: string; similarity: number } | undefined {
+  const requested = search.split('\n');
+  const lines = content.split('\n');
+  const count = requested.length;
+  if (!search.trim() || !lines.length) return undefined;
+  let best: { line: number; matched: string; similarity: number } | undefined;
+  for (let i = 0; i <= lines.length - count; i += 1) {
+    const matched = lines.slice(i, i + count).join('\n');
+    const left = normalizedForSimilarity(search);
+    const right = normalizedForSimilarity(matched);
+    const max = Math.max(left.length, right.length, 1);
+    const similarity = 1 - editDistance(left, right) / max;
+    if (!best || similarity > best.similarity) best = { line: i + 1, matched, similarity };
+  }
+  return best;
+}
+
+function diagnosticDiff(requested: string, matched: string): string {
+  const requestedLines = requested.split('\n');
+  const matchedLines = matched.split('\n');
+  const lines = ['```diff', '- requested'];
+  lines.push(...requestedLines.map((line) => `- ${line}`));
+  lines.push('+ matched');
+  lines.push(...matchedLines.map((line) => `+ ${line}`));
+  lines.push('```');
+  return lines.join('\n');
 }
 
 function stripReadFileLineNumbers(search: string): string | undefined {
@@ -565,8 +651,7 @@ function parseStringArray(value: unknown): string[] | undefined {
   }
 }
 
-async function readLineRange(filePath: string, offset = 1, limit?: number): Promise<string> {
-  const raw = await readFile(filePath, 'utf8');
+function formatLineRange(raw: string, offset = 1, limit?: number): string {
   if (raw === '') return '';
   const allLines = raw.split('\n');
   const totalLines = allLines.length;
@@ -580,9 +665,17 @@ async function readLineRange(filePath: string, offset = 1, limit?: number): Prom
     : numbered;
 }
 
+async function readLineRange(filePath: string, offset = 1, limit?: number): Promise<string> {
+  return formatLineRange(await readFile(filePath, 'utf8'), offset, limit);
+}
+
 function boundedOutput(value: string, maxChars = 4 * 1024 * 1024): string {
   if (value.length <= maxChars) return value;
   return `${value.slice(0, maxChars)}\n... (output truncated at ${maxChars} characters)`;
+}
+
+function contentVersion(content: string): string {
+  return createHash('sha256').update(content).digest('hex');
 }
 
 // ── Pure-Node search fallback (used when `rg` is not installed) ──────────────
@@ -974,7 +1067,10 @@ async function executeBuiltinTool(
       const offsetArg = typeof args['offset'] === 'number' ? args['offset'] : undefined;
       const limitArg = typeof args['limit'] === 'number' ? args['limit'] : undefined;
       try {
-        return await readLineRange(resolveToolPath(path, ctx), offsetArg, limitArg);
+        const targetPath = resolveToolPath(path, ctx);
+        const content = await readFile(targetPath, 'utf8');
+        ctx?.recordReadVersion?.(targetPath, contentVersion(content));
+        return formatLineRange(content, offsetArg, limitArg);
       } catch (error) {
         return `Error reading file: ${String(error)}`;
       }
@@ -993,7 +1089,10 @@ async function executeBuiltinTool(
           continue;
         }
         try {
-          sections.push(`===== ${path} =====\n${await readLineRange(resolveToolPath(path, ctx), 1, maxLines)}`);
+          const targetPath = resolveToolPath(path, ctx);
+          const content = await readFile(targetPath, 'utf8');
+          ctx?.recordReadVersion?.(targetPath, contentVersion(content));
+          sections.push(`===== ${path} =====\n${formatLineRange(content, 1, maxLines)}`);
         } catch (error) {
           sections.push(`===== ${path} =====\nError reading file: ${String(error)}`);
         }
@@ -1039,6 +1138,16 @@ async function executeBuiltinTool(
         } catch (error) {
           return `Error reading file for edit: ${String(error)}`;
         }
+        const currentVersion = contentVersion(src);
+        if (ctx?.requirePriorRead) {
+          const readVersion = ctx.getReadVersion?.(targetPath);
+          if (!readVersion) {
+            return `Error: edit_file requires a prior read_file of ${path} in this session. Read the file, then retry the edit.`;
+          }
+          if (readVersion !== currentVersion) {
+            return `Error: edit_file read lease is stale for ${path}; the file changed after it was read. Read it again before editing.`;
+          }
+        }
 
         let parsed: Array<{ search: string; replace?: string; expectedReplacements?: number; replaceAll?: boolean }>;
         try {
@@ -1054,14 +1163,19 @@ async function executeBuiltinTool(
           return `Error parsing edits JSON: ${String(error)}`;
         }
 
-        const noMatchError = (index: number, search: string): string => {
-          const hints = closestLineHints(src, search);
+        const noMatchError = (index: number, search: string, haystack = content): string => {
+          const hints = closestLineHints(haystack, search);
           const hint = hints.length > 0 ? `\nFirst line of the search loosely appears near lines: ${hints.join(', ')}.` : '';
-          return `Error: edit[${index}]: Could not find old text in ${path}. It must match exactly, including whitespace, indentation, and line endings.\nSearch string was:\n${search}${hint}`;
+          const closest = closestMatch(haystack, search);
+          const detail = closest
+            ? `\nClosest normalized window: lines ${closest.line}-${closest.line + search.split('\n').length - 1} (similarity ${closest.similarity.toFixed(3)}).\n${diagnosticDiff(search, closest.matched)}`
+            : '';
+          return `Error: edit[${index}]: Could not find old text in ${path}. It must match exactly, including whitespace, indentation, and line endings.\nSearch string was:\n${search}${hint}${detail}\nNext action: resubmit the exact matched text.`;
         };
 
         let content = src;
         const log: string[] = [];
+        const diagnostics: string[] = [];
         const applied: Array<{ search: string; replace: string; made: number }> = [];
         for (let i = 0; i < parsed.length; i += 1) {
           const entry = parsed[i]!;
@@ -1080,8 +1194,10 @@ async function executeBuiltinTool(
           const numberedSearch = stripReadFileLineNumbers(search);
           const unescapedSearch = unescapeEscapes(search);
           const variants = [search];
-          if (numberedSearch !== undefined && numberedSearch !== search && !variants.includes(numberedSearch)) variants.push(numberedSearch);
-          if (unescapedSearch !== search && !variants.includes(unescapedSearch)) variants.push(unescapedSearch);
+          if (!replaceAll) {
+            if (numberedSearch !== undefined && numberedSearch !== search && !variants.includes(numberedSearch)) variants.push(numberedSearch);
+            if (unescapedSearch !== search && !variants.includes(unescapedSearch)) variants.push(unescapedSearch);
+          }
 
           if (replaceAll) {
             let usedVariant: string | undefined;
@@ -1128,7 +1244,10 @@ async function executeBuiltinTool(
           content = content.replace(matched, effectiveReplace);
           applied.push({ search: matched, replace: effectiveReplace, made: 1 });
           const normalizedLineNumbers = numberedSearch !== undefined && matchedVariant === numberedSearch;
-          log.push(`edit[${i}]: replaced ${matched.length} chars via ${outcome.strategy}${normalizedLineNumbers ? ' (line-number normalized)' : ''}`);
+          log.push(`edit[${i}]: replaced ${matched.length} chars via ${outcome.strategy}${normalizedLineNumbers ? ' (line-number normalized)' : ''}${outcome.strategy === 'exact' ? '' : ' [non-exact; use exact text next time]'}`);
+          if (outcome.strategy !== 'exact' || normalizedLineNumbers) {
+            diagnostics.push(`edit[${i}] matched span vs requested (strategy: ${outcome.strategy}${normalizedLineNumbers ? ', line-number normalized' : ''}):\n${diagnosticDiff(search, matched)}`);
+          }
         }
 
         if (content === src) {
@@ -1136,25 +1255,27 @@ async function executeBuiltinTool(
         }
 
         try {
-          const writtenPath = await writeViaWorkspace(path, content, ctx);
-          const written = await readFile(writtenPath, 'utf8');
-          for (const edit of applied) {
-            if (edit.replace === '') {
-              if (countOccurrences(written, edit.search) !== 0) {
-                return `Error: readback verification failed for ${path}: deleted text is still present after write.`;
+          const writtenPath = await stagedWrite(path, content, ctx, (written) => {
+            for (const edit of applied) {
+              if (edit.replace === '') {
+                if (countOccurrences(written, edit.search) !== 0) {
+                  throw new Error(`readback verification failed for ${path}: deleted text is still present after write.`);
+                }
+              } else if (countOccurrences(written, edit.replace) < edit.made) {
+                throw new Error(`readback verification failed for ${path}: expected at least ${edit.made} occurrence(s) of the replaced text in the written file.`);
               }
-            } else if (countOccurrences(written, edit.replace) < edit.made) {
-              return `Error: readback verification failed for ${path}: expected at least ${edit.made} occurrence(s) of the replaced text in the written file.`;
             }
-          }
+          });
           await gitAutoCommit(writtenPath, `edit: ${path} (${applied.length} change${applied.length === 1 ? '' : 's'})`, ctx);
           const diff = unifiedDiff(path, src, content);
-          const sha256 = createHash('sha256').update(written).digest('hex').slice(0, 12);
+          const sha256 = createHash('sha256').update(content).digest('hex').slice(0, 12);
+          ctx?.recordWriteVersion?.(targetPath, contentVersion(content));
           const linesBefore = src.split('\n').length;
-          const linesAfter = written.split('\n').length;
-          return [`OK: ${log.join('; ')} (${writtenPath}); ${linesBefore} → ${linesAfter} lines; sha256:${sha256}`, diff].filter(Boolean).join('\n\n');
+          const linesAfter = content.split('\n').length;
+          return [`OK: ${log.join('; ')} (${writtenPath}); ${linesBefore} → ${linesAfter} lines; sha256:${sha256}`, diagnostics.join('\n\n'), diff].filter(Boolean).join('\n\n');
         } catch (error) {
-          return `Error writing edited file: ${String(error)}`;
+          const message = error instanceof Error ? error.message : String(error);
+          return `Error writing edited file: ${message} (target left unchanged)`;
         }
       });
     }
