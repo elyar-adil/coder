@@ -45,3 +45,17 @@ test('openai chat reports usage and cached input tokens', async (t) => {
   for await (const chunk of chatStream({ type: 'openai', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
   assert.deepEqual(chunks.find((chunk) => chunk.usage)?.usage, { inputTokens: 20, outputTokens: 3, cachedInputTokens: 15, reasoningTokens: undefined });
 });
+
+test('anthropic reports input, output, and cache usage across SSE events', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'event: message_start\ndata: {"message":{"usage":{"input_tokens":30,"cache_read_input_tokens":12,"cache_creation_input_tokens":4}}}',
+    'event: message_delta\ndata: {"usage":{"output_tokens":9}}',
+    'event: message_stop\ndata: {}', '',
+  ].join('\n\n'), { status: 200 }));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'anthropic', baseUrl: 'http://test', model: 'test', apiKey: 'test' }, '', [])) chunks.push(chunk);
+  assert.deepEqual(chunks.filter((chunk) => chunk.usage).map((chunk) => chunk.usage), [
+    { inputTokens: 30, cachedInputTokens: 12, cacheCreationInputTokens: 4 },
+    { outputTokens: 9, cachedInputTokens: undefined, cacheCreationInputTokens: undefined },
+  ]);
+});

@@ -263,7 +263,7 @@ TUI 不再模拟任务管理器，而采用现代桌面聊天应用布局：
 - [ ] main 的“相关工作复用还是新建 coordinator”由 LLM/spec 决定，Runtime 尚未提供语义相似度或去重兜底。
 - [ ] TUI 已现代化但仍是 Blessed 单体界面，尚未拆成可复用组件；暂不提供 Web 客户端。
 - [ ] 多用户、多进程服务化和远程 agent 执行尚未实现。
-- [ ] Agent 级 token/cost 统计和完整 trace 导出尚未实现。
+- [x] Agent 级 token/延迟统计已记录并在 TUI 状态栏展示；完整 trace 导出仍待后续补充。
 
 ## 10. 验收标准
 

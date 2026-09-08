@@ -584,8 +584,8 @@ async function* anthropicStream(
           content_block?: AnthropicContentBlock;
           error?: { message?: string };
           type?: string;
-          message?: { usage?: { input_tokens?: number; output_tokens?: number } };
-          usage?: { input_tokens?: number; output_tokens?: number };
+          message?: { usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } };
+          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
         };
 
         if (event === 'error') {
@@ -625,15 +625,27 @@ async function* anthropicStream(
           continue;
         }
 
+        if (event === 'message_start' && (parsed.message?.usage?.input_tokens !== undefined)) {
+          const usage = parsed.message.usage;
+          yield { content: null, done: false, usage: {
+            inputTokens: usage.input_tokens,
+            cachedInputTokens: usage.cache_read_input_tokens,
+            cacheCreationInputTokens: usage.cache_creation_input_tokens,
+          } };
+        }
+        if (event === 'message_delta' && parsed.usage) {
+          const usage = parsed.usage;
+          if (usage.output_tokens !== undefined || usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined) {
+            yield { content: null, done: false, usage: {
+              outputTokens: usage.output_tokens,
+              cachedInputTokens: usage.cache_read_input_tokens,
+              cacheCreationInputTokens: usage.cache_creation_input_tokens,
+            } };
+          }
+        }
         if (event === 'message_stop') {
           yield { content: null, done: true };
           return;
-        }
-        if (event === 'message_start' && (parsed.message?.usage?.input_tokens !== undefined)) {
-          yield { content: null, done: false, usage: { inputTokens: parsed.message.usage.input_tokens } };
-        }
-        if (event === 'message_delta' && parsed.usage?.output_tokens !== undefined) {
-          yield { content: null, done: false, usage: { outputTokens: parsed.usage.output_tokens } };
         }
       } catch {
         // Ignore malformed frames and keep streaming.

@@ -11,7 +11,7 @@
 | 1. edit_file fuzzy 错位 | ✅ 已修复 | 删除全部阈值类模糊策略，对齐 Claude Code / pi 的纯确定性匹配 |
 | 2. edit 反馈失真 | ✅ 已修复 | diff 由写入后真实内容生成 + readback 验证 + 行数/sha 上报 + no-op 显式状态 |
 | 3. Windows 搜索薄弱 | ✅ 已修复 | rg 任意失败退化纯 JS fallback + 正则回归测试 + win32 bash 能力声明 |
-| 4. usage/token 统计 | ⏸ 暂缓 | 方案已调研定稿（见下文），暂不实施 |
+| 4. usage/token 统计 | ✅ 已实施 | 四个 provider 解析 usage，Runtime 聚合并在 TUI 状态栏展示 |
 | 5. write_file 无防呆 | ✅ 已修复 | 覆盖前自动快照（`.coder/snapshots/`），对齐 OpenCode/Claude Code 的快照+回滚模式 |
 
 验证基线：`npm run typecheck` 无错误 + `npm test` 135 pass / 0 fail。
@@ -63,7 +63,7 @@
 
 **实施说明（2026-09-07）**：rg 除"成功 + exit 1（无匹配）"外的任何失败（ENOENT、exit ≥ 2 的坏正则、spawn 错误、Windows .cmd shim 等）均退化到纯 JS `searchTextFallback`（已导出便于测试），两级错误信息合并上报；fallback 正则回归测试覆盖 `\.`、`\d`、非法正则字面量退化、glob 过滤、`m` 锚定、上限截断（tests/search-text.test.ts，6 例）；bash 工具在 win32 下于描述与结果中声明 cmd.exe 能力边界并建议改用 search_text/read_file。
 
-### 4. usage / token 统计缺失 — 🟠 中 ⏸ 暂缓（方案已定，随时可重启）
+### 4. usage / token 统计缺失 — 🟠 中 ✅ 已修复
 
 **现象**
 用户与 agent 都看不到每次 turn 花了多少 token。四个后端（Anthropic / Ollama /
@@ -74,11 +74,11 @@ OpenAI Chat / Responses）的流式协议其实都返回 usage：
 - OpenAI Chat：`usage`（需 `stream_options: { include_usage: true }`）
 - Responses：`response.completed` 的 `usage`（含 `reasoning_tokens`）
 
-**修复建议**（方案已调研定稿，暂缓实施）
+**实施说明**
 
-1. `ChatChunk` 增加 `usage?: { inputTokens; outputTokens; reasoningTokens? }`，各后端解析。
-2. runtime 聚合每 turn 用量，写入 SessionMessage 与 timeline（持久化）。
-3. TUI 在状态栏或 Agent Activity 显示 per-turn / per-session 消耗。
+1. `ChatChunk` 增加 usage，各后端解析并保留 cached/reasoning 字段。
+2. Runtime 聚合每 turn 用量、请求数和首 token 延迟，随 AgentInstance 持久化。
+3. TUI 状态栏显示 session 聚合 token、cache 和首 token 延迟。
 
 （附注：实施时顺带修复 backend.ts SSE 仅按 `\n\n` 分割、不兼容 CRLF 的问题；responses.ts 已做 CRLF 归一。）
 

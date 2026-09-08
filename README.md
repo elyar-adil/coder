@@ -49,7 +49,7 @@ Interactive mode requires a terminal. Non-interactive runs report agent failures
 
 ## Architecture
 
-The user talks to `main`, whose primary responsibility is responsive conversation and coordination. Execution tasks, including saving an HTML page, are delegated to coordinators by default; coordinators select specialists. Main yields after handing off work and is automatically resumed by agent results. Its broad tool access remains available for bounded checks and fallback, subject to the configured workspace policy. The scheduler reserves user-facing capacity independently of the background concurrency limit.
+The user talks to `main`, whose primary responsibility is responsive conversation and forward progress. Main handles small, local, and well-scoped work directly. It delegates only genuinely multi-file, ambiguous, or independently parallel work; coordinators select specialists only when that extra coordination is useful. Main remains available while background work runs and is resumed by verified agent results. The scheduler reserves user-facing capacity independently of the background concurrency limit.
 
 ```text
 user ↔ main → coordinator(s) → explorer / implement / review / custom agents
@@ -102,6 +102,10 @@ Specs can reduce capabilities but cannot bypass global tool policy, path boundar
 - New user input interrupts only main's current generation. Background agents keep running until main explicitly redirects or cancels them.
 - Only main output enters the user-visible conversation.
 - Sessions and instances persist under `~/.coder/runtime/` and recover after restart.
+- Each turn records requests, input/output tokens, provider-reported cached input, and first-token latency when the backend supplies them. The status bar shows the session aggregate.
+- `AGENT_MAX_CHILDREN_PER_TURN` limits fan-out (default `3`); `AGENT_MAX_CONCURRENT_TURNS` and `AGENT_MAX_DEPTH` provide additional scheduler guardrails.
+
+Provider prompt caching is used when the provider supports it: runtime system prefixes stay stable and live sibling state travels through mailboxes instead of being re-injected into every request. Cross-request response caching is intentionally avoided because coding answers depend on the current workspace and tool results.
 
 ### Context compaction
 

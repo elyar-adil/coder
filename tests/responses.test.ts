@@ -37,3 +37,12 @@ test('Responses reports incomplete streams instead of treating them as success',
     for await (const _chunk of chatStream({ type: 'openai', wireApi: 'responses', baseUrl: 'http://test', model: 'test' }, '', [])) { /* consume */ }
   }, /before completion/);
 });
+
+test('Responses reports completed input, output, cache, and reasoning usage', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'data: {"type":"response.completed","response":{"usage":{"input_tokens":40,"output_tokens":11,"input_tokens_details":{"cached_tokens":18},"output_tokens_details":{"reasoning_tokens":6}}}}', '',
+  ].join('\n\n')));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'openai', wireApi: 'responses', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
+  assert.deepEqual(chunks.at(-1)?.usage, { inputTokens: 40, outputTokens: 11, cachedInputTokens: 18, reasoningTokens: 6 });
+});
