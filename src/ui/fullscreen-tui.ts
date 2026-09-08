@@ -11,6 +11,7 @@ import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
 import { diffPreview, elapsedLabel, isWaitingForFirstToken, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
+import { applyPillScrollbarTheme, createPillScrollbar, pillScrollbarColors, syncPillScrollbar } from './scrollbar.js';
 import { recordTimeline } from '../runtime/session-timeline.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
 import type { TuiThemeColors, Tone } from './theme.js';
@@ -180,11 +181,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const conversation = blessed.box({
     parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
     tags: true, scrollable: true, alwaysScroll: true, keys: true, vi: true, mouse: true, autoFocus: false,
-    scrollbar: {
-      ch: '│',
-      track: { bg: COLOR().panel },
-      style: { fg: COLOR().muted },
-    },
+    scrollbar: createPillScrollbar(COLOR),
     padding: { left: 2, right: 2 },
     style: { bg: COLOR().background, fg: COLOR().text },
   });
@@ -198,6 +195,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     parent: screen, top: 3, right: 0, width: '28%', bottom: 2,
     tags: true, keys: true, vi: true, mouse: true,
     scrollable: true, padding: { left: 1, right: 1 },
+    scrollbar: createPillScrollbar(COLOR),
     style: {
       bg: COLOR().activity, fg: COLOR().muted,
       selected: { bg: COLOR().elevated, fg: COLOR().accent, bold: true },
@@ -239,13 +237,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     statusbar.style.fg = c.muted;
     conversation.style.bg = c.background;
     conversation.style.fg = c.text;
-    const scrollbar = (conversation as unknown as { scrollbar?: { track?: { bg?: string }; style?: { fg?: string } } }).scrollbar;
-    if (scrollbar) {
-      scrollbar.track = scrollbar.track ?? {};
-      scrollbar.track.bg = c.panel;
-      scrollbar.style = scrollbar.style ?? {};
-      scrollbar.style.fg = c.muted;
-    }
+    applyPillScrollbarTheme(conversation, pillScrollbarColors(c));
+    applyPillScrollbarTheme(activity, pillScrollbarColors(c));
+    if (activityDetail) applyPillScrollbarTheme(activityDetail.body, pillScrollbarColors(c));
     activity.style.bg = c.activity;
     activity.style.fg = c.muted;
     activity.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
@@ -867,6 +861,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (composerFocused && screen.focused !== composer) composer.focus();
     if (composerFocused) screen.program.hideCursor();
     renderScreen();
+    // Raw SGR writes are painted after blessed's own render so the pill
+    // survives programmatic scrolls and theme switches that don't emit
+    // scroll events.
+    syncPillScrollbar(conversation, () => pillScrollbarColors(COLOR()));
+    syncPillScrollbar(activity, () => pillScrollbarColors(COLOR()));
+    if (activityDetail) syncPillScrollbar(activityDetail.body, () => pillScrollbarColors(COLOR()));
     if (composerFocused) {
       placeComposerCursor();
       screen.program.showCursor();
@@ -1097,7 +1097,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const body = blessed.box({
       parent: modal, top: 3, left: 2, right: 2, bottom: 2,
       tags: true, keys: true, vi: true, mouse: true, scrollable: true, alwaysScroll: true,
-      scrollbar: { ch: '│', track: { bg: COLOR().modal }, style: { fg: COLOR().subtle } },
+      scrollbar: createPillScrollbar(COLOR),
       style: { bg: COLOR().modal, fg: COLOR().text },
       content: activityDetailContent(instance),
     });
@@ -1114,6 +1114,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       focusComposer();
     };
     body.key(['escape', 'q'], closeDetail);
+    body.on('scroll', () => {
+      setImmediate(() => { if (!closed) syncPillScrollbar(body, () => pillScrollbarColors(COLOR())); });
+    });
     activityDetail = { instanceId: instance.instanceId, modal, body };
     body.focus();
     requestFullRedraw();
@@ -1372,6 +1375,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
   activity.key(['enter', 'space'], () => { runAction(showActivityDetail); });
   activity.on('select item', (_item, index) => { selectedActivityIndex = index; });
+  activity.on('scroll', () => {
+    setImmediate(() => { if (!closed) syncPillScrollbar(activity, () => pillScrollbarColors(COLOR())); });
+  });
   const openCommandPalette = (): void => {
     if (screen.focused === composer || screen.focused === conversation || screen.focused === activity) runAction(commandPalette);
   };
@@ -1481,6 +1487,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (restoringConversationScroll) return;
     conversationScrollOffset = conversation.childBase;
     conversationFollowOutput = conversationAtBottom();
+    // Blessed renders after scroll handlers run, so paint on the next tick
+    // to keep the pill on top of blessed's own thumb.
+    setImmediate(() => { if (!closed) syncPillScrollbar(conversation, () => pillScrollbarColors(COLOR())); });
   });
   screen.key(['pageup', 'pagedown'], (_ch, key) => {
     selection = undefined;
