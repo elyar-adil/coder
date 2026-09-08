@@ -120,8 +120,88 @@ const rosePine: TuiTheme = {
   syntax: ['#908caa', '#f6c177', '#c4a7e7', '#9ccfd8', '#ebbcba'],
 };
 
+const tokyoNight: TuiTheme = {
+  name: 'tokyo-night', label: 'Tokyo Night · neon dusk',
+  ui: { background: '#1a1b26', panel: '#16161e', composer: '#1f2335', activity: '#1c1d2b', elevated: '#292e42', modal: '#1f2335', modalRule: '#2f334d', line: '#3b4261', text: '#c0caf5', muted: '#a9b1d6', subtle: '#565f89', accent: '#7aa2f7', success: '#9ece6a', warning: '#e0af68', error: '#f7768e' },
+  markdown: { text: '#c0caf5', muted: '#565f89', accent: '#7dcfff', heading: '#7aa2f7', headingStrong: '#c0caf5', codeBg: '#16161e', codeText: '#a9b1d6', codeFence: '#3b4261', diffAddBg: '#1e2a24', diffAddText: '#9ece6a', diffDelBg: '#2d202a', diffDelText: '#f7768e' },
+  syntax: ['#565f89', '#9ece6a', '#bb9af7', '#7aa2f7', '#ff9e64'],
+};
+
+const catppuccinMocha: TuiTheme = {
+  name: 'catppuccin-mocha', label: 'Catppuccin Mocha · pastel night',
+  ui: { background: '#1e1e2e', panel: '#181825', composer: '#242438', activity: '#181825', elevated: '#313244', modal: '#1b1b2a', modalRule: '#45475a', line: '#313244', text: '#cdd6f4', muted: '#a6adc8', subtle: '#6c7086', accent: '#89b4fa', success: '#a6e3a1', warning: '#f9e2af', error: '#f38ba8' },
+  markdown: { text: '#cdd6f4', muted: '#6c7086', accent: '#89b4fa', heading: '#cba6f7', headingStrong: '#cdd6f4', codeBg: '#181825', codeText: '#cdd6f4', codeFence: '#45475a', diffAddBg: '#20312a', diffAddText: '#a6e3a1', diffDelBg: '#3b2530', diffDelText: '#f38ba8' },
+  syntax: ['#6c7086', '#a6e3a1', '#cba6f7', '#89b4fa', '#fab387'],
+};
+
+const catppuccinLatte: TuiTheme = {
+  name: 'catppuccin-latte', label: 'Catppuccin Latte · pastel light',
+  ui: { background: '#eff1f5', panel: '#e6e9ef', composer: '#e6e9ef', activity: '#dce0e8', elevated: '#ccd0da', modal: '#f4f6fb', modalRule: '#bcc0cc', line: '#bcc0cc', text: '#4c4f69', muted: '#6c6f85', subtle: '#9ca0b0', accent: '#1e66f5', success: '#40a02b', warning: '#df8e1d', error: '#d20f39' },
+  markdown: { text: '#4c4f69', muted: '#9ca0b0', accent: '#1e66f5', heading: '#8839ef', headingStrong: '#4c4f69', codeBg: '#e6e9ef', codeText: '#4c4f69', codeFence: '#acb0be', diffAddBg: '#dcefdd', diffAddText: '#28731c', diffDelBg: '#f4dbdc', diffDelText: '#d20f39' },
+  syntax: ['#9ca0b0', '#40a02b', '#8839ef', '#1e66f5', '#fe640b'],
+};
+
+const gruvboxDark: TuiTheme = {
+  name: 'gruvbox-dark', label: 'Gruvbox Dark · retro groove',
+  ui: { background: '#282828', panel: '#1d2021', composer: '#32302f', activity: '#2c2c28', elevated: '#3c3836', modal: '#2d2c29', modalRule: '#504945', line: '#504945', text: '#ebdbb2', muted: '#d5c4a1', subtle: '#928374', accent: '#fe8019', success: '#b8bb26', warning: '#fabd2f', error: '#fb4934' },
+  markdown: { text: '#ebdbb2', muted: '#928374', accent: '#83a598', heading: '#fabd2f', headingStrong: '#ebdbb2', codeBg: '#1d2021', codeText: '#ebdbb2', codeFence: '#504945', diffAddBg: '#2f331f', diffAddText: '#b8bb26', diffDelBg: '#3c2321', diffDelText: '#fb4934' },
+  syntax: ['#928374', '#b8bb26', '#fb4934', '#83a598', '#d3869b'],
+};
+
+const oneDark: TuiTheme = {
+  name: 'one-dark', label: 'One Dark · atom classic',
+  ui: { background: '#282c34', panel: '#21252b', composer: '#2f343d', activity: '#23272e', elevated: '#3a3f4b', modal: '#2a2e37', modalRule: '#3e4451', line: '#3e4451', text: '#abb2bf', muted: '#828997', subtle: '#5c6370', accent: '#61afef', success: '#98c379', warning: '#e5c07b', error: '#e06c75' },
+  markdown: { text: '#abb2bf', muted: '#5c6370', accent: '#56b6c2', heading: '#61afef', headingStrong: '#d7dae0', codeBg: '#21252b', codeText: '#abb2bf', codeFence: '#3e4451', diffAddBg: '#243129', diffAddText: '#98c379', diffDelBg: '#38262a', diffDelText: '#e06c75' },
+  syntax: ['#5c6370', '#98c379', '#c678dd', '#61afef', '#d19a66'],
+};
+
+const monokai: TuiTheme = {
+  name: 'monokai', label: 'Monokai · classic pop',
+  ui: { background: '#272822', panel: '#1e1f1c', composer: '#2d2e27', activity: '#262721', elevated: '#3e3d32', modal: '#2b2c25', modalRule: '#49483e', line: '#49483e', text: '#f8f8f2', muted: '#a8a89d', subtle: '#75715e', accent: '#66d9ef', success: '#a6e22e', warning: '#e6db74', error: '#f92672' },
+  markdown: { text: '#f8f8f2', muted: '#75715e', accent: '#a6e22e', heading: '#fd971f', headingStrong: '#f8f8f2', codeBg: '#1e1f1c', codeText: '#f8f8f2', codeFence: '#49483e', diffAddBg: '#2a331d', diffAddText: '#a6e22e', diffDelBg: '#3a1f26', diffDelText: '#f92672' },
+  syntax: ['#75715e', '#e6db74', '#f92672', '#66d9ef', '#ae81ff'],
+};
+
+const kanagawa: TuiTheme = {
+  name: 'kanagawa', label: 'Kanagawa · ink wash',
+  ui: { background: '#1f1f28', panel: '#16161d', composer: '#2a2a37', activity: '#1a1a22', elevated: '#363649', modal: '#262635', modalRule: '#363649', line: '#54546d', text: '#dcd7ba', muted: '#c8c093', subtle: '#727169', accent: '#7e9cd8', success: '#98bb6c', warning: '#ff9e3b', error: '#e82424' },
+  markdown: { text: '#dcd7ba', muted: '#727169', accent: '#7fb4ca', heading: '#957fb8', headingStrong: '#dcd7ba', codeBg: '#16161d', codeText: '#dcd7ba', codeFence: '#54546d', diffAddBg: '#2a332e', diffAddText: '#98bb6c', diffDelBg: '#43242b', diffDelText: '#e82424' },
+  syntax: ['#727169', '#98bb6c', '#957fb8', '#7fb4ca', '#ff9e3b'],
+};
+
+const everforest: TuiTheme = {
+  name: 'everforest', label: 'Everforest · moss green',
+  ui: { background: '#2d353b', panel: '#272e33', composer: '#343f44', activity: '#2e373d', elevated: '#3d484d', modal: '#333e44', modalRule: '#475258', line: '#475258', text: '#d3c6aa', muted: '#9da9a0', subtle: '#7a8478', accent: '#a7c080', success: '#83c092', warning: '#dbbc7f', error: '#e67e80' },
+  markdown: { text: '#d3c6aa', muted: '#7a8478', accent: '#7fbbb3', heading: '#dbbc7f', headingStrong: '#d3c6aa', codeBg: '#272e33', codeText: '#d3c6aa', codeFence: '#475258', diffAddBg: '#2f3a2d', diffAddText: '#a7c080', diffDelBg: '#452f2c', diffDelText: '#e67e80' },
+  syntax: ['#7a8478', '#a7c080', '#d699b6', '#7fbbb3', '#dbbc7f'],
+};
+
+const synthwave: TuiTheme = {
+  name: 'synthwave', label: "SynthWave '84 · neon grid",
+  ui: { background: '#262335', panel: '#211d2e', composer: '#2c2840', activity: '#252138', elevated: '#3a3454', modal: '#2a2540', modalRule: '#443d63', line: '#443d63', text: '#f8f8f4', muted: '#a5a1bd', subtle: '#6f6a8a', accent: '#ff7edb', success: '#72f1b8', warning: '#fede5d', error: '#fe4450' },
+  markdown: { text: '#f8f8f4', muted: '#6f6a8a', accent: '#ff7edb', heading: '#36f9f6', headingStrong: '#f8f8f4', codeBg: '#1e1c2c', codeText: '#d9d6e8', codeFence: '#443d63', diffAddBg: '#1e332c', diffAddText: '#72f1b8', diffDelBg: '#3a2233', diffDelText: '#fe4450' },
+  syntax: ['#6f6a8a', '#fede5d', '#ff7edb', '#36f9f6', '#fe8b48'],
+};
+
+const solarizedLight: TuiTheme = {
+  name: 'solarized-light', label: 'Solarized Light · paper',
+  ui: { background: '#fdf6e3', panel: '#eee8d5', composer: '#f4eedd', activity: '#ece5d3', elevated: '#ddd5c1', modal: '#f2ecdb', modalRule: '#ccc4ae', line: '#afa897', text: '#657b83', muted: '#93a1a1', subtle: '#a4aeab', accent: '#268bd2', success: '#859900', warning: '#b58900', error: '#dc322f' },
+  markdown: { text: '#657b83', muted: '#93a1a1', accent: '#268bd2', heading: '#268bd2', headingStrong: '#586e75', codeBg: '#eee8d5', codeText: '#657b83', codeFence: '#93a1a1', diffAddBg: '#e3eedd', diffAddText: '#859900', diffDelBg: '#f3dfdb', diffDelText: '#dc322f' },
+  syntax: ['#93a1a1', '#859900', '#6c71c4', '#268bd2', '#cb4b16'],
+};
+
+const githubLight: TuiTheme = {
+  name: 'github-light', label: 'GitHub Light · clean day',
+  ui: { background: '#ffffff', panel: '#f6f8fa', composer: '#f6f8fa', activity: '#eef1f4', elevated: '#e7ebef', modal: '#fafbfc', modalRule: '#d0d7de', line: '#d0d7de', text: '#1f2328', muted: '#656d76', subtle: '#8b949e', accent: '#0969da', success: '#1a7f37', warning: '#9a6700', error: '#cf222e' },
+  markdown: { text: '#1f2328', muted: '#656d76', accent: '#0969da', heading: '#0969da', headingStrong: '#1f2328', codeBg: '#f6f8fa', codeText: '#1f2328', codeFence: '#d0d7de', diffAddBg: '#dafbe1', diffAddText: '#116329', diffDelBg: '#ffebe9', diffDelText: '#a40e26' },
+  syntax: ['#6e7781', '#0a3069', '#cf222e', '#8250df', '#0550ae'],
+};
+
 export const THEMES: Record<string, TuiTheme> = {
   midnight, nord, dracula, dawn, solarized, 'rose-pine': rosePine,
+  'tokyo-night': tokyoNight, 'catppuccin-mocha': catppuccinMocha, 'catppuccin-latte': catppuccinLatte,
+  'gruvbox-dark': gruvboxDark, 'one-dark': oneDark, monokai, kanagawa, everforest, synthwave,
+  'solarized-light': solarizedLight, 'github-light': githubLight,
 };
 
 export const DEFAULT_THEME = 'midnight';

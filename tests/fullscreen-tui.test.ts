@@ -220,8 +220,12 @@ test('the /theme command repaints every surface with the chosen palette and pers
     assert.ok(themeList, 'choosing /theme must open the theme picker');
     themeList.emit('keypress', '', { name: 'down' });
     await tick();
+    assert.equal(activity.style.bg, '#333b47', 'browsing must live-preview the nord palette before committing');
+    assert.equal(themeList.style.item?.bg, '#353c4a', 'picker rows must adopt the previewed modal palette');
+    assert.equal(activity.style.item?.bg, '#333b47', 'activity rows must adopt the previewed palette');
+    assert.ok(!savedConfigs.some((config) => config.theme === 'nord'), 'preview must not persist the palette');
     themeList.emit('keypress', '', { name: 'enter' });
-    for (let attempt = 0; activity.style.bg !== '#333b47' && attempt < 100; attempt++) await wait(10);
+    for (let attempt = 0; savedConfigs.at(-1)?.theme !== 'nord' && attempt < 100; attempt++) await wait(10);
     assert.equal(activity.style.bg, '#333b47', 'activity surface must adopt the nord palette');
     const composer = screen.children.find((child) => child.style.bg === '#3b4252');
     assert.ok(composer, 'composer surface must adopt the nord palette');
@@ -229,6 +233,42 @@ test('the /theme command repaints every surface with the chosen palette and pers
     assert.ok(composerBand, 'the row above the editor must use the same full-width composer background');
     assert.equal(composerBand?.left, 0, 'composer background band must reach the left edge');
     assert.equal(savedConfigs.at(-1)?.theme, 'nord', 'theme choice must persist to config');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
+test('dismissing the theme picker reverts to the previously selected theme without persisting', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+    config: { theme: 'midnight' },
+  });
+  try {
+    const { screen, input, savedConfigs } = tui;
+    const activity = screen.children.find((child) => child.type === 'list' && child.style.bg === '#11161c') as blessed.Widgets.ListElement;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('/theme');
+    await tick();
+    input.write('\t');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let themeList: blessed.Widgets.ListElement | undefined;
+    for (let attempt = 0; !themeList && attempt < 100; attempt++) {
+      await wait(10);
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => item.getContent().includes('midnight'))) themeList = nested;
+      }
+    }
+    assert.ok(themeList, 'choosing /theme must open the theme picker');
+    themeList.emit('keypress', '', { name: 'down' });
+    for (let attempt = 0; activity.style.bg !== '#333b47' && attempt < 100; attempt++) await wait(10);
+    assert.equal(activity.style.bg, '#333b47', 'browsing must live-preview the nord palette');
+    // list.key() binds 'key escape' on the element itself, so emit that event directly.
+    themeList.emit('key escape', '', { name: 'escape', full: 'escape' });
+    for (let attempt = 0; activity.style.bg !== '#11161c' && attempt < 100; attempt++) await wait(10);
+    assert.equal(activity.style.bg, '#11161c', 'dismissing the picker must roll back to midnight');
+    assert.ok(!savedConfigs.some((config) => config.theme === 'nord'), 'a dismissed preview must not persist anything');
   } finally {
     await tui.cleanup();
   }

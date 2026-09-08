@@ -14,7 +14,7 @@ import { diffPreview, elapsedLabel, isWaitingForFirstToken, STATUS_PRESENTATION,
 import { attachPillScrollbar, type PillScrollbarHandle, type PillScrollbarTheme, pillScrollbarColors } from './scrollbar.js';
 import { recordTimeline } from '../runtime/session-timeline.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
-import type { TuiThemeColors, Tone } from './theme.js';
+import type { TuiTheme, TuiThemeColors, Tone } from './theme.js';
 import { resetTuiMarkdownCache } from './markdown.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
@@ -244,6 +244,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     conversation.style.fg = c.text;
     activity.style.bg = c.activity;
     activity.style.fg = c.muted;
+    // blessed's List copies style.item from the constructor palette and reads
+    // it per unselected row on every render, so it must be re-created here.
+    activity.style.item = { bg: c.activity, fg: c.muted };
     activity.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
     composer.style.bg = c.composer;
     composer.style.fg = c.text;
@@ -254,6 +257,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     composerPrompt.style.fg = c.accent;
     completions.style.bg = c.panel;
     completions.style.fg = c.muted;
+    completions.style.item = { bg: c.panel, fg: c.muted };
     completions.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
     activityHeader.style.bg = c.activity;
     activityHeader.style.fg = c.text;
@@ -455,11 +459,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   };
 
   type ChoiceItem = string | { label: string; detail?: string };
-  const choose = (title: string, items: ChoiceItem[]): Promise<number> => new Promise((resolveChoice) => {
+  interface ChooseOptions {
+    /** Invoked whenever the highlighted entry changes; enables live preview. */
+    onHighlight?: (index: number) => void;
+  }
+  const choose = (title: string, items: ChoiceItem[], options: ChooseOptions = {}): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
-    const renderedItems = items.map((item) => typeof item === 'string'
+    const renderItem = (item: ChoiceItem): string => typeof item === 'string'
       ? safe(item)
-      : `{bold}${safe(item.label)}{/bold}${item.detail ? `  {${COLOR().muted}-fg}${safe(item.detail)}{/${COLOR().muted}-fg}` : ''}`);
+      : `{bold}${safe(item.label)}{/bold}${item.detail ? `  {${COLOR().muted}-fg}${safe(item.detail)}{/${COLOR().muted}-fg}` : ''}`;
     const itemWidths = items.map((item) => typeof item === 'string' ? item.length : Math.max(item.label.length, item.detail?.length ?? 0));
     const width = Math.min(Math.max(28, Number(screen.width) - 4), 82, Math.max(36, ...itemWidths.map((item) => item + 8)));
     const height = Math.min(items.length + 4, 22, Math.max(6, Number(screen.height) - 2));
@@ -477,9 +485,29 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       style: { bg: COLOR().modal, fg: COLOR().modalRule },
     });
     const list = blessed.list({
-      parent: modal, top: 2, left: 1, right: 1, bottom: 1, items: renderedItems, tags: true, keys: true, vi: true, mouse: true,
+      parent: modal, top: 2, left: 1, right: 1, bottom: 1, items: items.map(renderItem), tags: true, keys: true, vi: true, mouse: true,
       scrollable: true, style: { bg: COLOR().modal, fg: COLOR().text, selected: { bg: COLOR().modal, fg: COLOR().accent, bold: true } },
     });
+    // The modal captures style objects at creation time; while a live preview
+    // swaps the active palette, re-patch it so it does not keep the palette
+    // it was opened with.
+    const restyleModal = (): void => {
+      const c = COLOR();
+      modal.style.bg = c.modal;
+      modal.style.fg = c.text;
+      heading.style.bg = c.modal;
+      heading.style.fg = c.text;
+      rule.style.bg = c.modal;
+      rule.style.fg = c.modalRule;
+      rule.setContent(`{${c.modalRule}-fg}${'─'.repeat(Math.max(0, width - 2))}{/${c.modalRule}-fg}`);
+      list.style.bg = c.modal;
+      list.style.fg = c.text;
+      // Row elements resolve their palette from list.style.item on render;
+      // re-create it or the picker keeps the palette it opened with.
+      list.style.item = { bg: c.modal, fg: c.text };
+      list.style.selected = { bg: c.modal, fg: c.accent, bold: true };
+      list.setItems(items.map(renderItem));
+    };
     let done = false;
     const finish = (value: number): void => {
       if (done) return;
@@ -491,6 +519,20 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       resolveChoice(value);
     };
     list.on('select', (_item, index) => finish(index));
+    // setItems() re-emits 'select item' while restoring the selection, so the
+    // preview handler must be re-entrancy guarded or it recurses forever.
+    let restyling = false;
+    list.on('select item', (_item, index) => {
+      if (done || restyling || !options.onHighlight || typeof index !== 'number' || index < 0) return;
+      restyling = true;
+      try {
+        options.onHighlight(index);
+        restyleModal();
+        renderScreen();
+      } finally {
+        restyling = false;
+      }
+    });
     list.key(['escape', 'q'], () => finish(-1));
     list.focus();
     void heading;
@@ -1124,26 +1166,47 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     renderScreen();
   };
 
-  const applyTheme = async (name: string): Promise<void> => {
+  // Swaps the active palette and repaints every surface without persisting;
+  // used both to commit a choice and to preview while browsing the picker.
+  const applyThemeVisuals = (name: string): TuiTheme => {
     const next = setActiveTheme(name);
     resetTuiMarkdownCache();
     applyWidgetTheme();
     conversationDirty = true;
     activityDirty = true;
     requestFullRedraw();
+    return next;
+  };
+
+  const applyTheme = async (name: string): Promise<void> => {
+    const next = applyThemeVisuals(name);
     notice = `Theme set to ${next.label}`;
     await options.configManager.saveConfig({ ...options.configManager.getConfig(), theme: next.name });
     refresh();
   };
 
   const openTheme = async (): Promise<void> => {
-    const current = activeTuiTheme().name;
+    const original = activeTuiTheme().name;
     const names = themeNames();
     const index = await choose('Theme', names.map((name) => ({
-      label: `${name}${name === current ? '  ✓' : ''}`,
+      label: `${name}${name === original ? '  ✓' : ''}`,
       detail: resolveTheme(name).label,
-    })));
-    if (index >= 0) await applyTheme(names[index]!);
+    })), {
+      onHighlight: (highlight) => {
+        const name = names[highlight];
+        if (name && name !== activeTuiTheme().name) {
+          applyThemeVisuals(name);
+          refresh();
+        }
+      },
+    });
+    if (index >= 0) {
+      await applyTheme(names[index]!);
+    } else if (activeTuiTheme().name !== original) {
+      // Picker dismissed: roll back to the theme chosen before previewing.
+      applyThemeVisuals(original);
+      refresh();
+    }
   };
 
   const command = async (raw: string): Promise<void> => {
