@@ -48,7 +48,7 @@ export async function* responsesStream(config: BackendConfig, instructions: stri
         const event = JSON.parse(data) as {
           type: string; delta?: string; message?: string;
           item?: Record<string, unknown> & { type?: string; call_id?: string; name?: string; arguments?: string };
-          response?: { error?: { message?: string }; incomplete_details?: { reason?: string } };
+          response?: { error?: { message?: string }; incomplete_details?: { reason?: string }; usage?: { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number }; output_tokens_details?: { reasoning_tokens?: number } } };
         };
         if (event.type === 'response.output_text.delta' && event.delta) yield { content: event.delta, done: false };
         if (event.type === 'response.reasoning_summary_text.delta' && event.delta) yield { content: null, thinking: event.delta, done: false };
@@ -63,7 +63,16 @@ export async function* responsesStream(config: BackendConfig, instructions: stri
         if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
           throw new Error(event.response?.error?.message ?? event.message ?? event.response?.incomplete_details?.reason ?? `Responses: ${event.type}`);
         }
-        if (event.type === 'response.completed') { yield { content: null, done: true }; return; }
+        if (event.type === 'response.completed') {
+          const usage = event.response?.usage;
+          yield { content: null, done: true, usage: usage ? {
+            inputTokens: usage.input_tokens,
+            outputTokens: usage.output_tokens,
+            cachedInputTokens: usage.input_tokens_details?.cached_tokens,
+            reasoningTokens: usage.output_tokens_details?.reasoning_tokens,
+          } : undefined };
+          return;
+        }
       }
       if (done) throw new Error('Responses stream ended before completion');
     }

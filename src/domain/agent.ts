@@ -29,6 +29,23 @@ export interface AgentModelMessage {
   tool_use_id?: string;
 }
 
+/** Provider reported usage for one model request. Values are optional because
+ * local and OpenAI-compatible gateways do not always return usage in streams. */
+export interface ModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  cachedInputTokens?: number;
+  cacheCreationInputTokens?: number;
+}
+
+export interface AgentUsage extends ModelUsage {
+  requests: number;
+  turns: number;
+  firstTokenMs?: number;
+  lastTurnMs?: number;
+}
+
 export type AgentInstanceStatus = 'queued' | 'running' | 'idle' | 'waiting' | 'failed' | 'cancelled';
 
 export interface AgentMailboxMessage {
@@ -59,6 +76,10 @@ export interface AgentInstance {
   compactionCount?: number;
   /** Scheduled compaction, applied at the next safe boundary (end of the current tool batch). */
   pendingCompact?: { focus?: string; keepRecent?: number; reason: 'auto' | 'manual' };
+  /** Turn that created children, used to prevent unbounded fan-out. */
+  parentTurnId?: string;
+  usage?: AgentUsage;
+  lastTurn?: { startedAt: string; endedAt: string; durationMs: number; usage?: ModelUsage };
 }
 
 export interface SessionMessage {

@@ -49,6 +49,7 @@ export interface ChatChunk {
   thinking?: string;
   toolCalls?: OllamaMsg['tool_calls'];
   done: boolean;
+  usage?: { inputTokens?: number; outputTokens?: number; reasoningTokens?: number; cachedInputTokens?: number; cacheCreationInputTokens?: number };
 }
 
 const ANTHROPIC_VERSION = '2023-06-01';
@@ -132,7 +133,11 @@ async function* ollamaStream(
         yield { content: null, toolCalls: obj.message.tool_calls, done: false };
       }
       if (obj.done) {
-        yield { content: null, done: true };
+        const stats = obj as typeof obj & { prompt_eval_count?: number; eval_count?: number };
+        yield { content: null, done: true, usage: (stats.prompt_eval_count !== undefined || stats.eval_count !== undefined) ? {
+          inputTokens: stats.prompt_eval_count,
+          outputTokens: stats.eval_count,
+        } : undefined };
         return;
       }
     }
@@ -271,6 +276,7 @@ async function* openaiStream(
     model: config.model,
     stream: true,
     messages: convertToOpenAIMessages(systemPrompt, messages),
+    stream_options: { include_usage: true },
   };
   applyOpenAIRequestOptions(body, config);
   const openaiTools = convertToolsToOpenAI(tools);
@@ -316,7 +322,13 @@ async function* openaiStream(
       if (!trimmed.startsWith('data: ')) continue;
 
       try {
-        const parsed = JSON.parse(trimmed.slice(6)) as { choices?: OpenAIChoice[] };
+        const parsed = JSON.parse(trimmed.slice(6)) as { choices?: OpenAIChoice[]; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } } };
+        if (parsed.usage) yield { content: null, done: false, usage: {
+          inputTokens: parsed.usage.prompt_tokens,
+          outputTokens: parsed.usage.completion_tokens,
+          cachedInputTokens: parsed.usage.prompt_tokens_details?.cached_tokens,
+          reasoningTokens: parsed.usage.completion_tokens_details?.reasoning_tokens,
+        } };
         const choice = parsed.choices?.[0];
         if (!choice) continue;
 
@@ -572,6 +584,8 @@ async function* anthropicStream(
           content_block?: AnthropicContentBlock;
           error?: { message?: string };
           type?: string;
+          message?: { usage?: { input_tokens?: number; output_tokens?: number } };
+          usage?: { input_tokens?: number; output_tokens?: number };
         };
 
         if (event === 'error') {
@@ -614,6 +628,12 @@ async function* anthropicStream(
         if (event === 'message_stop') {
           yield { content: null, done: true };
           return;
+        }
+        if (event === 'message_start' && (parsed.message?.usage?.input_tokens !== undefined)) {
+          yield { content: null, done: false, usage: { inputTokens: parsed.message.usage.input_tokens } };
+        }
+        if (event === 'message_delta' && parsed.usage?.output_tokens !== undefined) {
+          yield { content: null, done: false, usage: { outputTokens: parsed.usage.output_tokens } };
         }
       } catch {
         // Ignore malformed frames and keep streaming.

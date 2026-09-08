@@ -114,6 +114,84 @@ test('a finished Thought freezes its duration instead of counting while the turn
   }
 });
 
+test('streamed tokens render incrementally while the turn is still running', async () => {
+  let finishGeneration!: () => void;
+  const generationGate = new Promise<void>((resolve) => { finishGeneration = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      yield { content: 'Hel', thinking: null, done: false };
+      await generationGate;
+      yield { content: 'lo', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // The turn is held open by the gate: 'Hel' must already be visible.
+    let sawPartial = false;
+    for (let attempt = 0; attempt < 50 && !sawPartial; attempt++) {
+      await wait(10);
+      sawPartial = plainText(conversation.getContent()).includes('Hel');
+    }
+    assert.ok(sawPartial, `partial token 'Hel' must render before the turn completes, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    finishGeneration();
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Hello') && attempt < 100; attempt++) await wait(10);
+  } finally {
+    finishGeneration();
+    await tui.cleanup();
+  }
+});
+
+test('the waiting ellipsis shows before the first token and disappears once tokens stream', async () => {
+  let firstToken!: () => void;
+  let finishGeneration!: () => void;
+  const firstTokenGate = new Promise<void>((resolve) => { firstToken = resolve; });
+  const generationGate = new Promise<void>((resolve) => { finishGeneration = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      await firstTokenGate;
+      yield { content: 'Hel', thinking: null, done: false };
+      await generationGate;
+      yield { content: 'lo', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // Before the first token the assistant slot shows the animated ellipsis.
+    let sawIndicator = false;
+    for (let attempt = 0; attempt < 50 && !sawIndicator; attempt++) {
+      await wait(10);
+      sawIndicator = plainText(conversation.getContent()).includes('...');
+    }
+    assert.ok(sawIndicator, `waiting ellipsis must show before the first token, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    assert.ok(/\x1b\[9[0-6]m\.\.\./.test(conversation.getContent()), `indicator dots must be colorized, got: ${JSON.stringify(conversation.getContent())}`);
+    firstToken();
+    let midContent = '';
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await wait(10);
+      midContent = plainText(conversation.getContent());
+      if (midContent.includes('Hel') && !midContent.includes('...')) break;
+    }
+    assert.ok(midContent.includes('Hel'), `partial token must render mid-turn, got: ${JSON.stringify(midContent)}`);
+    assert.ok(!midContent.includes('...'), `indicator must disappear once tokens stream, got: ${JSON.stringify(midContent)}`);
+    finishGeneration();
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Hello') && attempt < 100; attempt++) await wait(10);
+  } finally {
+    firstToken();
+    finishGeneration();
+    await tui.cleanup();
+  }
+});
+
 test('the /theme command repaints every surface with the chosen palette and persists it', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },
@@ -147,6 +225,9 @@ test('the /theme command repaints every surface with the chosen palette and pers
     assert.equal(activity.style.bg, '#333b47', 'activity surface must adopt the nord palette');
     const composer = screen.children.find((child) => child.style.bg === '#3b4252');
     assert.ok(composer, 'composer surface must adopt the nord palette');
+    const composerBand = screen.children.find((child) => child.style.bg === '#3b4252' && Number(child.height) === 1);
+    assert.ok(composerBand, 'the row above the editor must use the same full-width composer background');
+    assert.equal(composerBand?.left, 0, 'composer background band must reach the left edge');
     assert.equal(savedConfigs.at(-1)?.theme, 'nord', 'theme choice must persist to config');
   } finally {
     await tui.cleanup();

@@ -7,6 +7,7 @@ import type {
   AgentInstance,
   AgentMailboxMessage,
   AgentModelMessage,
+  ModelUsage,
   AgentSession,
   AgentSpec,
   PersistedAgentSession,
@@ -36,10 +37,28 @@ export interface AgentRuntimeOptions {
   modelStream?: ModelStream;
   maxConcurrentTurns?: number;
   maxAgentDepth?: number;
+  maxChildrenPerTurn?: number;
 }
 
 function now(): string {
   return new Date().toISOString();
+}
+
+function mergeUsage(previous: ModelUsage | undefined, next: ModelUsage): ModelUsage {
+  const result: ModelUsage = { ...(previous ?? {}) };
+  for (const key of ['inputTokens', 'outputTokens', 'reasoningTokens', 'cachedInputTokens', 'cacheCreationInputTokens'] as const) {
+    if (next[key] !== undefined) result[key] = (result[key] ?? 0) + next[key]!;
+  }
+  return result;
+}
+
+function mergeAgentUsage(previous: AgentInstance['usage'], usage: ModelUsage | undefined, firstTokenMs: number | undefined, durationMs: number, requests = 1): AgentInstance['usage'] {
+  const merged = mergeUsage(previous, usage ?? {});
+  return { ...merged, requests: (previous?.requests ?? 0) + requests, turns: (previous?.turns ?? 0) + 1, firstTokenMs, lastTurnMs: durationMs };
+}
+
+function sessionChildren(instances: Map<string, AgentInstance>, parentId: string): AgentInstance[] {
+  return [...instances.values()].filter((instance) => instance.parentInstanceId === parentId);
 }
 
 // ── Context compaction ───────────────────────────────────────────────────────
@@ -146,6 +165,7 @@ export class AgentRuntime {
   private readonly modelStream: ModelStream;
   private readonly maxConcurrentTurns: number;
   private readonly maxAgentDepth: number;
+  private readonly maxChildrenPerTurn: number;
   private defaultModel?: string;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly instances = new Map<string, AgentInstance>();
@@ -171,6 +191,7 @@ export class AgentRuntime {
     ));
     this.maxConcurrentTurns = Math.max(1, options.maxConcurrentTurns ?? Number(process.env.AGENT_MAX_CONCURRENT_TURNS ?? 4));
     this.maxAgentDepth = Math.max(1, options.maxAgentDepth ?? Number(process.env.AGENT_MAX_DEPTH ?? 4));
+    this.maxChildrenPerTurn = Math.max(1, options.maxChildrenPerTurn ?? Number(process.env.AGENT_MAX_CHILDREN_PER_TURN ?? 3));
     this.ready = Promise.all([this.registry.load(), this.store.init()]).then(() => this.validateSpecs());
   }
 
@@ -354,8 +375,12 @@ export class AgentRuntime {
     if (parent.depth + 1 > this.maxAgentDepth) throw new Error(`Maximum agent depth ${this.maxAgentDepth} exceeded`);
     const ancestors = this.ancestorAgentIds(parent);
     if (ancestors.has(agentId)) throw new Error(`Agent call cycle rejected: ${agentId} already exists in the ancestor chain`);
+    const turnId = parent.activeTurnId;
+    const childrenThisTurn = sessionChildren(this.instances, parent.instanceId).filter((child) => child.parentTurnId === turnId).length;
+    if (childrenThisTurn >= this.maxChildrenPerTurn) throw new Error(`Maximum of ${this.maxChildrenPerTurn} child agents per turn reached; reuse an existing agent or continue directly.`);
     const session = this.sessions.get(parent.sessionId)!;
     const child = this.newInstance(parent.sessionId, agentId, parent.instanceId, parent.depth + 1);
+    child.parentTurnId = turnId;
     this.instances.set(child.instanceId, child);
     parent.childInstanceIds.push(child.instanceId);
     parent.updatedAt = now();
@@ -596,9 +621,10 @@ export class AgentRuntime {
 
   private systemPrompt(instance: AgentInstance, spec: AgentSpec): string {
     const catalog = this.registry.allowedAgents(spec);
-    const relatedInstances = this.listInstances(instance.sessionId)
-      .filter((candidate) => candidate.instanceId !== instance.instanceId && candidate.status !== 'cancelled')
-      .map((candidate) => `- ${candidate.agentId} (${candidate.instanceId}): ${candidate.status}${candidate.lastOutput ? ` — ${candidate.lastOutput.slice(0, 180)}` : ''}`);
+    // Keep the system prefix stable between model calls. Injecting every sibling's
+    // live status here invalidates provider prompt caches and burns input tokens;
+    // child results are delivered through the mailbox and remain visible in the
+    // normal conversation context.
     return [
       spec.instructions,
       '',
@@ -613,9 +639,7 @@ export class AgentRuntime {
       catalog.length
         ? `Available agents:\n${catalog.map((agent) => `- ${agent.id}: ${agent.description}`).join('\n')}`
         : 'Available agents: none.',
-      relatedInstances.length
-        ? `Existing instances in this session:\n${relatedInstances.join('\n')}`
-        : 'Existing instances in this session: none.',
+      'Existing instances are communicated through mailbox messages. Reuse an existing related agent when possible; do not spawn duplicates.',
     ].join('\n');
   }
 
@@ -824,6 +848,10 @@ export class AgentRuntime {
       if (!config.model) throw new Error('No model configured. Use /provider or /model first.');
       const tools = this.toolsFor(instance, spec);
       let finalOutput = '';
+      const turnStartedAt = Date.now();
+      let turnUsage: ModelUsage | undefined;
+      let firstTokenMs: number | undefined;
+      let requestCount = 0;
       for (let step = 0; step < 32; step += 1) {
         if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
         if (instance.pendingCompact || this.shouldAutoCompact(instance.messages, config)) {
@@ -837,6 +865,7 @@ export class AgentRuntime {
           } catch { /* Compaction is best-effort; trimMessages remains the fallback. */ }
         }
         const messages = this.trimMessages(instance.messages, config);
+        requestCount += 1;
         let text = '';
         let thinking = '';
         const responseItems: Record<string, unknown>[] = [];
@@ -849,12 +878,14 @@ export class AgentRuntime {
             this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
           }
           if (chunk.content) {
+            if (firstTokenMs === undefined) firstTokenMs = Date.now() - turnStartedAt;
             text += chunk.content;
             finalOutput += chunk.content;
             if (!instance.parentInstanceId) {
               this.emit({ type: 'assistant_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.content });
             }
           }
+          if (chunk.usage) turnUsage = mergeUsage(turnUsage, chunk.usage);
           if (chunk.toolCalls?.length) calls.push(...chunk.toolCalls);
         }
         instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });
@@ -887,6 +918,9 @@ export class AgentRuntime {
       }
       if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
       instance.lastOutput = finalOutput.trim() || instance.lastOutput;
+      const endedAt = now();
+      instance.usage = mergeAgentUsage(instance.usage, turnUsage, firstTokenMs, Date.now() - turnStartedAt, requestCount);
+      instance.lastTurn = { startedAt: new Date(turnStartedAt).toISOString(), endedAt, durationMs: Date.now() - turnStartedAt, usage: turnUsage };
       instance.lastError = undefined;
       instance.status = 'idle';
       instance.activeTurnId = undefined;

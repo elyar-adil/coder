@@ -22,7 +22,7 @@ Act according to this test spec.
 
 async function fixture(
   modelStream: ConstructorParameters<typeof AgentRuntime>[0]['modelStream'],
-  options: { maxConcurrentTurns?: number } = {},
+  options: { maxConcurrentTurns?: number; maxChildrenPerTurn?: number } = {},
 ): Promise<{
   runtime: AgentRuntime;
   root: string;
@@ -46,6 +46,7 @@ async function fixture(
     resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
     modelStream,
     maxConcurrentTurns: options.maxConcurrentTurns,
+    maxChildrenPerTurn: options.maxChildrenPerTurn,
   });
   await runtime.whenReady();
   return { runtime, root, store };
@@ -135,6 +136,24 @@ describe('AgentRuntime', () => {
       await runtime.shutdown();
       await rm(root, { recursive: true, force: true });
     }
+  });
+
+  test('records provider usage and turn latency without exposing provider details to the model', async () => {
+    const { runtime, root } = await fixture(async function* () {
+      yield { content: 'ok', done: false, usage: { inputTokens: 10, outputTokens: 2, cachedInputTokens: 7 } };
+      yield { content: null, done: true };
+    });
+    try {
+      await runtime.submitMessage('usage', 'measure');
+      await runtime.waitForIdle('usage');
+      const instance = runtime.listInstances('usage')[0]!;
+      assert.equal(instance.usage?.inputTokens, 10);
+      assert.equal(instance.usage?.outputTokens, 2);
+      assert.equal(instance.usage?.cachedInputTokens, 7);
+      assert.equal(instance.usage?.requests, 1);
+      assert.equal(instance.usage?.turns, 1);
+      assert.equal(typeof instance.lastTurn?.durationMs, 'number');
+    } finally { await runtime.shutdown(); await rm(root, { recursive: true, force: true }); }
   });
 
   test('stops the whole session and allows a fresh user turn', async () => {
@@ -275,7 +294,7 @@ describe('AgentRuntime', () => {
       }
       yield { content: null, done: true };
     };
-    const { runtime, root } = await fixture(model, { maxConcurrentTurns: 2 });
+    const { runtime, root } = await fixture(model, { maxConcurrentTurns: 2, maxChildrenPerTurn: 4 });
     try {
       await runtime.openSession('parallel-wait');
       await runtime.submitMessage('parallel-wait', 'parallel');

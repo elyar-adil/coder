@@ -10,7 +10,7 @@ import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
-import { diffPreview, elapsedLabel, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries } from './tui-design.js';
+import { diffPreview, elapsedLabel, isWaitingForFirstToken, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
 import { recordTimeline } from '../runtime/session-timeline.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
 import type { TuiThemeColors, Tone } from './theme.js';
@@ -100,6 +100,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let spinnerTimer: NodeJS.Timeout | undefined;
   let welcomeTimer: NodeJS.Timeout | undefined;
   let welcomeFrame = 0;
+  let streamTimer: NodeJS.Timeout | undefined;
+  let waitingFrame = 0;
+  let lastPaintedStreamText = '';
   const composerChars: string[] = [];
   const inputHistory: string[] = [];
   const pendingTurns = new Set<string>();
@@ -185,6 +188,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     padding: { left: 2, right: 2 },
     style: { bg: COLOR().background, fg: COLOR().text },
   });
+  // Full-width surface keeps the composer visually continuous at both edges;
+  // the editable text box is inset on top of this backdrop.
+  const composerBackdrop = blessed.box({
+    parent: screen, bottom: 1, left: 0, width: '100%', height: 2,
+    style: { bg: COLOR().composer },
+  });
   const activity = blessed.list({
     parent: screen, top: 3, right: 0, width: '28%', bottom: 2,
     tags: true, keys: true, vi: true, mouse: true,
@@ -200,8 +209,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     style: { bg: COLOR().composer, fg: COLOR().text },
   });
   const divider = blessed.box({
-    parent: screen, bottom: 3, left: 1, width: '100%-2', height: 1,
-    style: { fg: COLOR().line, bg: COLOR().background },
+    // This row is part of the composer surface. Keeping it full width makes
+    // the input area read as one continuous band instead of a boxed field
+    // separated by a decorative rule.
+    parent: screen, bottom: 3, left: 0, width: '100%', height: 1,
+    style: { fg: COLOR().composer, bg: COLOR().composer },
   });
   const composerPrompt = blessed.box({
     parent: screen, bottom: 1, left: 1, width: 2, height: 2,
@@ -239,8 +251,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     activity.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
     composer.style.bg = c.composer;
     composer.style.fg = c.text;
-    divider.style.fg = c.line;
-    divider.style.bg = c.background;
+    composerBackdrop.style.bg = c.composer;
+    divider.style.fg = c.composer;
+    divider.style.bg = c.composer;
     composerPrompt.style.bg = c.composer;
     composerPrompt.style.fg = c.accent;
     completions.style.bg = c.panel;
@@ -276,10 +289,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const start = Math.max(0, result.cursor.row - height + 1);
     composer.height = height;
     composerPrompt.height = height;
+    composerBackdrop.height = height;
     conversation.bottom = height + 2;
     activity.bottom = height + 2;
     divider.bottom = height + 1;
-    divider.setContent('─'.repeat(Math.max(0, Number(screen.width) - 2)));
+    divider.setContent(' '.repeat(Math.max(0, Number(screen.width))));
     composerRow = result.cursor.row - start;
     composerColumn = result.cursor.column;
     composer.setContent(result.rows.slice(start, start + height).join('\n'));
@@ -399,6 +413,44 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     spinnerTimer = undefined;
   };
 
+  // While a turn is live, deltas alone cannot be trusted to defeat blessed's
+  // row-diff suppression or the viewport-clamped trailing line, so a slow
+  // repaint cadence forces the growing transcript onto the screen. The same
+  // tick animates the waiting indicator shown before the first token arrives.
+  const stopStreamTimer = (): void => {
+    if (!streamTimer) return;
+    clearInterval(streamTimer);
+    streamTimer = undefined;
+  };
+  const startStreamTimer = (): void => {
+    if (streamTimer || closed) return;
+    streamTimer = setInterval(() => {
+      if (closed || pendingTurns.size === 0) {
+        stopStreamTimer();
+        return;
+      }
+      // Native text selection owns the screen; never dirty or repaint under it.
+      if (nativeSelection || hasSelection()) return;
+      const runningEntry = [...(session.timeline ?? [])].find((entry) => entry.status === 'running' && entry.kind !== 'tool');
+      if (streams.size > 0 || runningEntry) {
+        const liveText = [...streams.values()].join('')
+          + [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind === 'message').map((entry) => entry.content).join('');
+        if (liveText !== lastPaintedStreamText) {
+          // Only a real content change earns a structural repaint; plain diffs
+          // stay cheap and flicker-free.
+          fullRedrawPending = true;
+          lastPaintedStreamText = liveText;
+          conversationDirty = true;
+        }
+      } else {
+        waitingFrame = (waitingFrame + 1) % 24;
+        conversationDirty = true;
+      }
+      scheduleRefresh();
+    }, 90);
+    streamTimer.unref?.();
+  };
+
   const focusComposer = (): void => {
     if (closed) return;
     composerPinned = true;
@@ -504,9 +556,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const renderStatus = (): void => {
     const active = instances().filter((item) => item.status === 'running' || item.status === 'waiting' || item.status === 'queued').length;
     const activityText = active ? `${active} active` : 'Ready';
+    const usage = instances().reduce((total, item) => {
+      total.input += item.usage?.inputTokens ?? 0;
+      total.output += item.usage?.outputTokens ?? 0;
+      total.cached += item.usage?.cachedInputTokens ?? 0;
+      if (item.usage?.firstTokenMs !== undefined) total.firstTokenMs = total.firstTokenMs === undefined ? item.usage.firstTokenMs : Math.min(total.firstTokenMs, item.usage.firstTokenMs);
+      return total;
+    }, { input: 0, output: 0, cached: 0, firstTokenMs: undefined as number | undefined });
+    const usageText = usage.input || usage.output ? `  ·  ${usage.input + usage.output} tok${usage.cached ? ` (${usage.cached} cached)` : ''}${usage.firstTokenMs !== undefined ? `  ·  first ${usage.firstTokenMs}ms` : ''}` : '';
     const width = Math.max(1, Number(screen.width) - 2);
     const left = `maw  ${activeModel}`;
-    const right = Number(screen.width) >= 78 ? `${activityText}  ·  Ctrl+K commands` : activityText;
+    const right = Number(screen.width) >= 78 ? `${activityText}${usageText}  ·  Ctrl+K commands` : `${activityText}${usageText}`;
     const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(right));
     statusbar.setContent(gap >= 3
       ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}${' '.repeat(gap)}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(right)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
@@ -644,6 +704,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         renderedBlocks.add(message.turnId);
         renderThinkingBlock(thinkingBlocks.get(message.turnId)!);
       }
+    }
+    if (isWaitingForFirstToken({
+      pendingTurns: pendingTurns.size,
+      streamingEntries: streams.size,
+      runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind !== 'tool').length,
+      sessionHasTimeline: Boolean(session.timeline),
+    })) {
+      pushConversationLine('');
+      pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
+      pushConversationLine(waitingIndicatorFrame(waitingFrame, { accent: COLOR().accent, subtle: COLOR().subtle }));
+      pushConversationLine('');
     }
     if (!session.timeline && pendingTurns.size > 0) {
       const turnId = [...pendingTurns][0];
@@ -950,6 +1021,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (instance.instanceId === session.mainInstanceId && instance.activeTurnId) pendingTurns.add(instance.activeTurnId);
     }
     startSpinner();
+    startStreamTimer();
     refresh();
   };
 
@@ -1164,6 +1236,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           markThinkingStart(turnId);
         }
         startSpinner();
+        startStreamTimer();
         refresh();
       }
     } catch (error) {
@@ -1192,10 +1265,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       markThinkingStart(event.turnId);
       const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find((item) => item.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
       if (block) block.thinking = `${block.thinking ?? ''}${event.text}`;
+      // Deltas can burst faster than a usable frame rate; the turn timer paints
+      // them at a steady cadence so a markdown re-render runs at most ~10fps.
+      if (streamTimer) return;
     }
     if (event.type === 'assistant_delta') {
       conversationDirty = true;
       streams.set(event.turnId, `${streams.get(event.turnId) ?? ''}${event.text}`);
+      if (streamTimer) return;
     }
     if (event.type === 'assistant_message') {
       conversationDirty = true;
@@ -1236,6 +1313,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         notice = `Error: ${event.error}`;
         pendingTurns.clear();
         stopSpinner();
+        stopStreamTimer();
       }
     }
     if (event.type === 'instance_updated' && event.instance.instanceId === session.mainInstanceId
@@ -1250,6 +1328,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
       markThinkingStart(turnId);
       startSpinner();
+      startStreamTimer();
     }
     if (event.type === 'instance_updated'
       && event.instance.sessionId === sessionId
@@ -1264,6 +1343,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       pendingTurns.clear();
       streams.clear();
       stopSpinner();
+      stopStreamTimer();
     }
     scheduleRefresh();
   };
@@ -1275,6 +1355,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (closed) return;
     closed = true;
     stopSpinner();
+    stopStreamTimer();
     if (welcomeTimer) clearInterval(welcomeTimer);
     unsubscribe();
     screen.destroy();

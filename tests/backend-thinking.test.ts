@@ -27,3 +27,21 @@ for (const entry of cases) test(`${entry.type} preserves streamed thinking separ
   assert.equal(chunks.map((chunk) => chunk.thinking ?? '').join(''), 'Inspect. Verify.');
   assert.equal(chunks.map((chunk) => chunk.content ?? '').join(''), 'Done.');
 });
+
+test('ollama reports prompt and generation usage from the terminal frame', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response(`${JSON.stringify({ message: { content: 'ok' }, done: true, prompt_eval_count: 12, eval_count: 4 })}\n`, { status: 200 }));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'ollama', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
+  assert.deepEqual(chunks.at(-1)?.usage, { inputTokens: 12, outputTokens: 4 });
+});
+
+test('openai chat reports usage and cached input tokens', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'data: {"choices":[{"delta":{"content":"ok"}}]}',
+    'data: {"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":15}}}',
+    'data: [DONE]', '',
+  ].join('\n\n'), { status: 200 }));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'openai', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
+  assert.deepEqual(chunks.find((chunk) => chunk.usage)?.usage, { inputTokens: 20, outputTokens: 3, cachedInputTokens: 15, reasoningTokens: undefined });
+});

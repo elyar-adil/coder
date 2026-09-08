@@ -106,3 +106,57 @@ export function visibleTimelineEntries(entries: SessionTimelineEntry[], limit = 
   const omitted = Math.max(0, entries.length - safeLimit);
   return { entries: omitted ? entries.slice(omitted) : entries, omitted };
 }
+
+const WAITING_DOT = '.';
+// One full gradient cycle in frames; divisible by 3 so the per-dot phase
+// offsets stay evenly spaced.
+const WAITING_CYCLE = 24;
+const WAITING_PHASES = [0, 1 / 6, 1 / 3];
+
+const isHexColor = (color: string): boolean => /^#[0-9a-fA-F]{6}$/.test(color);
+
+function blendHex(low: string, high: string, intensity: number): string {
+  const channels = [0, 1, 2].map((channel) => {
+    const from = parseInt(low.slice(1 + channel * 2, 3 + channel * 2), 16);
+    const to = parseInt(high.slice(1 + channel * 2, 3 + channel * 2), 16);
+    return Math.round(from + (to - from) * intensity);
+  });
+  return `#${channels.map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, '0')).join('')}`;
+}
+
+/**
+ * Animated ellipsis for the assistant slot while a turn has been submitted but
+ * no token has arrived. Pure and deterministic: the frame number is the only
+ * input, colors come from the caller, and nothing here touches blessed state.
+ * Dots cycle through a gradient between the two colors with per-dot phase
+ * offset (eased-cosine interpolation); non-hex colors degrade to a single tag.
+ */
+export function waitingIndicatorFrame(frame: number, colors: { accent: string; subtle: string }): string {
+  const safeFrame = Number.isFinite(frame) ? Math.max(0, Math.floor(frame)) : 0;
+  const accent = typeof colors?.accent === 'string' ? colors.accent : '';
+  const subtle = typeof colors?.subtle === 'string' ? colors.subtle : '';
+  if (isHexColor(accent) && isHexColor(subtle)) {
+    const dots = WAITING_PHASES.map((phase, index) => {
+      const progress = (((safeFrame % WAITING_CYCLE) / WAITING_CYCLE) + phase) % 1;
+      const eased = (1 - Math.cos(progress * Math.PI * 2)) / 2;
+      const color = blendHex(subtle, accent, eased);
+      return `{${color}-fg}${WAITING_DOT}{/${color}-fg}`;
+    });
+    return dots.join('');
+  }
+  const fallback = (isHexColor(accent) ? accent : '') || (isHexColor(subtle) ? subtle : '') || accent || subtle || 'gray';
+  return `{${fallback}-fg}...{/${fallback}-fg}`;
+}
+
+/** A turn is pending with no streamed token yet: show the waiting ellipsis. */
+export function isWaitingForFirstToken(state: {
+  pendingTurns: number;
+  streamingEntries: number;
+  runningTimelineEntries: number;
+  sessionHasTimeline: boolean;
+}): boolean {
+  if (state.sessionHasTimeline) {
+    return state.pendingTurns > 0 && state.streamingEntries === 0 && state.runningTimelineEntries === 0;
+  }
+  return false;
+}

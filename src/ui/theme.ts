@@ -106,8 +106,22 @@ const dawn: TuiTheme = {
   syntax: ['#6f6a5c', '#8a5a20', '#5b4392', '#1f5c8b', '#8f3a63'],
 };
 
+const solarized: TuiTheme = {
+  name: 'solarized', label: 'Solarized · balanced contrast',
+  ui: { background: '#002b36', panel: '#073642', composer: '#0b3b46', activity: '#06323d', elevated: '#14505b', modal: '#0b3b46', modalRule: '#1b5963', line: '#496b70', text: '#eee8d5', muted: '#c7c0a8', subtle: '#839496', accent: '#2aa198', success: '#859900', warning: '#b58900', error: '#dc322f' },
+  markdown: { text: '#eee8d5', muted: '#839496', accent: '#2aa198', heading: '#268bd2', headingStrong: '#fdf6e3', codeBg: '#073642', codeText: '#eee8d5', codeFence: '#586e75', diffAddBg: '#193b31', diffAddText: '#b7d68a', diffDelBg: '#4a2528', diffDelText: '#f28b82' },
+  syntax: ['#839496', '#2aa198', '#859900', '#268bd2', '#d33682'],
+};
+
+const rosePine: TuiTheme = {
+  name: 'rose-pine', label: 'Rosé Pine · soft dusk',
+  ui: { background: '#191724', panel: '#1f1d2e', composer: '#26233a', activity: '#211f32', elevated: '#393552', modal: '#26233a', modalRule: '#403d52', line: '#524f67', text: '#e0def4', muted: '#c4a7e7', subtle: '#908caa', accent: '#ebbcba', success: '#9ccfd8', warning: '#f6c177', error: '#eb6f92' },
+  markdown: { text: '#e0def4', muted: '#908caa', accent: '#ebbcba', heading: '#c4a7e7', headingStrong: '#fffaf3', codeBg: '#1f1d2e', codeText: '#e0def4', codeFence: '#6e6a86', diffAddBg: '#20373b', diffAddText: '#9ccfd8', diffDelBg: '#422638', diffDelText: '#eb6f92' },
+  syntax: ['#908caa', '#f6c177', '#c4a7e7', '#9ccfd8', '#ebbcba'],
+};
+
 export const THEMES: Record<string, TuiTheme> = {
-  midnight, nord, dracula, dawn,
+  midnight, nord, dracula, dawn, solarized, 'rose-pine': rosePine,
 };
 
 export const DEFAULT_THEME = 'midnight';
