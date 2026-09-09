@@ -27,6 +27,22 @@ function finish(entries: SessionTimelineEntry[], predicate: (entry: SessionTimel
   }
 }
 
+/** Record a user-typed `!command` run as a transcript entry. Shell entries
+ * stream inline in the conversation but never reach the model context; the
+ * caller mutates `content`/`status` as output arrives and the process exits. */
+export function recordShellRun(session: AgentSession, command: string): SessionTimelineEntry {
+  const entries: SessionTimelineEntry[] = session.timeline ??= session.messages.map<SessionTimelineEntry>(message => ({
+    id: message.messageId, kind: 'message', role: message.role,
+    turnId: message.turnId, content: message.content, status: 'completed',
+  }));
+  const entry: SessionTimelineEntry = {
+    id: randomUUID(), kind: 'shell', turnId: undefined, tool: 'shell',
+    input: command, content: '', status: 'running', startedAt: Date.now(),
+  };
+  entries.push(entry);
+  return entry;
+}
+
 /** Record display order at event time, not grouped retrospectively by turn. */
 export function recordTimeline(session: AgentSession, event: AgentEvent): void {
   const entries: SessionTimelineEntry[] = session.timeline ??= session.messages.map<SessionTimelineEntry>(message => ({

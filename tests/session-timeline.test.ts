@@ -1,7 +1,27 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { AgentSession, SessionTimelineEntry } from '../src/domain/agent.js';
-import { recordTimeline } from '../src/runtime/session-timeline.js';
+import { recordTimeline, recordShellRun } from '../src/runtime/session-timeline.js';
+
+test('shell runs stream as transcript-only entries that never touch agent state', () => {
+  const session: AgentSession = {
+    sessionId: 'shell', mainInstanceId: 'main', messages: [], instanceIds: ['main'],
+    createdAt: '', updatedAt: '',
+  };
+  const entry = recordShellRun(session, 'npm test');
+  assert.equal(entry.kind, 'shell');
+  assert.equal(entry.input, 'npm test');
+  assert.equal(entry.status, 'running');
+  assert.ok(entry.startedAt !== undefined);
+  assert.equal(entry.instanceId, undefined, 'shell entries belong to no agent instance');
+  // Streaming: content grows on the entry itself; agent timeline finish
+  // passes must not mutate shell entries.
+  entry.content = 'partial output';
+  assert.equal(session.timeline?.at(-1)?.content, 'partial output');
+  entry.status = 'completed';
+  entry.endedAt = Date.now();
+  assert.equal(session.timeline?.at(-1)?.status, 'completed');
+});
 
 test('timeline updates stay indexed after a long history', () => {
   const raw = Array.from({ length: 10_000 }, (_, index): SessionTimelineEntry => ({

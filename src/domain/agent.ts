@@ -108,7 +108,8 @@ export interface AgentSession {
 
 export interface SessionTimelineEntry {
   id: string;
-  kind: 'message' | 'thinking' | 'tool';
+  /** `shell` entries are user-typed `!command` runs: transcript-only, never sent to the model. */
+  kind: 'message' | 'thinking' | 'tool' | 'shell';
   instanceId?: string;
   turnId?: string;
   role?: 'user' | 'assistant' | 'system';
@@ -116,6 +117,8 @@ export interface SessionTimelineEntry {
   tool?: string;
   input?: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Shell runs: the child's exit code (undefined when stopped or unreported). */
+  exitCode?: number;
   /** Epoch ms when this entry started (first delta / tool start). */
   startedAt?: number;
   /** Epoch ms when this entry reached a terminal status; frozen once set. */

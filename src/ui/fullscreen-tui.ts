@@ -14,7 +14,7 @@ import { commandMatches } from './commands.js';
 import { runShellCommand } from '../infra/tools.js';
 import { diffPreview, elapsedLabel, isWaitingForFirstToken, spinnerGlyph, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
 import { attachPillScrollbar, type PillScrollbarHandle, type PillScrollbarTheme, pillScrollbarColors } from './scrollbar.js';
-import { recordTimeline } from '../runtime/session-timeline.js';
+import { recordTimeline, recordShellRun } from '../runtime/session-timeline.js';
 import { otherWorkspaceInstances, type WorkspaceInstanceInfo } from '../runtime/workspace-instances.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
 import type { TuiTheme, TuiThemeColors, Tone } from './theme.js';
@@ -491,7 +491,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       }
       // Native text selection owns the screen; never dirty or repaint under it.
       if (nativeSelection || hasSelection()) return;
-      const runningEntry = [...(session.timeline ?? [])].find((entry) => entry.status === 'running' && entry.kind !== 'tool');
+      const runningEntry = [...(session.timeline ?? [])].find((entry) => entry.status === 'running' && entry.kind !== 'tool' && entry.kind !== 'shell');
       if (streams.size > 0 || runningEntry) {
         const liveText = [...streams.values()].join('')
           + [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind === 'message').map((entry) => entry.content).join('');
@@ -523,6 +523,18 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     /** Invoked whenever the highlighted entry changes; enables live preview. */
     onHighlight?: (index: number) => void;
   }
+  /** A small clickable ✕ pinned to a modal's top-right corner. Modals already
+   * close on Escape; this gives mouse users the same affordance. */
+  const attachCloseButton = (modal: blessed.Widgets.BoxElement, onClose: () => void): blessed.Widgets.BoxElement => {
+    const button = blessed.box({
+      parent: modal, top: 0, right: 0, width: 3, height: 1, tags: true, mouse: true,
+      content: ' {bold}✕{/bold} ',
+      style: { bg: COLOR().modal, fg: COLOR().muted, hover: { bg: COLOR().modal, fg: COLOR().error } },
+    });
+    button.on('click', onClose);
+    return button;
+  };
+
   const choose = (title: string, items: ChoiceItem[], options: ChooseOptions = {}): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
     const renderItem = (item: ChoiceItem): string => typeof item === 'string'
@@ -548,6 +560,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       parent: modal, top: 2, left: 1, right: 1, bottom: 1, items: items.map(renderItem), tags: true, keys: true, vi: true, mouse: true,
       scrollable: true, style: { bg: COLOR().modal, fg: COLOR().text, selected: { bg: COLOR().modal, fg: COLOR().accent, bold: true } },
     });
+    const closeButton = attachCloseButton(modal, () => finish(-1));
     // The modal captures style objects at creation time; while a live preview
     // swaps the active palette, re-patch it so it does not keep the palette
     // it was opened with.
@@ -566,6 +579,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       // re-create it or the picker keeps the palette it opened with.
       list.style.item = { bg: c.modal, fg: c.text };
       list.style.selected = { bg: c.modal, fg: c.accent, bold: true };
+      closeButton.style.bg = c.modal;
+      closeButton.style.fg = c.muted;
+      closeButton.style.hover = { bg: c.modal, fg: c.error };
       list.setItems(items.map(renderItem));
     };
     let done = false;
@@ -624,6 +640,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       parent: modal, bottom: 0, left: 1, right: 1, height: 1,
       content: 'Enter confirm  ·  Esc cancel', style: { bg: COLOR().modal, fg: COLOR().modalRule },
     });
+    attachCloseButton(modal, () => finish(''));
     input.setValue(initial);
     let done = false;
     const finish = (value: string): void => {
@@ -786,6 +803,37 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           pushConversationLine('');
           continue;
         }
+        if (entry.kind === 'shell') {
+          // User-typed shell run: header carries the command and its status,
+          // output streams beneath as plain transcript text.
+          pushConversationLine('');
+          const running = entry.status === 'running';
+          const stateLabel = running
+            ? '…'
+            : entry.status === 'failed'
+              ? `✗ exit ${entry.exitCode ?? 1}`
+              : entry.status === 'cancelled'
+                ? '× stopped'
+                : '✓';
+          const iconColor = running
+            ? COLOR().accent
+            : entry.status === 'failed'
+              ? COLOR().error
+              : entry.status === 'cancelled'
+                ? COLOR().muted
+                : COLOR().success;
+          pushConversationLine(`{${iconColor}-fg}{bold}! ${safe(entry.input ?? '')}{/bold} ${stateLabel}{/${iconColor}-fg}`);
+          const outputLines = safe(entry.content).split('\n');
+          const maxOutputLines = 400;
+          if (outputLines.length > maxOutputLines) {
+            pushConversationLine(`  {${COLOR().subtle}-fg}… ${outputLines.length - maxOutputLines} earlier output lines hidden{/${COLOR().subtle}-fg}`);
+          }
+          for (const line of outputLines.slice(-maxOutputLines)) {
+            if (line.length > 0) pushConversationLine(`  ${line}`);
+          }
+          pushConversationLine('');
+          continue;
+        }
         const expanded = thinkingBlocks.get(entry.id)?.expanded ?? false;
         const previous = thinkingBlocks.get(entry.id);
         const block: ThinkingBlock = { turnId: entry.id, expanded, content: previous?.content ?? [],
@@ -853,7 +901,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (isWaitingForFirstToken({
       pendingTurns: pendingTurns.size,
       streamingEntries: streams.size,
-      runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind !== 'tool').length,
+      runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind !== 'tool' && entry.kind !== 'shell').length,
       sessionHasTimeline: Boolean(session.timeline),
     })) {
       // Only a confirmed thinking delta switches the slot to Thinking; until
@@ -1392,6 +1440,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       focusComposer();
     };
     body.key(['escape', 'q'], closeDetail);
+    attachCloseButton(modal, closeDetail);
     activityDetailScrollbar.current = attachPillScrollbar(body, pillColors);
     activityDetail = { instanceId: instance.instanceId, modal, body };
     body.focus();
@@ -1794,63 +1843,37 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     scheduleRefresh();
   };
 
-  // `!command` shell mode. Chunks stream into a scrollable popup so long
-  // builds stay reviewable; the modal closes with Enter or Esc without
-  // touching the conversation transcript, and the output never reaches the
-  // model context.
+  // `!command` shell mode. Output streams inline into the conversation as a
+  // timeline entry (transcript-only — never sent to the model); Ctrl+C stops
+  // the run. Like a real shell, a nonzero exit is shown, not treated as an
+  // error: the user is the authorizer.
   const runShellMode = async (shellCommand: string): Promise<void> => {
-    const nlChar = String.fromCharCode(10);
-    let pendingShellHeader = true;
-    notice = '';
-    conversationDirty = true;
-    refresh();
-    const width = Math.min(96, Math.max(46, Number(screen.width) - 6));
-    const height = Math.min(26, Math.max(9, Number(screen.height) - 6));
+    const entry = recordShellRun(session, shellCommand);
+    const keepTail = (text: string): string => (text.length > 48_000 ? text.slice(-48_000) : text);
     const controller = new AbortController();
     shellAbort = controller;
-    const box = blessed.box({
-      parent: screen, top: 'center', left: 'center', width, height,
-      tags: true, scrollable: true, alwaysScroll: true, scrollbar: { ch: '│' },
-      mouse: true, keys: true, vi: true,
-      border: { type: 'line' }, label: `$ ${oneLine(shellCommand, width - 8)}`,
-      style: { border: { fg: COLOR().accent }, scrollbar: { fg: COLOR().muted } },
-    });
-    let boxClosed = false;
-    const closeBox = (): void => {
-      if (boxClosed) return;
-      boxClosed = true;
-      controller.abort();
-      box.destroy();
-      requestFullRedraw();
-      focusComposer();
-    };
-    box.key(['escape', 'enter', 'q'], closeBox);
-    box.focus();
+    conversationDirty = true;
     refresh();
     try {
       const result = await runShellCommand(shellCommand, {
         workspaceRoot: runtime.workspace(),
         signal: controller.signal,
         onChunk: (text) => {
-          if (boxClosed) return;
           const cleaned = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
-          box.setContent(pendingShellHeader ? `{bold}$ ${safe(shellCommand)}${nlChar}{/bold}${safe(cleaned)}` : box.getContent() + safe(cleaned));
-          pendingShellHeader = false;
-          box.setScrollPerc(100);
-          screen.render();
+          if (!cleaned) return;
+          entry.content = keepTail(entry.content + cleaned);
+          conversationDirty = true;
+          scheduleRefresh();
         },
       });
-      if (!boxClosed) {
-        const ok = result.exitCode === 0;
-        box.setLabel(`$ ${oneLine(shellCommand, width - 8)} ${ok ? '✓' : '✗'}`);
-        const exitText = result.exitCode === undefined
-          ? 'stopped'
-          : `exit ${result.exitCode}`;
-        box.insertBottom(`  {${ok ? COLOR().muted : COLOR().error}-fg}${exitText}{/${ok ? COLOR().muted : COLOR().error}-fg}  ·  Enter/Esc close`);
-        screen.render();
-      }
+      entry.content = keepTail(result.output.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, ''));
+      entry.exitCode = result.exitCode;
+      entry.status = result.exitCode === 0 ? 'completed' : result.exitCode === undefined ? 'cancelled' : 'failed';
+      entry.endedAt = Date.now();
     } finally {
-      shellAbort = controller === shellAbort ? undefined : shellAbort;
+      if (shellAbort === controller) shellAbort = undefined;
+      conversationDirty = true;
+      refresh();
     }
   };
 

@@ -751,6 +751,35 @@ test('/aside queues a note without a turn and folds it into the next message', a
   }
 });
 
+test('shell mode streams inline into the conversation instead of a popup', async () => {
+  const tui = await startTui({
+    modelStream: async function* () {
+      yield { content: 'noop', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    input.write('!echo hello-inline && echo more-output');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let rendered = false;
+    for (let attempt = 0; attempt < 200 && !rendered; attempt++) {
+      await wait(10);
+      const text = plainText(conversation.getContent());
+      rendered = text.includes('! echo hello-inline && echo more-output') && text.includes('more-output') && text.includes('✓');
+    }
+    assert.ok(rendered, `shell run must appear inline in the transcript with its status, got: ${JSON.stringify(plainText(conversation.getContent()).split('\n'))}`);
+    // The transcript carries the completion marker instead of a modal label;
+    // nothing above the composer remains focused.
+    const text = plainText(conversation.getContent());
+    assert.match(text, /! echo hello-inline && echo more-output ✓/);
+  } finally {
+    await tui.cleanup();
+  }
+});
+
 test('/goal shows in the status bar and /goal clear removes it', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },

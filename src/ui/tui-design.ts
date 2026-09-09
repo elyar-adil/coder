@@ -50,6 +50,7 @@ const TOOL_LABELS: Record<string, string> = {
   search_files: 'Find files',
   search_history: 'Search history',
   search_text: 'Search',
+  shell: 'Shell',
   spawn_agent: 'Start agent',
   send_agent: 'Message agent',
   wait_agent: 'Wait for agent',
