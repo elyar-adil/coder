@@ -775,6 +775,9 @@ test('shell mode streams inline into the conversation instead of a popup', async
     // nothing above the composer remains focused.
     const text = plainText(conversation.getContent());
     assert.match(text, /! echo hello-inline && echo more-output ✓/);
+    // The welcome logo must yield to the shell run even though no session
+    // message exists yet.
+    assert.ok(!text.includes('C O D E R'), 'welcome logo must disappear once a shell run streams into the transcript');
   } finally {
     await tui.cleanup();
   }

@@ -763,7 +763,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const metrics = tuiLayout(screenWidth, activityVisible);
     const markdownCols = Math.max(10, Math.min(120, metrics.conversationWidth - metrics.horizontalPadding * 2 - 2));
     thinkingBlockLines.clear();
-    const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0;
+    // The welcome screen yields to any conversation content — messages,
+    // streaming output, thinking, or transcript entries like shell runs and
+    // queued asides.
+    const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0 && !(session.timeline?.length);
     if (welcomeVisible) {
       for (const line of renderWelcome(
         Number(conversation.width) - Number(conversation.iwidth) - 1,
@@ -804,10 +807,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           continue;
         }
         if (entry.kind === 'shell') {
-          // User-typed shell run: header carries the command and its status,
-          // output streams beneath as plain transcript text.
+          // User-typed shell run: the command line wears a dedicated color so
+          // it reads as a user action, not agent activity; the status glyph
+          // keeps its own tone. Output streams beneath as plain text.
           pushConversationLine('');
           const running = entry.status === 'running';
+          const commandColor = COLOR().warning;
           const stateLabel = running
             ? '…'
             : entry.status === 'failed'
@@ -822,7 +827,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
               : entry.status === 'cancelled'
                 ? COLOR().muted
                 : COLOR().success;
-          pushConversationLine(`{${iconColor}-fg}{bold}! ${safe(entry.input ?? '')}{/bold} ${stateLabel}{/${iconColor}-fg}`);
+          pushConversationLine(`{${commandColor}-fg}{bold}! ${safe(entry.input ?? '')}{/bold}{/${commandColor}-fg} {${iconColor}-fg}${stateLabel}{/${iconColor}-fg}`);
           const outputLines = safe(entry.content).split('\n');
           const maxOutputLines = 400;
           if (outputLines.length > maxOutputLines) {
