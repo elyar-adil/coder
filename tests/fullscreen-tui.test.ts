@@ -751,6 +751,33 @@ test('/aside queues a note without a turn and folds it into the next message', a
   }
 });
 
+test('composer marks shell mode with a $ prompt and shell-colored text', async () => {
+  const tui = await startTui({
+    modelStream: async function* () {
+      yield { content: 'noop', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    input.write('!echo composer-test');
+    await tick();
+    const shellPrompt = screen.children.find((child) => plainText((child as blessed.Widgets.BoxElement).getContent()) === '$');
+    assert.ok(shellPrompt, `composer prompt must switch to $ in shell mode, children: ${screen.children.map((child) => JSON.stringify(plainText((child as blessed.Widgets.BoxElement).getContent()).slice(0, 24)))}`);
+    const composerBox = screen.children.find((child) => plainText((child as blessed.Widgets.BoxElement).getContent()).includes('echo composer-test')) as blessed.Widgets.BoxElement | undefined;
+    assert.ok(composerBox, 'composer must show the shell draft');
+    assert.match(String(composerBox.getContent()), /\x1b\[/, 'shell draft must be color-rendered');
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; attempt < 200 && !plainText(conversation.getContent()).includes('! echo composer-test ✓'); attempt++) await wait(10);
+    assert.ok(plainText(conversation.getContent()).includes('! echo composer-test ✓'), 'the shell run must complete inline');
+    const normalPrompt = screen.children.find((child) => plainText((child as blessed.Widgets.BoxElement).getContent()) === '›');
+    assert.ok(normalPrompt, 'prompt must return to › after submit');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
 test('shell mode streams inline into the conversation instead of a popup', async () => {
   const tui = await startTui({
     modelStream: async function* () {

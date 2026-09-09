@@ -108,6 +108,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let welcomeFrame = 0;
   let streamTimer: NodeJS.Timeout | undefined;
   let shellAbort: AbortController | undefined;
+  let shellAnimationFrame = 0;
   let waitingFrame = 0;
   let lastPaintedStreamText = '';
   const composerChars: string[] = [];
@@ -243,6 +244,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const composer = blessed.box({
     parent: screen, bottom: 1, left: 3, width: '100%-4', height: 2,
     input: true, keys: true, mouse: true, padding: { left: 0, right: 1 },
+    tags: true,
     style: { bg: COLOR().composer, fg: COLOR().text },
   });
   const divider = blessed.box({
@@ -328,6 +330,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const result = layoutComposer(composerValue(), composerCursor, width, (text) => Number(composer.strWidth(text)));
     const height = Math.min(Math.max(2, result.rows.length), Math.max(2, Math.min(6, Number(screen.height) - 7)));
     const start = Math.max(0, result.cursor.row - height + 1);
+    // A draft starting with `!` is shell mode: the prompt becomes `$` and the
+    // command text wears the shell color so the submit target is unambiguous.
+    const shellMode = composerValue().startsWith('!');
+    composerPrompt.setContent(shellMode ? '$' : '›');
+    composerPrompt.style.fg = shellMode ? COLOR().warning : COLOR().accent;
     composer.height = height;
     composerPrompt.height = height;
     composerBackdrop.height = height;
@@ -337,7 +344,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     divider.setContent(' '.repeat(Math.max(0, Number(screen.width))));
     composerRow = result.cursor.row - start;
     composerColumn = result.cursor.column;
-    composer.setContent(result.rows.slice(start, start + height).join('\n'));
+    // Rows are laid out from plain text; escape them for the tag parser so
+    // commands containing literal braces render as typed.
+    const visibleRows = result.rows.slice(start, start + height).map((row) => safe(row));
+    composer.setContent(shellMode
+      ? visibleRows.map((row) => `{${COLOR().warning}-fg}${row}{/${COLOR().warning}-fg}`).join('\n')
+      : visibleRows.join('\n'));
     const query = composerValue();
     if (query !== completionQuery) { completionIndex = 0; completionQuery = query; }
     const matches = query === dismissedCompletion ? [] : commandMatches(query);
@@ -814,20 +826,16 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           const running = entry.status === 'running';
           const commandColor = COLOR().warning;
           const stateLabel = running
-            ? '…'
+            ? waitingIndicatorFrame(shellAnimationFrame, { accent: COLOR().accent, subtle: COLOR().subtle })
             : entry.status === 'failed'
               ? `✗ exit ${entry.exitCode ?? 1}`
               : entry.status === 'cancelled'
                 ? '× stopped'
                 : '✓';
-          const iconColor = running
-            ? COLOR().accent
-            : entry.status === 'failed'
-              ? COLOR().error
-              : entry.status === 'cancelled'
-                ? COLOR().muted
-                : COLOR().success;
-          pushConversationLine(`{${commandColor}-fg}{bold}! ${safe(entry.input ?? '')}{/bold}{/${commandColor}-fg} {${iconColor}-fg}${stateLabel}{/${iconColor}-fg}`);
+          const iconColor = running ? COLOR().accent
+            : entry.status === 'failed' ? COLOR().error
+              : entry.status === 'cancelled' ? COLOR().muted : COLOR().success;
+          pushConversationLine(`{${commandColor}-fg}{bold}! ${safe(entry.input ?? '')}{/bold}{/${commandColor}-fg} ${running ? stateLabel : `{${iconColor}-fg}${stateLabel}{/${iconColor}-fg}`}`);
           const outputLines = safe(entry.content).split('\n');
           const maxOutputLines = 400;
           if (outputLines.length > maxOutputLines) {
@@ -1857,6 +1865,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const keepTail = (text: string): string => (text.length > 48_000 ? text.slice(-48_000) : text);
     const controller = new AbortController();
     shellAbort = controller;
+    // Long-running commands animate the header's ellipsis (same gradient
+    // frames as the waiting indicator) so a live job is obvious at a glance.
+    const animation = setInterval(() => {
+      if (closed) { clearInterval(animation); return; }
+      shellAnimationFrame += 1;
+      conversationDirty = true;
+      scheduleRefresh();
+    }, 60);
+    animation.unref?.();
     conversationDirty = true;
     refresh();
     try {
@@ -1876,6 +1893,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       entry.status = result.exitCode === 0 ? 'completed' : result.exitCode === undefined ? 'cancelled' : 'failed';
       entry.endedAt = Date.now();
     } finally {
+      clearInterval(animation);
       if (shellAbort === controller) shellAbort = undefined;
       conversationDirty = true;
       refresh();
