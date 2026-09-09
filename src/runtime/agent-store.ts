@@ -30,6 +30,29 @@ async function replaceFile(temp: string, target: string): Promise<void> {
   throw lastError;
 }
 
+/** First user message, flattened to one line and clipped for session-picker previews. */
+function firstUserPreview(messages: PersistedAgentSession['session']['messages']): string | undefined {
+  const first = messages.find((message) => message.role === 'user');
+  const text = first?.content.replace(/\s+/g, ' ').trim();
+  if (!text) return undefined;
+  return text.length > 60 ? `${text.slice(0, 59)}…` : text;
+}
+
+/** Coarse relative timestamp for session pickers: just now / Nm ago / Nh ago / Nd ago / date. */
+function relativeTime(iso: string): string {
+  const then = Date.parse(iso);
+  if (!Number.isFinite(then)) return iso;
+  const seconds = Math.max(0, Math.round((Date.now() - then) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(then).toISOString().slice(0, 10);
+}
+
 export class AgentRuntimeStore {
   private readonly dir: string;
 
@@ -102,11 +125,11 @@ export class AgentRuntimeStore {
     }
   }
 
-  async list(): Promise<Array<{ sessionId: string; messages: number; updatedAt: string }>> {
+  async list(): Promise<Array<{ sessionId: string; messages: number; updatedAt: string; preview?: string; relativeUpdatedAt?: string }>> {
     await Promise.all([...writes.values()].map((write) => write.catch(() => undefined)));
     let files: string[] = [];
     try { files = await readdir(this.dir); } catch { return []; }
-    const sessions: Array<{ sessionId: string; messages: number; updatedAt: string }> = [];
+    const sessions: Array<{ sessionId: string; messages: number; updatedAt: string; preview?: string; relativeUpdatedAt?: string }> = [];
     for (const file of files.filter((name) => name.endsWith('.json'))) {
       try {
         const parsed = JSON.parse(await readFile(resolve(this.dir, file), 'utf8')) as PersistedAgentSession;
@@ -115,6 +138,8 @@ export class AgentRuntimeStore {
           sessionId: parsed.session.sessionId,
           messages: parsed.session.messages.length,
           updatedAt: parsed.session.updatedAt,
+          preview: firstUserPreview(parsed.session.messages),
+          relativeUpdatedAt: relativeTime(parsed.session.updatedAt),
         });
       } catch { /* skip invalid snapshots */ }
     }

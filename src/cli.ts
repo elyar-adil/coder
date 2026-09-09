@@ -10,6 +10,7 @@ import { AgentRuntime } from './runtime/agent-runtime.js';
 import { WorktreeManager } from './runtime/worktree.js';
 import { registerWorkspaceInstance } from './runtime/workspace-instances.js';
 import { runFullscreenTui } from './ui/fullscreen-tui.js';
+import { checkForUpdate, formatUpdateNotice, offerSelfUpdate } from './update-check.js';
 import { CODER_VERSION } from './version.js';
 
 async function main(): Promise<void> {
@@ -18,6 +19,17 @@ async function main(): Promise<void> {
   program.allowExcessArguments(false).showSuggestionAfterError();
   program.option('--model <name>', 'default model name or .agentrc alias');
   program.option('--worktree [name]', 'start inside an isolated managed git worktree (.coder/worktrees/<name>)');
+
+  // Query npm for a newer release while the command runs; afterwards a y/N
+  // prompt offers a self-update (China mirror first) in interactive sessions.
+  const updateNotice = checkForUpdate().catch(() => null);
+  const showUpdateNotice = async (): Promise<void> => {
+    const result = await updateNotice;
+    if (!result?.updateAvailable || !process.stderr.isTTY) return;
+    process.stderr.write(`\n${formatUpdateNotice(result)}\n`);
+    const message = await offerSelfUpdate(result).catch(() => null);
+    if (message) process.stderr.write(`\n${message}\n`);
+  };
 
   let config = await loadConfig();
   const selectedFromCli = (): string | undefined => program.opts<{ model?: string }>().model;
@@ -74,6 +86,7 @@ async function main(): Promise<void> {
         const submitted = session.messages.findIndex((message) => message.role === 'user' && message.turnId === turnId);
         const response = session.messages.slice(submitted + 1).reverse().find((message) => message.role === 'assistant');
         if (response) process.stdout.write(`${response.content}\n`);
+        await showUpdateNotice();
       } finally {
         await runtime.shutdown();
       }
@@ -87,6 +100,7 @@ async function main(): Promise<void> {
       for (const spec of runtime.listAgentSpecs()) {
         process.stdout.write(`${spec.id}\t${spec.scope}\t${spec.model ?? 'inherit'}\t${spec.description}\n`);
       }
+      await showUpdateNotice();
       await runtime.shutdown();
     });
 
@@ -119,6 +133,7 @@ async function main(): Promise<void> {
       },
       configManager,
     });
+    await showUpdateNotice();
     await runtime.shutdown();
   });
 

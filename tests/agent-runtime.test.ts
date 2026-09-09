@@ -537,35 +537,6 @@ Always run npm test before committing.
     }
   });
 
-  test('asides fold into the next submitted message for the model and persist', async () => {
-    const delivered: string[] = [];
-    const { runtime, root, store } = await fixture(async function* (_config, _system, messages: AgentModelMessage[]): AsyncGenerator<ChatChunk> {
-      delivered.push(String(messages.at(-1)?.content ?? ''));
-      yield { content: 'ok', done: true };
-    });
-    try {
-      await assert.rejects(runtime.addAside('asides', '   '), /Aside cannot be empty/);
-      const queued = await runtime.addAside('asides', 'Run npm test before committing');
-      assert.equal(queued.queued, true);
-      await runtime.submitMessage('asides', 'please continue');
-      await runtime.waitForIdle('asides');
-      // The model must see the folded aside, not just the raw user text.
-      assert.match(delivered.at(-1) ?? '', /Run npm test before committing/);
-      assert.match(delivered.at(-1) ?? '', /please continue/);
-      // The persisted user message carries the aside inline; the queue is empty.
-      const persisted = (await store.load('asides'))!.session;
-      const userMessage = persisted.messages.find((message) => message.role === 'user');
-      assert.ok(userMessage?.content.includes('Run npm test before committing'));
-      assert.equal(persisted.pendingAsides?.length ?? 0, 0, 'asides clear after folding');
-      // A queued aside survives a persist round trip.
-      await runtime.addAside('asides', 'second note');
-      assert.deepEqual((await store.load('asides'))!.session.pendingAsides, ['second note']);
-    } finally {
-      await runtime.shutdown();
-      await rm(root, { recursive: true, force: true });
-    }
-  });
-
   test('setSessionGoal injects the goal into agent prompts until cleared', async () => {
     const prompts: string[] = [];
     const { runtime, root, store } = await fixture(async function* (_config, system): AsyncGenerator<ChatChunk> {

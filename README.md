@@ -31,7 +31,6 @@ Inside the TUI:
 - `F2` (or `/select`) optionally releases app mouse capture for the terminal's native selection. `F2` again restores app clicks, drag selection and wheel scrolling. `Ctrl+Y` and `PageUp` / `PageDown` also work without the mouse.
 - `Ctrl+X` or `/cancel` stops the current session's agents; send another message to continue.
 - `/compact` summarizes and archives older context of the main agent; an optional argument focuses the digest (e.g. `/compact file changes and pending work`).
-- `/aside <note>` queues a side note without starting a turn; it folds into the next message you send and is announced in the conversation stream.
 - `/btw <question>` opens a side conversation forked from the current session (full context included) and sends your question there. `/back` or `Ctrl+C` returns to the main conversation; side sessions are marked `[side]` in the status bar and the `/sessions` list.
 - `/fork` copies the current conversation into a new saved session. `/sessions` lists both; the original stays untouched.
 - `/goal <text>` sets a standing goal for the session: it is injected into every agent's prompt until cleared, shows in the status bar, and survives across sessions. `/goal clear` removes it.

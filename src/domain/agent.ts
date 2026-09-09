@@ -98,8 +98,6 @@ export interface AgentSession {
   defaultModel?: string;
   /** Standing directive injected into every agent prompt of this session until cleared (/goal). */
   goal?: string;
-  /** Aside notes queued with /btw that fold into the next submitted message without starting a turn. */
-  pendingAsides?: string[];
   messages: SessionMessage[];
   instanceIds: string[];
   createdAt: string;

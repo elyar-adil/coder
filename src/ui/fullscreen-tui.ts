@@ -107,10 +107,32 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let welcomeTimer: NodeJS.Timeout | undefined;
   let welcomeFrame = 0;
   let welcomeStartedAt = 0;
-  // Terminal focus lifecycle (DECSET 1004): while the window is unfocused the
-  // periodic repaints pause — otherwise 20fps of screen updates flood the PTY
-  // and the terminal replays the backlog the moment the window regains focus.
+  // Terminal focus lifecycle (DECSET 1004). While the window is unfocused the
+  // app must be frugal with PTY writes: a refocusing terminal replays the
+  // bytes it did not render, and a backlog of pending updates is what users
+  // see as the "crazy scrolling" burst on focus regain. Two rules:
+  //  - Decorative animation (spinner glyphs, welcome shine, shell ellipsis) is
+  //    suppressed outright while blurred: it is invisible in an unfocused
+  //    window, and every frame is a multi-row byte burst.
+  //  - Streaming text keeps flowing on a ~400ms heartbeat so a background
+  //    window still shows the transcript growing. Event-driven repaints (tool
+  //    calls, finished messages) are never throttled.
+  // Frames skipped for blur set `blurredStale`; focus regain then issues
+  // exactly one full redraw (like a resize) instead of replaying a backlog.
   let windowFocused = true;
+  let blurredStale = false;
+  const BLURRED_STREAM_MS = 400;
+  let lastStreamFrame = 0;
+  // Heartbeat gate for the stream repaint timer: true at most once every
+  // BLURRED_STREAM_MS while unfocused, always while focused.
+  const throttledFrame = (): boolean => {
+    if (windowFocused) return true;
+    const now = Date.now();
+    if (now - lastStreamFrame < BLURRED_STREAM_MS) return false;
+    lastStreamFrame = now;
+    blurredStale = true;
+    return true;
+  };
   let streamTimer: NodeJS.Timeout | undefined;
   let shellAbort: AbortController | undefined;
   let shellAnimationFrame = 0;
@@ -437,6 +459,16 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (matches.length && key.name === 'escape') {
       dismissedCompletion = composerValue(); renderComposerFrame(); return;
     }
+    // A bare Escape stops the running turn, same as Ctrl+X / `/cancel`. The
+    // completion menu and the screen-level bindings keep their Esc semantics
+    // (dismiss suggestions, leave a focused pane), so stop only when nothing
+    // else claims the key and something is actually running — a stray press
+    // while idle stays a no-op instead of wiping queued work.
+    if (key.name === 'escape') {
+      const active = instances().some((item) => ['running', 'waiting', 'queued'].includes(item.status));
+      if (active) void command('/cancel').catch((error) => { notice = String(error); refresh(); });
+      return;
+    }
     if (matches.length && (key.name === 'tab' || ((!key.meta) && (key.name === 'enter' || key.name === 'return')))) {
       setComposerValue(matches[completionIndex]!.name + (key.name === 'tab' ? ' ' : ''));
       if (key.name === 'tab') renderComposerFrame(); else void submit();
@@ -482,7 +514,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         stopSpinner();
         return;
       }
-      if (nativeSelection || hasSelection() || !windowFocused) return;
+      // Decoration only: frozen while blurred. Skipping a frame leaves the
+      // screen untouched and still valid, so it must not mark the frame stale
+      // — a quiet refocus after decoration-only blur is the whole point.
+      if (!windowFocused) return;
+      if (nativeSelection || hasSelection()) return;
       spinnerFrame += 1;
       conversationDirty = true;
       scheduleRefresh();
@@ -513,7 +549,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         return;
       }
       // Native text selection owns the screen; never dirty or repaint under it.
-      if (nativeSelection || hasSelection() || !windowFocused) return;
+      if (nativeSelection || hasSelection()) return;
+      // Content heartbeat: while blurred, repaint live text at most once per
+      // BLURRED_STREAM_MS so the background window keeps up without flooding.
+      if (!throttledFrame()) return;
       const runningEntry = [...(session.timeline ?? [])].find((entry) => entry.status === 'running' && entry.kind !== 'tool' && entry.kind !== 'shell');
       if (streams.size > 0 || runningEntry) {
         const liveText = [...streams.values()].join('')
@@ -526,6 +565,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           conversationDirty = true;
         }
       } else {
+        // The waiting ellipsis is decoration: frozen while blurred. A skipped
+        // frame leaves the screen untouched, so it must not mark it stale.
+        if (!windowFocused) return;
         waitingFrame = (waitingFrame + 1) % 24;
         conversationDirty = true;
       }
@@ -864,8 +906,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const markdownCols = Math.max(10, Math.min(120, metrics.conversationWidth - metrics.horizontalPadding * 2 - 2));
     thinkingBlockLines.clear();
     // The welcome screen yields to any conversation content — messages,
-    // streaming output, thinking, or transcript entries like shell runs and
-    // queued asides.
+    // streaming output, thinking, or transcript entries like shell runs.
     const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0 && !(session.timeline?.length);
     if (welcomeVisible) {
       for (const line of renderWelcome(
@@ -875,7 +916,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (!welcomeTimer) {
         welcomeStartedAt = performance.now();
         welcomeTimer = setInterval(() => {
-          if (!windowFocused || nativeSelection || hasSelection() || screen.focused !== composer) return;
+          // Decoration only: frozen while blurred. A skipped frame leaves the
+          // screen untouched, so it must not mark the frame stale.
+          if (!windowFocused) return;
+          if (nativeSelection || hasSelection() || screen.focused !== composer) return;
           // The frame derives from the monotonic clock instead of a counter:
           // after sleep or background suspension the animation lands on the
           // correct phase in one step, with no backlog of missed ticks.
@@ -1164,20 +1208,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const stickyHeaderLine = (block: ThinkingBlock): string => {
     const toggle = block.expanded ? '▼' : '▶';
-    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : toggle;
+    // Completed blocks reuse the toggle glyph as their icon; keep only one so
+    // the pinned header never shows "▼ ▼".
+    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : '';
     const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
     const label = block.status === 'active'
       ? (block.thinking || block.content.length === 0 ? 'Thinking' : 'Working')
       : (block.thinking ? 'Thought' : 'Activity');
     const duration = elapsedLabel(block.startedAt, block.finishedAt);
     const durationText = duration ? `  ${duration}` : '';
-    return `{${color}-fg}${toggle} ${icon} ${label}${durationText}{/${color}-fg}`;
+    return `{${color}-fg}${toggle}${icon ? ` ${icon}` : ''} ${label}${durationText}{/${color}-fg}`;
   };
 
   const renderThinkingBlock = (block: ThinkingBlock): void => {
     const headerLine = lineCursor;
     const toggle = block.expanded ? '▼' : '▶';
-    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : toggle;
+    // Completed blocks reuse the toggle glyph as their icon; keep only one so
+    // the header never shows "▼ ▼" or "▶ ▶".
+    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : '';
     const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
     // An active block with nothing to show yet is the pre-first-token state:
     // the model is reasoning, so label it Thinking, not Working.
@@ -1190,7 +1238,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const scanLabel = `{${COLOR().accent}-fg}${label}{/${COLOR().accent}-fg}`;
       pushConversationLine(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}{${COLOR().subtle}-fg}${durationText}{/${COLOR().subtle}-fg}`);
     } else {
-      pushConversationLine(`{${color}-fg}${icon} ${label}${durationText}{/${color}-fg}`);
+      pushConversationLine(`{${color}-fg}${toggle}${icon ? ` ${icon}` : ''} ${label}${durationText}{/${color}-fg}`);
     }
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
@@ -1297,11 +1345,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
   };
 
-  // Focus regained is treated like a resize: one invalidate + full redraw so
-  // blessed's diff buffers, the viewport, and the overlay scrollbar positions
-  // are all rebuilt from the live state instead of a stale frame.
+  // Focus regained is treated like a resize, and only when the blur window
+  // actually skipped frames: one invalidate + full redraw rebuilds blessed's
+  // diff buffers, the viewport, and the overlay scrollbar positions from the
+  // live state instead of a stale frame. Skipping it when nothing was skipped
+  // keeps short refocuses byte-quiet (no replay burst, no scrolling flash).
   screen.program.on('focus', () => {
     windowFocused = true;
+    if (!blurredStale) return;
+    blurredStale = false;
     requestFullRedraw();
     conversationDirty = true;
     scheduleRefresh();
@@ -1474,7 +1526,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const openSessions = async (): Promise<void> => {
     const sessions = await runtime.listSessions();
     const index = await choose('Sessions', [
-      ...sessions.map((item) => ({ label: item.sessionId, detail: `${item.messages} messages${item.sessionId.startsWith('btw-') ? '  [side]' : ''}` })),
+      ...sessions.map((item) => ({
+        label: oneLine(item.preview, 52) || item.sessionId,
+        detail: `${item.messages} msg · ${item.relativeUpdatedAt ?? ''} · ${item.sessionId}${item.sessionId.startsWith('btw-') ? ' [side]' : ''}`,
+      })),
       { label: 'New session', detail: 'Start a blank conversation' },
     ], { searchable: true });
     if (index < 0) return;
@@ -1646,7 +1701,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         refresh();
         break;
       case 'cancel': {
-        if (!args[0]) { await runtime.cancelSession(sessionId); notice = 'Stopped. Send a message to continue.'; refresh(); break; }
+        // The notice renders in the conversation stream; without flagging the
+        // dirty bit renderConversation() skips the repaint entirely and the
+        // acknowledgement never shows.
+        if (!args[0]) { await runtime.cancelSession(sessionId); conversationDirty = true; notice = 'Stopped. Send a message to continue.'; refresh(); break; }
         const target = instances().find((item) => item.instanceId === args[0] || item.instanceId.startsWith(args[0] ?? ''));
         const main = runtime.getInstance(session.mainInstanceId);
         if (target && main && target.instanceId !== main.instanceId) await runtime.cancelAgent(main.instanceId, target.instanceId);
@@ -1661,19 +1719,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         refresh();
         break;
       }
-      // /aside queues a side note without starting a turn; it folds into the
-      // next submitted message. /btw opens a self-contained side conversation
-      // forked from this one (/back or Ctrl+C returns); /fork copies the whole
-      // conversation into a new saved session. /goal sets a standing directive
-      // shown in the status bar and injected into every agent's prompt until
-      // cleared.
-      case 'aside': {
-        const note = args.join(' ');
-        if (!note) { notice = 'Usage: /aside <note>'; refresh(); break; }
-        const result = await runtime.addAside(sessionId, note);
-        notice = result.detail;
-        break;
-      }
+      // /btw opens a self-contained side conversation forked from this one
+      // (/back or Ctrl+C returns); /fork copies the whole conversation into a
+      // new saved session. /goal sets a standing directive shown in the status
+      // bar and injected into every agent's prompt until cleared.
       case 'btw': {
         const question = args.join(' ').trim();
         if (!question) { notice = 'Usage: /btw <question> - opens a side conversation; /back or Ctrl+C returns'; refresh(); break; }
@@ -1981,6 +2030,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     // frames as the waiting indicator) so a live job is obvious at a glance.
     const animation = setInterval(() => {
       if (closed) { clearInterval(animation); return; }
+      // Decoration only: frozen while blurred. A skipped frame leaves the
+      // screen untouched, so it must not mark the frame stale.
       if (!windowFocused) return;
       shellAnimationFrame += 1;
       conversationDirty = true;

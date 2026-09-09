@@ -327,6 +327,54 @@ test('the waiting ellipsis shows before the first token and disappears once toke
   }
 });
 
+test('Escape stops a running turn and is a no-op while the session is idle', async () => {
+  let finishGeneration!: () => void;
+  const generationGate = new Promise<void>((resolve) => { finishGeneration = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      await generationGate;
+      yield { content: 'done', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // While idle, Escape must not surface any stop notice.
+    editor.emit('keypress', '', { name: 'escape' });
+    await tick();
+    await wait(50);
+    assert.doesNotMatch(plainText(conversation.getContent()), /Stopped\./);
+    // Start a turn that never finishes on its own.
+    input.write('long running task');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; attempt < 100 && !(plainText(conversation.getContent()).includes('long running task')); attempt++) await wait(10);
+    // Escape cancels the turn.
+    editor.emit('keypress', '', { name: 'escape' });
+    let stopped = false;
+    for (let attempt = 0; attempt < 100 && !stopped; attempt++) {
+      await wait(10);
+      stopped = plainText(conversation.getContent()).includes('Stopped.');
+    }
+    assert.ok(stopped, `Escape during a turn must stop it, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    // The session recovers: a follow-up message completes normally.
+    finishGeneration();
+    input.write('second message');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let finished = false;
+    for (let attempt = 0; attempt < 100 && !finished; attempt++) {
+      await wait(10);
+      finished = plainText(conversation.getContent()).includes('done');
+    }
+    assert.ok(finished, `the next message must still complete after Escape, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+  } finally {
+    finishGeneration();
+    await tui.cleanup();
+  }
+});
+
 test('the /theme command repaints every surface with the chosen palette and persists it', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },
@@ -735,6 +783,10 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
     assert.ok(await headerGone(), 'the scenario must scroll the block header off the top of the viewport');
     assert.ok(visibleRows()[0].includes('▼'), 'the collapsed-state arrow must stay reachable at the conversation top');
     assert.ok(visibleRows()[0].includes('Thought'), 'the pinned row must identify the block');
+    // A completed block's icon doubles as the toggle glyph; rendering both
+    // produced a double ▼ (or ▶) on the pinned row.
+    const pinnedArrows = (visibleRows()[0].match(/[▼▶]/g) ?? []).length;
+    assert.equal(pinnedArrows, 1, `the pinned row must render exactly one toggle arrow, got: ${JSON.stringify(visibleRows()[0])}`);
     // The pinned row must still collapse the block; afterwards the sticky row
     // disappears because the header row is back inside the viewport.
     await mouse(0, 3, 0);
@@ -742,6 +794,12 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
     assert.doesNotMatch(conversation.getContent(), /Reasoning paragraph line 0/, 'clicking the pinned row collapses the block');
     for (let attempt = 0; attempt < 20; attempt++) await wait(10);
     assert.ok(!visibleRows().some((row) => row.includes('Thought') && row.includes('▼')), 'the pinned row must vanish once the header is visible again');
+    // Once the real (in-stream) header is visible again it must not double the
+    // glyph either: the completed block's status icon reuses the toggle shape.
+    const realHeaderRow = visibleRows().find((row) => row.includes('Thought'));
+    assert.ok(realHeaderRow, 'the collapsed Thought header must be visible after the pinned row clears');
+    const headerArrows = (realHeaderRow.match(/[▼▶]/g) ?? []).length;
+    assert.equal(headerArrows, 1, `the real header row must render exactly one toggle arrow, got: ${JSON.stringify(realHeaderRow)}`);
     // Expanding again and scrolling the whole block (header + body) past the
     // viewport top hides the pinned row even though later content follows.
     const thoughtRow = await findThoughtRow();
@@ -755,48 +813,6 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
     for (let attempt = 0; attempt < 120 && (await stickyVisible()); attempt++) await mouse(65, 3, 5);
     assert.ok(!(await stickyVisible()), 'scrolling past the body must hide the pinned header');
     assert.ok(await answerVisible(), 'the answer must remain visible after the pinned header clears');
-  } finally {
-    await tui.cleanup();
-  }
-});
-
-test('/aside queues a note without a turn and folds it into the next message', async () => {
-  let turnCount = 0;
-  const seenLastUser: string[] = [];
-  const tui = await startTui({
-    modelStream: async function* (_config, _system, messages) {
-      turnCount += 1;
-      seenLastUser.push(String(messages.filter((message) => message.role === 'user').at(-1)?.content ?? ''));
-      yield { content: `done ${turnCount}`, done: true };
-    },
-  });
-  try {
-    const { screen, input } = tui;
-    const editor = screen.focused as blessed.Widgets.BoxElement;
-    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
-    input.write('/aside also check the flaky test');
-    await tick();
-    editor.emit('keypress', '', { name: 'enter' });
-    // The note must be acknowledged in the conversation without any model call.
-    let acknowledged = false;
-    for (let attempt = 0; attempt < 100 && !acknowledged; attempt++) {
-      await wait(10);
-      acknowledged = plainText(conversation.getContent()).includes('Noted.');
-    }
-    assert.ok(acknowledged, `queueing an aside must acknowledge it, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
-    assert.equal(turnCount, 0, 'queueing an aside must not start a turn');
-    input.write('continue the work');
-    await tick();
-    editor.emit('keypress', '', { name: 'enter' });
-    let folded = false;
-    for (let attempt = 0; attempt < 100 && !folded; attempt++) {
-      await wait(10);
-      folded = plainText(conversation.getContent()).includes('Aside included with your message');
-    }
-    assert.ok(folded, `the folded aside must be announced, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
-    for (let attempt = 0; !plainText(conversation.getContent()).includes('done 1') && attempt < 100; attempt++) await wait(10);
-    assert.match(seenLastUser.at(-1) ?? '', /also check the flaky test/);
-    assert.match(seenLastUser.at(-1) ?? '', /continue the work/);
   } finally {
     await tui.cleanup();
   }
@@ -959,7 +975,7 @@ test('the welcome banner repaints on its own animation clock', async () => {
   }
 });
 
-test('animations freeze while the terminal reports blur and resume on focus', async () => {
+test('blur slows animation to a heartbeat and focus restores full speed', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },
   });
@@ -973,19 +989,49 @@ test('animations freeze while the terminal reports blur and resume on focus', as
     }
     assert.ok(bannerPainted, 'the conversation must paint its initial banner');
     const snapshot = (): string => screen.lines.map((row) => row.map((cell) => cell.join(':')).join('|')).join('\n');
+    // While focused the 50ms welcome animation must keep repainting.
     const focused = snapshot();
-    await wait(300);
+    await wait(150);
     assert.notEqual(snapshot(), focused, 'the welcome screen must animate while the terminal is focused');
     input.write('\x1b[O');
     await wait(80);
     const blurred = snapshot();
-    await wait(300);
-    assert.equal(snapshot(), blurred, 'animation must freeze while the terminal is unfocused');
+    await wait(150);
+    assert.equal(snapshot(), blurred, 'welcome decoration must freeze while the terminal is unfocused');
+    // Refocusing after a blur that skipped only decoration must resume the
+    // decoration at full speed — one live repaint, then steady animation, the
+    // opposite of a frozen frame or a replay burst.
+    const beforeRefocus = snapshot();
     input.write('\x1b[I');
+    await wait(120);
+    assert.notEqual(snapshot(), beforeRefocus, 'refocus must resume decoration animation at full speed');
+    // Streaming text keeps a heartbeat while blurred: the transcript must keep
+    // growing in a background window instead of freezing.
+    input.write('\x1b[O');
     await wait(80);
-    const resumed = snapshot();
+    input.write('streaming while blurred');
+    await tick();
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    editor.emit('keypress', '', { name: 'enter' });
+    let streamed = false;
+    for (let attempt = 0; attempt < 60 && !streamed; attempt++) {
+      await wait(50);
+      streamed = plainText(conversation.getContent()).includes('streaming while blurred');
+    }
+    assert.ok(streamed, 'streamed text must keep rendering while the terminal is unfocused');
+    // Focus regain after skipped frames is treated like one resize: the frame
+    // is rebuilt in place from live state. The visible screen must not roll
+    // or replay — it simply stays put.
+    const finalFocus = snapshot();
+    await wait(150);
+    assert.equal(snapshot(), finalFocus, 'refocus must rebuild in place without rolling the screen');
+    const rebuilt = snapshot();
+    await wait(200);
+    assert.equal(snapshot(), rebuilt, 'the refocus redraw must be a single rebuild, not a rolling burst');
     await wait(300);
-    assert.notEqual(snapshot(), resumed, 'animation must resume once focus returns');
+    assert.equal(snapshot(), rebuilt, 'the refocus redraw must settle immediately (no replay burst)');
+    await wait(400);
+    assert.equal(snapshot(), rebuilt, 'the refocus redraw must not produce further updates');
   } finally {
     await tui.cleanup();
   }

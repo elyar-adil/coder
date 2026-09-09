@@ -59,10 +59,6 @@ function mergeUsage(previous: ModelUsage | undefined, next: ModelUsage): ModelUs
   return result;
 }
 
-function asidePrefix(): string {
-  return 'Additional context noted earlier (aside):';
-}
-
 function mergeAgentUsage(previous: AgentInstance['usage'], usage: ModelUsage | undefined, firstTokenMs: number | undefined, durationMs: number, requests = 1): AgentInstance['usage'] {
   const merged = mergeUsage(previous, usage ?? {});
   return { ...merged, requests: (previous?.requests ?? 0) + requests, turns: (previous?.turns ?? 0) + 1, firstTokenMs, lastTurnMs: durationMs };
@@ -443,7 +439,7 @@ export class AgentRuntime {
     return session.instanceIds.map((id) => this.instances.get(id)).filter((item): item is AgentInstance => Boolean(item)).map(cloneInstance);
   }
 
-  async listSessions(): Promise<Array<{ sessionId: string; messages: number; updatedAt: string }>> {
+  async listSessions(): Promise<Array<{ sessionId: string; messages: number; updatedAt: string; preview?: string; relativeUpdatedAt?: string }>> {
     await this.ready;
     return this.store.list();
   }
@@ -484,7 +480,6 @@ export class AgentRuntime {
     const session = this.sessions.get(sessionId)!;
     session.messages = [];
     session.timeline = [];
-    session.pendingAsides = [];
     session.goal = undefined;
     session.updatedAt = now();
     const main = this.instances.get(session.mainInstanceId);
@@ -518,24 +513,6 @@ export class AgentRuntime {
     }
     await this.persistSession(sessionId);
     this.notifyIdleWaiters();
-  }
-
-  /** Queue an aside (/aside): folds into the next submitted message without starting a turn. */
-  async addAside(sessionId: string, content: string): Promise<{ queued: boolean; detail: string }> {
-    const text = content.trim();
-    if (!text) throw new Error('Aside cannot be empty');
-    await this.requireSessionWrite(sessionId);
-    const session = this.sessions.get(sessionId)!;
-    const hadAsides = (session.pendingAsides?.length ?? 0) > 0;
-    (session.pendingAsides ??= []).push(text);
-    session.updatedAt = now();
-    await this.persistSession(sessionId);
-    this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: hadAsides
-      ? `Noted — another aside is already queued; both will be included with your next message.`
-      : `Noted. This will be included with your next message without starting a turn.`, createdAt: now() } });
-    return { queued: true, detail: hadAsides
-      ? 'Queued behind one earlier aside; both will be included with the next message.'
-      : 'Queued. It will be included with the next message without starting a turn.' };
   }
 
   /** Set or clear the standing session goal (/goal). Injected into every agent's prompt until cleared. */
@@ -586,35 +563,16 @@ export class AgentRuntime {
     const session = this.sessions.get(sessionId)!;
     const main = this.instances.get(session.mainInstanceId)!;
     const turnId = randomUUID();
-    const queuedAsides = session.pendingAsides ?? [];
-    session.pendingAsides = [];
-    const composed = queuedAsides.length
-      ? `${text}
-
-${asidePrefix()}
-${queuedAsides.map((aside, index) => `${index + 1}. ${aside}`).join('\n')}`
-      : text;
-    const message: SessionMessage = { messageId: randomUUID(), role: 'user', content: composed, createdAt: now(), turnId };
+    const message: SessionMessage = { messageId: randomUUID(), role: 'user', content: text, createdAt: now(), turnId };
     session.messages.push(message);
     session.updatedAt = message.createdAt;
     if (main.status === 'running' || main.status === 'waiting') {
       this.controllers.get(main.instanceId)?.abort('Superseded by a newer user message');
     }
     if (main.status === 'cancelled') main.status = 'idle';
-    // The model must see the folded asides, so deliver the composed message.
-    // The TUI renders the asides as separate system entries from the emitted
-    // system_message events above, while this user message keeps them inline.
-    this.deliver(main, composed, undefined, turnId);
+    this.deliver(main, text, undefined, turnId);
     await this.persistSession(sessionId);
     this.emit({ type: 'user_message', sessionId, message: { ...message } });
-    if (queuedAsides.length) {
-      // Timeline-only notices; the user message itself already carries the
-      // asides inline for the model.
-      this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: `Aside${queuedAsides.length > 1 ? 's' : ''} included with your message:`, createdAt: now() } });
-      for (const aside of queuedAsides) {
-        this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: `· ${aside}`, createdAt: now() } });
-      }
-    }
     this.enqueue(main.instanceId);
     return turnId;
   }

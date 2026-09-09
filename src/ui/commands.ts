@@ -1,7 +1,6 @@
 export const SLASH_COMMANDS = [
   { name: '/provider', description: 'Manage providers' },
   { name: '/model', description: 'Choose a model' },
-  { name: '/aside', description: 'Queue an aside to fold into the next message' },
   { name: '/btw', description: 'Ask in a side conversation forked from this one' },
   { name: '/back', description: 'Return from a side conversation to the parent session' },
   { name: '/fork', description: 'Copy this conversation into a new saved session' },
