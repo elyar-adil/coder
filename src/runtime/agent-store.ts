@@ -37,6 +37,11 @@ export class AgentRuntimeStore {
     this.dir = resolve(baseDir, 'runtime');
   }
 
+  /** Root directory for runtime state (sessions, archives, locks, instances). */
+  get runtimeDir(): string {
+    return this.dir;
+  }
+
   async init(): Promise<void> {
     await mkdir(this.dir, { recursive: true });
   }
@@ -44,6 +49,11 @@ export class AgentRuntimeStore {
   private path(sessionId: string): string {
     validSessionId(sessionId);
     return resolve(this.dir, `${sessionId}.json`);
+  }
+
+  /** Absolute path of the persisted session snapshot (cross-process lock target). */
+  sessionPath(sessionId: string): string {
+    return this.path(sessionId);
   }
 
   async save(snapshot: PersistedAgentSession): Promise<void> {
@@ -74,6 +84,21 @@ export class AgentRuntimeStore {
       return parsed.version === 1 ? parsed : undefined;
     } catch {
       return undefined;
+    }
+  }
+
+  /** Duplicate one persisted session file under a new session id (used by /fork). */
+  async copySession(sourceSessionId: string, newSessionId: string): Promise<void> {
+    const source = await this.load(sourceSessionId);
+    if (!source) throw new Error(`Session ${sourceSessionId} is not persisted yet.`);
+    const snapshot: PersistedAgentSession = {
+      version: 1,
+      session: { ...source.session, sessionId: newSessionId },
+      instances: source.instances.map((instance) => ({ ...instance, sessionId: newSessionId })),
+    };
+    await this.save(snapshot);
+    for (const archive of await this.loadArchives(sourceSessionId)) {
+      await this.saveArchive(newSessionId, archive.instanceId, archive.seq, archive.messages);
     }
   }
 

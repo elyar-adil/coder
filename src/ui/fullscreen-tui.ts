@@ -1,3 +1,4 @@
+import { resolve as resolvePath, sep } from 'node:path';
 import blessed from 'blessed';
 
 import type { BackendConfig } from '../backend.js';
@@ -10,12 +11,16 @@ import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
+import { runShellCommand } from '../infra/tools.js';
 import { diffPreview, elapsedLabel, isWaitingForFirstToken, spinnerGlyph, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
 import { attachPillScrollbar, type PillScrollbarHandle, type PillScrollbarTheme, pillScrollbarColors } from './scrollbar.js';
 import { recordTimeline } from '../runtime/session-timeline.js';
+import { otherWorkspaceInstances, type WorkspaceInstanceInfo } from '../runtime/workspace-instances.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
 import type { TuiTheme, TuiThemeColors, Tone } from './theme.js';
 import { resetTuiMarkdownCache } from './markdown.js';
+import { BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, enableBracketedPaste } from './bracketed-paste.js';
+import { WorktreeManager, type WorktreeInfo } from '../runtime/worktree.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 type Provider = {
@@ -102,6 +107,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let welcomeTimer: NodeJS.Timeout | undefined;
   let welcomeFrame = 0;
   let streamTimer: NodeJS.Timeout | undefined;
+  let shellAbort: AbortController | undefined;
   let waitingFrame = 0;
   let lastPaintedStreamText = '';
   const composerChars: string[] = [];
@@ -119,7 +125,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     finishedAt?: number;
   }
   const thinkingBlocks = new Map<string, ThinkingBlock>();
-  const thinkingBlockLines = new Map<string, { headerLine: number }>();
+  const thinkingBlockLines = new Map<string, { headerLine: number; lastLine: number }>();
+  // Sticky collapse header: when an expanded block's own header has scrolled
+  // above the viewport while the block body is still on screen, the header is
+  // redrawn pinned to the first conversation row so it can always be clicked
+  // to collapse. Sticky rows do not exist in the logical content; they are
+  // inserted at the viewport top after scrolling is applied.
   // Streaming events can batch: a thinking segment may be rendered only after
   // it already finished, so the start time is tracked per turn, not per block.
   const thinkingStartedAt = new Map<string, number>();
@@ -127,6 +138,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!thinkingStartedAt.has(turnId)) thinkingStartedAt.set(turnId, Date.now());
   };
   let latestThinkingTurnId: string | undefined;
+  // `lastLine` is the block's final rendered line; the pinned header must
+  // disappear once the whole block (not just its header) leaves the top.
+  type StickyHeader = { turnId: string; line: string; lastLine: number; redrawKey: string };
+  let stickyHeader: StickyHeader | undefined;
+  let lastStickyKey: string | undefined;
+  // Blessed bubbles a click from the sticky overlay up to the conversation
+  // box; the flag consumes the bubbled copy so the block is toggled once.
+  let stickyClickHandled = false;
   let conversationFollowOutput = true;
   let conversationScrollOffset = 0;
   let restoringConversationScroll = false;
@@ -140,9 +159,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let completionQuery = '';
   let dismissedCompletion = '';
   let nativeSelection = false;
+  // /btw side conversation state. Inside a side session, `sideParentSessionId`
+  // points at the conversation /back and Ctrl+C return to. /fork works from
+  // anywhere but never changes the mode.
+  let sideParentSessionId: string | undefined;
+  const isBtw = (): boolean => sideParentSessionId !== undefined;
   type Point = { x: number; y: number };
   let selection: { start: Point; end: Point; rows: string[][]; left: number; right: number; top: number; bottom: number; dragging: boolean } | undefined;
   const hasSelection = (): boolean => Boolean(selection && (selection.start.x !== selection.end.x || selection.start.y !== selection.end.y));
+
+  // When the sticky row's identity or text changes, a full redraw avoids
+  // blessed CSR diff artifacts around the shifted top row.
+  const invalidateStickyIfChanged = (next?: StickyHeader): void => {
+    const key = next ? `${next.turnId} :: ${next.line}` : '';
+    if (key !== lastStickyKey) {
+      lastStickyKey = key || undefined;
+      requestFullRedraw();
+    }
+  };
 
   const restoreThinking = (): void => {
     const restored = new Map<string, string>();
@@ -156,10 +190,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   restoreThinking();
   setActiveTheme(options.configManager.getConfig().theme);
 
+  // Bracketed paste: the terminal wraps pasted text in `\x1b[200~ ... \x1b[201~`.
+  // The filter turns each wrapped chunk into one paste event, so line breaks
+  // inside a paste insert literally instead of being read as Enter (which
+  // used to submit the half-pasted draft).
+  const pasteInput = enableBracketedPaste(process.stdin);
   const screen = blessed.screen({
+    input: pasteInput,
     smartCSR: true, fullUnicode: true, title: 'TokenMaw',
     style: { bg: COLOR().background, fg: COLOR().text },
   });
+  screen.program.write(BRACKETED_PASTE_ENABLE);
   let fullRedrawPending = true;
   const requestFullRedraw = (): void => { fullRedrawPending = true; };
   const renderScreen = (): void => {
@@ -177,11 +218,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const statusbar = blessed.box({
     parent: screen, bottom: 0, left: 0, width: '100%', height: 1, tags: true,
     padding: { left: 1, right: 1 }, style: { bg: COLOR().background, fg: COLOR().muted },
-  });
-  // Persistent reminder that a /goal is active; cleared and rebuilt in renderStatus.
-  const goalLabel = blessed.box({
-    parent: statusbar, top: 0, left: 0, height: 1, tags: true, shrink: true,
-    style: { bg: COLOR().background, fg: COLOR().accent },
   });
   const conversation = blessed.box({
     parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
@@ -352,8 +388,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     renderComposerFrame();
   };
 
+  const insertPaste = (text: string): void => {
+    const chars = Array.from(text);
+    composerChars.splice(composerCursor, 0, ...chars);
+    composerCursor += chars.length;
+  };
+
   const handleComposerKey = (ch: string, key: { name?: string; ctrl?: boolean; meta?: boolean }): void => {
     if (closed) return;
+    if (pasteInput.pasteActive) {
+      // Paste content is literal: line breaks included, never a submit.
+      // CR is normalized to LF so browser-style CRLF pastes stay clean.
+      if (ch === '\r' || ch === '\n') insertPaste('\n');
+      else if (ch && !key.ctrl && !key.meta && !/^[\x00-\x1f\x7f]$/.test(ch)) insertPaste(ch);
+      // Long pastes span many reads: keep repainting so the composer does
+      // not appear frozen while the paste streams in.
+      scheduleRefresh();
+      return;
+    }
     const matches = completions.hidden ? [] : commandMatches(composerValue());
     if (matches.length && (key.name === 'up' || key.name === 'down')) {
       completionIndex = (completionIndex + (key.name === 'up' ? -1 : 1) + matches.length) % matches.length;
@@ -367,7 +419,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (key.name === 'tab') renderComposerFrame(); else void submit();
       return;
     }
-    if ((key.name === 'enter' || key.name === 'return') && !key.meta) { void submit(); return; }
+    if ((key.name === 'enter' || key.name === 'return') && !key.meta) { void submit(); return; } // guarded above: never fires inside a paste
     if ((key.meta && (key.name === 'enter' || key.name === 'return')) || (key.ctrl && key.name === 'j')) {
       composerChars.splice(composerCursor++, 0, '\n');
     }
@@ -593,6 +645,23 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const instances = (): AgentInstance[] => [...instanceCache.values()];
 
+  // Cross-process awareness: periodically look for other live maw instances
+  // in the same workspace so the status bar can warn before edits collide.
+  let otherInstances: WorkspaceInstanceInfo[] = [];
+  const instancePoll = setInterval(() => {
+    void otherWorkspaceInstances(runtime.workspace()).then((found) => {
+      const changed = found.length !== otherInstances.length
+        || found.some((item, index) => item.pid !== otherInstances[index]?.pid);
+      otherInstances = found;
+      if (changed) { renderStatus(); screen.render(); }
+    }).catch(() => undefined);
+  }, 15_000);
+  instancePoll.unref?.();
+  void otherWorkspaceInstances(runtime.workspace()).then((found) => {
+    otherInstances = found;
+    renderStatus();
+  }).catch(() => undefined);
+
   const depthPrefix = (instance: AgentInstance): string => {
     const status = STATUS_PRESENTATION[instance.status];
     const color = TONE_COLOR(status.tone);
@@ -611,21 +680,42 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }, { input: 0, output: 0, cached: 0, firstTokenMs: undefined as number | undefined });
     const usageText = usage.input || usage.output ? `  ·  ${usage.input + usage.output} tok${usage.cached ? ` (${usage.cached} cached)` : ''}${usage.firstTokenMs !== undefined ? `  ·  first ${usage.firstTokenMs}ms` : ''}` : '';
     const width = Math.max(1, Number(screen.width) - 2);
-    const left = `maw  ${activeModel}`;
-    const right = Number(screen.width) >= 78 ? `${activityText}${usageText}  ·  Ctrl+K commands` : `${activityText}${usageText}`;
+    const home = process.env.HOME ? resolvePath(process.env.HOME) : undefined;
+    const cwd = runtime.workspace();
+    const cwdText = home && cwd.startsWith(home + sep) ? `~${cwd.slice(home.length)}` : cwd;
+    const left = `maw  ${activeModel}  ${cwdText}`;
+    // Surface the mode-specific Ctrl+C semantics so the double-press quit is
+    // never a surprise, and [side] marks a /btw conversation.
+    const ctrlHint = isBtw() ? 'Ctrl+C back' : 'Ctrl+C x2 quit';
+    // Cross-process state: a read-only badge when another process owns this
+    // session, and a warning when other maw instances are live in the
+    // same workspace (file conflicts are detected, not hidden).
+    const access = runtime.sessionAccess(sessionId);
+    const accessBadge = access.writable
+      ? ''
+      : `  {${COLOR().error}-fg}[read-only${access.holderPid ? ` pid ${access.holderPid}` : ''}]{/${COLOR().error}-fg}`;
+    const instanceBadge = otherInstances.length
+      ? `  {${COLOR().warning}-fg}⚠ ${otherInstances.length} other maw${otherInstances.length === 1 ? '' : 's'}{/${COLOR().warning}-fg}`
+      : '';
+    // A standing goal takes priority over the quit hint; the hint yields so
+    // the goal never gets truncated below its floor.
+    const right = session.goal
+      ? `${activityText}${usageText}`
+      : Number(screen.width) >= 78
+        ? `${activityText}${usageText}  ·  Ctrl+K commands  ·  ${ctrlHint}`
+        : `${activityText}${usageText}  ·  ${ctrlHint}`;
     const goal = session.goal;
-    if (goal) {
-      goalLabel.setContent(`{${COLOR().accent}-fg} ⚑ ${safe(oneLine(goal, Math.max(8, width - 30)))}{/${COLOR().accent}-fg}`);
-      goalLabel.show();
-    } else {
-      goalLabel.setContent('');
-      goalLabel.hide();
-    }
-    const rightWidth = Number(statusbar.strWidth(right)) + (goal ? Number(statusbar.strWidth(` ⚑ ${oneLine(goal, Math.max(8, width - 30))}`)) : 0);
-    const gap = width - Number(statusbar.strWidth(left)) - rightWidth;
+    // The standing goal rides the right cluster so the layout stays a single
+    // left/right split; a separate child widget would fight the statusbar's
+    // setContent-based repaint. Its budget is whatever the left and right
+    // clusters leave over, floored so it never collapses to nothing.
+    const goalBudget = Math.max(8, width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(right)) - 4);
+    const goalText = goal ? `  ⚑ ${oneLine(goal, goalBudget)}` : '';
+    const rightText = `${right}${goalText}`;
+    const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(rightText));
     statusbar.setContent(gap >= 3
-      ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}${' '.repeat(gap)}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(right)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
-      : `{bold}maw{/bold}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}`);
+      ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}  {${COLOR().muted}-fg}${safe(cwdText)}{/${COLOR().muted}-fg}${isBtw() ? `  {${COLOR().accent}-fg}[side]{/${COLOR().accent}-fg}` : ''}${accessBadge}${instanceBadge}${' '.repeat(Math.max(0, gap))}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(rightText)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
+      : `{bold}maw{/bold}${goal ? `  {${COLOR().accent}-fg}⚑ ${safe(oneLine(goal, goalBudget))}{/${COLOR().accent}-fg}` : ''}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}${accessBadge}${instanceBadge}`);
   };
 
   const conversationAtBottom = (): boolean => {
@@ -701,14 +791,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         const block: ThinkingBlock = { turnId: entry.id, expanded, content: previous?.content ?? [],
           status: entry.status === 'running' ? 'active' : 'completed',
           thinking: entry.kind === 'thinking' ? entry.content : previous?.thinking,
-          startedAt: previous?.startedAt ?? thinkingStartedAt.get(entry.turnId ?? '') ?? (entry.status === 'running' ? Date.now() : undefined),
-          finishedAt: entry.status === 'running' ? undefined : previous?.finishedAt ?? Date.now() };
+          startedAt: previous?.startedAt ?? entry.startedAt ?? thinkingStartedAt.get(entry.turnId ?? '') ?? (entry.status === 'running' ? Date.now() : undefined),
+          finishedAt: entry.status === 'running' ? undefined : previous?.finishedAt ?? entry.endedAt ?? Date.now() };
         thinkingBlocks.set(entry.id, block);
         if (entry.kind === 'thinking') {
           renderThinkingBlock(block);
         } else {
           const headerLine = lineCursor;
-          thinkingBlockLines.set(entry.id, { headerLine });
+          thinkingBlockLines.set(entry.id, { headerLine, lastLine: headerLine });
           latestThinkingTurnId = entry.id;
           const agent = entry.instanceId ? instanceCache.get(entry.instanceId)?.agentId : undefined;
           const state = entry.status === 'running'
@@ -817,8 +907,115 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     } finally {
       restoringConversationScroll = false;
     }
+    applyStickyHeader(conversation.childBase);
     conversationFollowOutput = shouldFollowOutput;
     conversationDirty = false;
+  };
+
+  // Pin the collapse header of an expanded block to the conversation top while
+  // the user is reading that block's body. The pinned row is a fixed overlay on
+  // the viewport's first row, and it disappears again as soon as the block's
+  // real header scrolls back into view or the whole block scrolls past the top.
+  const applyStickyHeader = (viewportTop: number): void => {
+    const visibleRows = Math.max(1, Number(conversation.height) - Number(conversation.iheight));
+    const scrollHeight = conversation.getScrollHeight();
+    // Nothing is scrolled out of view when the content fits, so no block can
+    // need a pinned header — fall through to the hide branch below so any
+    // sticky row left over from before the content shrank is cleared too.
+    let sticky: StickyHeader | undefined;
+    if (scrollHeight > visibleRows) {
+      const topRow = Math.max(0, Math.min(scrollHeight - visibleRows, viewportTop));
+      const clines = (conversation as unknown as { _clines?: { ftor?: Array<unknown[]> } })._clines;
+      // Block positions are logical content rows, but scrolling (childBase) is
+      // counted in rendered rows: long wrapped lines make the two diverge.
+      // Translate through ftor so the viewport is never considered to have
+      // left a block it is still inside.
+      const logicalSpan = (real: number): { first: number; last: number } => {
+        const bucket = clines?.ftor?.[real];
+        if (!bucket || bucket.length === 0) return { first: real, last: real };
+        return { first: Number(bucket[0]), last: Number(bucket[bucket.length - 1]) };
+      };
+      const pinFor = (turnId: string, block: ThinkingBlock, position: { headerLine: number; lastLine: number }): StickyHeader => {
+        const line = stickyHeaderLine(block);
+        return {
+          turnId,
+          line,
+          lastLine: logicalSpan(position.lastLine).last,
+          // The redraw key excludes the spinner glyph: its 60ms animation must
+          // not force full-screen reallocations, while label/duration changes
+          // (which only grow or switch) still do.
+          redrawKey: `${turnId} :: ${line.replace(spinnerGlyph(spinnerFrame), '')}`,
+        };
+      };
+      // Keep the current sticky row only while its block still occupies the
+      // viewport top: the real header sits above the top row and the block
+      // body has not fully scrolled past it yet.
+      const pos = stickyHeader ? thinkingBlockLines.get(stickyHeader.turnId) : undefined;
+      const keptBlock = stickyHeader && pos ? thinkingBlocks.get(stickyHeader.turnId) : undefined;
+      if (stickyHeader && pos && keptBlock?.expanded) {
+        const header = logicalSpan(pos.headerLine);
+        const tail = logicalSpan(pos.lastLine);
+        if (header.first < topRow && tail.last >= topRow) {
+          // Regenerate the row so a live block's spinner glyph and elapsed
+          // seconds keep updating instead of freezing at the pinning frame.
+          sticky = pinFor(stickyHeader.turnId, keptBlock, pos);
+        }
+      }
+      if (!sticky) {
+        // Several expanded blocks may sit above the viewport; the one to pin
+        // is the unique block whose rendered span still contains the top row.
+        for (const [turnId, position] of thinkingBlockLines) {
+          const block = thinkingBlocks.get(turnId);
+          if (!block?.expanded) continue;
+          const header = logicalSpan(position.headerLine);
+          const tail = logicalSpan(position.lastLine);
+          if (header.first < topRow && tail.last >= topRow) {
+            sticky = pinFor(turnId, block, position);
+            break;
+          }
+        }
+      }
+    }
+    invalidateStickyIfChanged(sticky);
+    const conversationExt = conversation as blessed.Widgets.BoxElement & { _listWrapper?: blessed.Widgets.BoxElement };
+    if (!sticky) {
+      conversationExt._listWrapper?.hide();
+      return;
+    }
+    // The pinned header is a fixed overlay anchored at the viewport's first
+    // row; it does not consume a logical content row.
+    conversationExt._listWrapper ??= (() => {
+      // Full parent width plus the same left/right padding as the content
+      // stream keeps the pinned header aligned with the real header row.
+      // `fixed` exempts the overlay from the scrollable parent's childBase
+      // offset, so it stays anchored at the viewport's top row instead of
+      // scrolling out of view together with the conversation content.
+      const wrapper = blessed.box({ parent: conversation, top: 0, left: 0, width: '100%', height: 1, tags: true, mouse: true, fixed: true, padding: { left: 2, right: 2 }, style: { bg: COLOR().background } });
+      wrapper.on('click', () => {
+        // Blessed bubbles this click up to the conversation box; the flag
+        // consumes the bubbled copy so the block is toggled exactly once.
+        stickyClickHandled = true;
+        if (hasSelection()) return;
+        focusConversation();
+        if (stickyHeader) toggleThinkingBlock(stickyHeader.turnId);
+      });
+      return wrapper;
+    })();
+    stickyHeader = sticky;
+    conversationExt._listWrapper.show();
+    conversationExt._listWrapper.setContent(sticky.line);
+  };
+
+  const stickyHeaderLine = (block: ThinkingBlock): string => {
+    const toggle = block.expanded ? '▼' : '▶';
+    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : toggle;
+    const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
+    const label = block.status === 'active'
+      ? (block.thinking || block.content.length === 0 ? 'Thinking' : 'Working')
+      : (block.thinking ? 'Thought' : 'Activity');
+    const duration = elapsedLabel(block.startedAt, block.finishedAt);
+    const durationText = duration ? `  ${duration}` : '';
+    return `{${color}-fg}${toggle} ${icon} ${label}${durationText}{/${color}-fg}`;
   };
 
   const renderThinkingBlock = (block: ThinkingBlock): void => {
@@ -839,7 +1036,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     } else {
       pushConversationLine(`{${color}-fg}${icon} ${label}${durationText}{/${color}-fg}`);
     }
-    thinkingBlockLines.set(block.turnId, { headerLine });
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
       if (block.thinking) {
@@ -855,6 +1051,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       }
     }
     pushConversationLine('');
+    // Recorded after the whole block is pushed so `lastLine` covers the body;
+    // the pinned header must vanish once this row scrolls past the viewport top.
+    thinkingBlockLines.set(block.turnId, { headerLine, lastLine: Math.max(0, lineCursor - 1) });
   };
 
   const renderActivity = (): void => {
@@ -1067,7 +1266,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     ]);
   };
 
-  const switchSession = async (id: string): Promise<void> => {
+  const switchSession = async (id: string, opts: { forkFrom?: string; parentSessionId?: string } = {}): Promise<void> => {
+    if (opts.forkFrom) {
+      // /btw and /fork both start as a full copy of the current conversation,
+      // so the side model keeps the whole picture from message one.
+      await runtime.forkSession(opts.forkFrom, id);
+    }
     const next = await runtime.openSession(id);
     sessionId = id;
     session = next;
@@ -1081,6 +1285,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     thinkingBlockLines.clear();
     thinkingStartedAt.clear();
     pendingTurns.clear();
+    stickyHeader = undefined;
+    lastStickyKey = undefined;
+    (conversation as blessed.Widgets.BoxElement & { _listWrapper?: blessed.Widgets.BoxElement })._listWrapper?.hide();
     notice = '';
     conversationDirty = true;
     conversationFollowOutput = true;
@@ -1089,6 +1296,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     for (const instance of instances()) {
       if (instance.instanceId === session.mainInstanceId && instance.activeTurnId) pendingTurns.add(instance.activeTurnId);
     }
+    sideParentSessionId = opts.parentSessionId;
     startSpinner();
     startStreamTimer();
     refresh();
@@ -1097,7 +1305,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const openSessions = async (): Promise<void> => {
     const sessions = await runtime.listSessions();
     const index = await choose('Sessions', [
-      ...sessions.map((item) => ({ label: item.sessionId, detail: `${item.messages} messages` })),
+      ...sessions.map((item) => ({ label: item.sessionId, detail: `${item.messages} messages${item.sessionId.startsWith('btw-') ? '  [side]' : ''}` })),
       { label: 'New session', detail: 'Start a blank conversation' },
     ]);
     if (index < 0) return;
@@ -1256,6 +1464,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         thinkingBlockLines.clear();
         thinkingStartedAt.clear();
         pendingTurns.clear();
+        stickyHeader = undefined;
+        lastStickyKey = undefined;
+        (conversation as blessed.Widgets.BoxElement & { _listWrapper?: blessed.Widgets.BoxElement })._listWrapper?.hide();
         notice = '';
         conversationDirty = true;
         refresh();
@@ -1276,20 +1487,129 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         refresh();
         break;
       }
-      // /btw queues a side note without starting a turn; it folds into the
-      // next submitted message. /goal sets a standing directive shown in the
-      // status bar and injected into every agent's prompt until cleared.
-      case 'btw': {
+      // /aside queues a side note without starting a turn; it folds into the
+      // next submitted message. /btw opens a self-contained side conversation
+      // forked from this one (/back or Ctrl+C returns); /fork copies the whole
+      // conversation into a new saved session. /goal sets a standing directive
+      // shown in the status bar and injected into every agent's prompt until
+      // cleared.
+      case 'aside': {
         const note = args.join(' ');
-        if (!note) { notice = 'Usage: /btw <note>'; refresh(); break; }
+        if (!note) { notice = 'Usage: /aside <note>'; refresh(); break; }
         const result = await runtime.addAside(sessionId, note);
         notice = result.detail;
+        break;
+      }
+      case 'btw': {
+        const question = args.join(' ').trim();
+        if (!question) { notice = 'Usage: /btw <question> - opens a side conversation; /back or Ctrl+C returns'; refresh(); break; }
+        await switchSession(`btw-${Date.now()}`, { forkFrom: sessionId, parentSessionId: sessionId });
+        await runtime.submitMessage(sessionId, question);
+        break;
+      }
+      case 'back': {
+        if (!sideParentSessionId) { notice = 'Not in a /btw side conversation.'; refresh(); break; }
+        await switchSession(sideParentSessionId);
+        break;
+      }
+      case 'fork': {
+        await switchSession(`session-${Date.now()}`, { forkFrom: sessionId });
         break;
       }
       case 'goal': {
         const result = await runtime.setSessionGoal(sessionId, args.join(' '));
         session.goal = runtime.getSession(sessionId)?.goal;
         notice = result.detail;
+        refresh();
+        break;
+      }
+      case 'cd': {
+        const target = args.join(' ').trim();
+        if (!target) { notice = `Working directory: ${runtime.workspace()}`; refresh(); break; }
+        try {
+          const result = await runtime.changeWorkspace(target, { sessionId });
+          notice = `Working directory: ${result.to}`;
+          refresh();
+        } catch (error) {
+          notice = `cd failed: ${error instanceof Error ? error.message : String(error)}`;
+          refresh();
+        }
+        break;
+      }
+      // Managed worktrees: /worktree <name> creates (or reopens) an isolated
+      // checkout under .coder/worktrees/<name> and moves this session into it,
+      // /worktree-list shows status, /worktree-exit returns to the main
+      // checkout, /worktree-remove <name> drops a clean worktree.
+      case 'worktree': {
+        const name = args.join(' ').trim();
+        if (!name) {
+          const manager = new WorktreeManager(runtime.workspace());
+          const here = await manager.containing(runtime.workspace());
+          notice = here ? `In worktree ${here.name} (${here.branch})${here.dirty ? ' · dirty' : ''}` : 'Usage: /worktree <name>';
+          refresh();
+          break;
+        }
+        try {
+          const manager = new WorktreeManager(runtime.workspace());
+          if (!await manager.isGitRepository()) throw new Error('not inside a git repository');
+          const info = await manager.create(name);
+          await runtime.changeWorkspace(info.path, { sessionId });
+          notice = `Worktree ready: ${info.path} (${info.branch})`;
+          refresh();
+        } catch (error) {
+          notice = `worktree failed: ${error instanceof Error ? error.message : String(error)}`;
+          refresh();
+        }
+        break;
+      }
+      case 'worktree-list': {
+        try {
+          const manager = new WorktreeManager(runtime.workspace());
+          const all: WorktreeInfo[] = await manager.list();
+          const here = await manager.containing(runtime.workspace());
+          if (!all.length) { notice = 'No managed worktrees. /worktree <name> creates one.'; refresh(); break; }
+          const lines = all.map((info) => `${info.name === here?.name ? '▸' : ' '} ${info.name}  ${info.branch}${info.dirty ? '  [dirty]' : ''}${info.locked ? '  [locked]' : ''}`);
+          notice = lines.join('   ·   ');
+          refresh();
+        } catch (error) {
+          notice = `worktree-list failed: ${error instanceof Error ? error.message : String(error)}`;
+          refresh();
+        }
+        break;
+      }
+      case 'worktree-exit': {
+        try {
+          const manager = new WorktreeManager(runtime.workspace());
+          const here = await manager.containing(runtime.workspace());
+          if (!here) { notice = 'Not inside a managed worktree.'; refresh(); break; }
+          await manager.unlock(here.name);
+          const main = await manager.mainRoot();
+          await runtime.changeWorkspace(main, { sessionId });
+          notice = `Back in main checkout: ${main} (worktree ${here.name} kept on disk)`;
+          refresh();
+        } catch (error) {
+          notice = `worktree-exit failed: ${error instanceof Error ? error.message : String(error)}`;
+          refresh();
+        }
+        break;
+      }
+      case 'worktree-remove': {
+        const name = args.join(' ').trim();
+        if (!name) { notice = 'Usage: /worktree-remove <name>'; refresh(); break; }
+        try {
+          const manager = new WorktreeManager(runtime.workspace());
+          await manager.remove(name);
+          notice = `Removed worktree ${name} (branch kept).`;
+          refresh();
+        } catch (error) {
+          notice = `worktree-remove failed: ${error instanceof Error ? error.message : String(error)}`;
+          refresh();
+        }
+        break;
+      }
+      // Alias for `/cd` with no argument; arguments are ignored, like pwd.
+      case 'pwd': {
+        notice = `Working directory: ${runtime.workspace()}`;
         refresh();
         break;
       }
@@ -1330,11 +1650,22 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const submit = async (): Promise<void> => {
     const value = composerValue().trim();
     if (!value) { focusComposer(); return; }
+    // A submit and a Ctrl+C park can interleave: if the draft changed under
+    // us, the user just parked a new draft — drop this stale submit.
+    if (value !== composerValue().trim()) return;
     if (!inputHistory.includes(value)) inputHistory.push(value);
     setComposerValue('');
     focusComposer();
     try {
       if (value.startsWith('/')) await command(value);
+      // Shell mode: `!cmd` runs directly in the workspace, outside the agent
+      // loop and tool policy. Output streams in a popup and never reaches the
+      // model context.
+      else if (value.startsWith('!')) {
+        const shellCommand = value.slice(1).trim();
+        if (!shellCommand) notice = 'Usage: !<command> runs it in the workspace shell.';
+        else await runShellMode(shellCommand);
+      }
       else {
         notice = '';
         conversationFollowOutput = true;
@@ -1463,6 +1794,66 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     scheduleRefresh();
   };
 
+  // `!command` shell mode. Chunks stream into a scrollable popup so long
+  // builds stay reviewable; the modal closes with Enter or Esc without
+  // touching the conversation transcript, and the output never reaches the
+  // model context.
+  const runShellMode = async (shellCommand: string): Promise<void> => {
+    const nlChar = String.fromCharCode(10);
+    let pendingShellHeader = true;
+    notice = '';
+    conversationDirty = true;
+    refresh();
+    const width = Math.min(96, Math.max(46, Number(screen.width) - 6));
+    const height = Math.min(26, Math.max(9, Number(screen.height) - 6));
+    const controller = new AbortController();
+    shellAbort = controller;
+    const box = blessed.box({
+      parent: screen, top: 'center', left: 'center', width, height,
+      tags: true, scrollable: true, alwaysScroll: true, scrollbar: { ch: '│' },
+      mouse: true, keys: true, vi: true,
+      border: { type: 'line' }, label: `$ ${oneLine(shellCommand, width - 8)}`,
+      style: { border: { fg: COLOR().accent }, scrollbar: { fg: COLOR().muted } },
+    });
+    let boxClosed = false;
+    const closeBox = (): void => {
+      if (boxClosed) return;
+      boxClosed = true;
+      controller.abort();
+      box.destroy();
+      requestFullRedraw();
+      focusComposer();
+    };
+    box.key(['escape', 'enter', 'q'], closeBox);
+    box.focus();
+    refresh();
+    try {
+      const result = await runShellCommand(shellCommand, {
+        workspaceRoot: runtime.workspace(),
+        signal: controller.signal,
+        onChunk: (text) => {
+          if (boxClosed) return;
+          const cleaned = text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, '');
+          box.setContent(pendingShellHeader ? `{bold}$ ${safe(shellCommand)}${nlChar}{/bold}${safe(cleaned)}` : box.getContent() + safe(cleaned));
+          pendingShellHeader = false;
+          box.setScrollPerc(100);
+          screen.render();
+        },
+      });
+      if (!boxClosed) {
+        const ok = result.exitCode === 0;
+        box.setLabel(`$ ${oneLine(shellCommand, width - 8)} ${ok ? '✓' : '✗'}`);
+        const exitText = result.exitCode === undefined
+          ? 'stopped'
+          : `exit ${result.exitCode}`;
+        box.insertBottom(`  {${ok ? COLOR().muted : COLOR().error}-fg}${exitText}{/${ok ? COLOR().muted : COLOR().error}-fg}  ·  Enter/Esc close`);
+        screen.render();
+      }
+    } finally {
+      shellAbort = controller === shellAbort ? undefined : shellAbort;
+    }
+  };
+
   const unsubscribe = runtime.subscribe(onEvent);
   let finish: (() => void) | undefined;
   const done = new Promise<void>((resolveDone) => { finish = resolveDone; });
@@ -1472,8 +1863,22 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     stopSpinner();
     stopStreamTimer();
     if (welcomeTimer) clearInterval(welcomeTimer);
+    clearInterval(instancePoll);
     unsubscribe();
+    // Release bracketed paste mode before the screen goes away so the shell
+    // after exit does not keep accumulating pasted text without newlines.
+    try {
+      screen.program.write(BRACKETED_PASTE_DISABLE);
+      screen.program.flush();
+    } catch {
+      // The program may already be torn down; the reset is best effort.
+    }
     screen.destroy();
+    // Blessed only removes its own listeners on destroy; release our proxy's
+    // forwarding too so the real stdin is left with no lingering listeners.
+    try { pasteInput.destroy?.(); } catch {
+      // Already torn down; nothing left to release.
+    }
     finish?.();
   }
 
@@ -1540,6 +1945,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!lpos) return;
     const contentTop = lpos.yi + Number(conversation.itop);
     const relY = data.y - contentTop;
+    // A click on the sticky overlay already toggled the block; the bubbled
+    // copy must not toggle it back.
+    if (stickyClickHandled) {
+      stickyClickHandled = false;
+      return;
+    }
+    // The pinned header is an overlay, not an inserted row: logical line
+    // indices still map 1:1 onto rendered rows, so no extra offset applies.
     const row = Math.floor(relY) + conversation.childBase;
     // RenderThinkingBlock records indices in the raw `lines` array, but blessed
     // re-parses/wraps content into `_clines`. Translate via ftor so the click
@@ -1596,6 +2009,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (restoringConversationScroll) return;
     conversationScrollOffset = conversation.childBase;
     conversationFollowOutput = conversationAtBottom();
+    // Pure scrolling does not mark the content dirty; the pinned header still
+    // needs to appear/disappear as the viewport moves.
+    if (stickyHeader || thinkingBlockLines.size > 0) {
+      conversationDirty = true;
+      scheduleRefresh();
+    }
   });
   screen.key(['pageup', 'pagedown'], (_ch, key) => {
     selection = undefined;
@@ -1654,9 +2073,54 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       selection.dragging = false;
     }
   });
+  // Ctrl+C semantics depend on mode: inside a /btw side conversation it
+  // returns to the parent session; elsewhere a bare press arms a quit
+  // confirmation and a second press within 2s exits, so a stray Ctrl+C never
+  // kills the session by accident.
+  let ctrlCAt = 0;
+  const handleBareCtrlC = (): void => {
+    // A running !command is the first thing Ctrl+C stops; the quit
+    // confirmation must not fire while the user is just killing a job.
+    if (shellAbort) { shellAbort.abort(); notice = 'Stopping command…'; refresh(); return; }
+    if (isBtw()) {
+      const parent = sideParentSessionId!;
+      void switchSession(parent).then(() => {
+        notice = 'Returned from /btw side conversation.';
+        refresh();
+      });
+      return;
+    }
+    // A non-empty draft changes the first press: park it in history and
+    // clear the composer. The second press (or a bare press on an empty
+    // composer) arms the quit as before.
+    if (composerValue().trim()) {
+      const draft = composerValue().trim();
+      if (inputHistory[inputHistory.length - 1] !== draft) inputHistory.push(draft);
+      // setComposerValue resets historyIndex, so the next Up naturally lands
+      // on the freshly parked draft.
+      setComposerValue('');
+      notice = 'Draft saved — press Up to restore.';
+      // The notice renders through the conversation timeline; without this
+      // flag the repaint skips the stale transcript and the user never sees
+      // the confirmation.
+      conversationDirty = true;
+      renderComposerFrame();
+      refresh();
+      focusComposer();
+      return;
+    }
+    const pressedAt = Date.now();
+    if (pressedAt - ctrlCAt > 2000) {
+      ctrlCAt = pressedAt;
+      notice = 'Press Ctrl+C again to quit.';
+      refresh();
+      return;
+    }
+    close();
+  };
   screen.key(['C-c'], () => {
     const range = orderedSelection();
-    if (!range || !selection) { close(); return; }
+    if (!range || !selection) { handleBareCtrlC(); return; }
     const [start, end] = range;
     const lines: string[] = [];
     for (let y = start.y; y <= end.y; y++) {

@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeTool } from '../src/infra/tools.js';
 import { snapshotBeforeWrite } from '../src/infra/file-snapshot.js';
+import { withWriteLockProvider } from './helpers/lock-context.js';
 
 let root: string;
 
@@ -23,7 +24,7 @@ describe('write_file snapshot', () => {
     const path = join(ws, 'target.txt');
     await writeFile(path, 'old line 1\nold line 2', 'utf8');
 
-    const result = await executeTool('write_file', { path, content: 'new content' }, { workspaceRoot: ws });
+    const result = await executeTool('write_file', { path, content: 'new content' }, withWriteLockProvider({ workspaceRoot: ws }, root));
     assert.match(result, /^OK: wrote/);
     assert.match(result, /overwrote existing file \(2 lines\)/);
     const match = result.match(/snapshot saved to (\S+)/);
@@ -39,7 +40,7 @@ describe('write_file snapshot', () => {
     await mkdir(ws, { recursive: true });
     const path = join(ws, 'fresh.txt');
 
-    const result = await executeTool('write_file', { path, content: 'created' }, { workspaceRoot: ws });
+    const result = await executeTool('write_file', { path, content: 'created' }, withWriteLockProvider({ workspaceRoot: ws }, root));
     assert.match(result, /^OK: wrote/);
     assert.match(result, /created new file/);
     assert.doesNotMatch(result, /snapshot/);
@@ -55,7 +56,7 @@ describe('write_file snapshot', () => {
     const path = join(targetDir, 'note.txt');
     await writeFile(path, 'v1', 'utf8');
 
-    const result = await executeTool('write_file', { path, content: 'v2' }, { workspaceRoot: ws });
+    const result = await executeTool('write_file', { path, content: 'v2' }, withWriteLockProvider({ workspaceRoot: ws }, root));
     const match = result.match(/snapshot saved to (\S+)/);
     assert.ok(match);
     const snapshotsDir = join(ws, '.coder', 'snapshots');
@@ -75,7 +76,7 @@ describe('write_file snapshot', () => {
     await chmod(join(ws, '.coder', 'snapshots'), 0o555);
 
     try {
-      const result = await executeTool('write_file', { path, content: 'written anyway' }, { workspaceRoot: ws });
+      const result = await executeTool('write_file', { path, content: 'written anyway' }, withWriteLockProvider({ workspaceRoot: ws }, root));
       assert.match(result, /^OK: wrote/);
       assert.match(result, /overwrote existing file \(1 lines\)/);
       assert.match(result, /snapshot unavailable/);

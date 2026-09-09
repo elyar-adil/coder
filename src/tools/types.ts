@@ -38,6 +38,11 @@ export interface ToolExecutionContext<TPolicy = unknown> {
   sharedContext?: string;
   signal?: AbortSignal;
   policy?: TPolicy;
+  /**
+   * Cross-process write lock for write tools. Runtime contexts MUST provide
+   * it — a context without this provider refuses unlocked writes instead of
+   * silently racing concurrent processes.
+   */
   acquireWriteLock?: (path: string) => Promise<() => void | Promise<void>>;
   checkpoint?: (note: string) => Promise<void>;
   /** Session-scoped file lease used by edit_file's read-before-edit invariant. */

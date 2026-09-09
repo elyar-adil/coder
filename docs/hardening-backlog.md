@@ -26,7 +26,7 @@
 | A2 会话文件防护 | `src/runtime/agent-store.ts` | 会话/归档文件 0644；load 解析失败静默返回 undefined → 同 id 新建会话直接覆盖历史 | `mode: 0o600`；损坏文件改名隔离为 `<id>.corrupt.<ts>` 并发出告警事件，不再静默重建 |
 | A3 symlink 逃逸 | `src/policy.ts`（纯词法路径判断）、`src/infra/tools.ts`（read/write 授权）、`file-snapshot.ts`（snapshot 读跟随链接） | 工作区内符号链接指向 `/etc/shadow` 可被 read_file 读取；对符号链接 write_file 会把机密读进 `.coder/snapshots` 并随 `git add` 泄露 | 授权前对文件及各级祖先 `realpath`；snapshot 读取 `lstat` 拒绝符号链接 / `O_NOFOLLOW`；`writeViaWorkspace` 字符串前缀判包含改 `path.relative`（`/repo` vs `/repo2` bug） |
 | A4 密钥防护 | `src/runtime/agent-runtime.ts`（persistSession）、`src/config.ts`（配置写盘） | `.agentrc` 的 apiKey 明文可经工具结果进入消息/时间线，全量明文写入 `~/.coder/runtime/<id>.json`（0644），无任何脱敏 | 持久化层对已知 apiKey 值做替换脱敏（读配置时收集已知密钥集合）；配置文件写入时 `chmod 600` |
-| A5 锁正确性 | `src/runtime/locks.ts` | release 不幂等：二次 release 会把锁交给下一个 waiter（原持有者仍在临界区）或误删 active 集合；且 `acquireWriteLock` 可选，缺省时静默无锁写 | release 改为 ownership token（token 不匹配则 no-op）；写工具路径强制加锁；补 `tests/locks.test.ts`（并发互斥、超时、二次 release） |
+| ~~A5 锁正确性~~ | `src/runtime/locks.ts` | ✅ 已修复（2026-09-09）：release 改为 ownership token 幂等化；跨进程层新增 `src/runtime/file-lock.ts`（O_EXCL 锁文件 + pid 存活检测 + 死进程接管）；带运行时上下文的写工具缺锁时**拒绝写入**（不再静默无锁）；`tests/locks.test.ts` 覆盖并发互斥、跨进程冲突、死锁接管、二次 release |
 
 ## 批次 B — 网络/流层健壮性
 

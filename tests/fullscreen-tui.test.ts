@@ -60,8 +60,14 @@ async function startTui(options: {
       screen: lockedScreen,
       input,
       savedConfigs,
-      finish: () => lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true }),
+      // Ctrl+C now quits only on a second press within 2s; emit twice so the
+      // arm + quit land even when another handler consumed an earlier press.
+      finish: () => {
+        lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+        lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+      },
       cleanup: async () => {
+        lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
         lockedScreen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
         blessed.screen = original;
         await runtime.shutdown();
@@ -110,6 +116,135 @@ test('a finished Thought freezes its duration instead of counting while the turn
     for (let attempt = 0; !plainText(conversation.getContent()).includes('Done') && attempt < 100; attempt++) await wait(10);
   } finally {
     finishGeneration();
+    await tui.cleanup();
+  }
+});
+
+test('a pinned Thought header keeps its elapsed seconds ticking while the turn runs', async () => {
+  let releaseThinking!: () => void;
+  const thinkingGate = new Promise<void>((resolve) => { releaseThinking = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      // A long thinking body keeps the block expanded-view taller than the
+      // viewport so the header can actually be pinned by scrolling.
+      yield { content: null, thinking: Array.from({ length: 60 }, (_, index) => `Reasoning paragraph line ${index}`).join('\n'), done: false };
+      await thinkingGate;
+      yield { content: 'Answer text.', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const mouse = async (button: number, x: number, y: number, release = false): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}${release ? 'm' : 'M'}`);
+      await tick();
+    };
+    const visibleRows = () => screen.lines.map((row) => row.map((cell) => cell[1]).join(''));
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Reasoning paragraph line 59') && attempt < 100; attempt++) await wait(10);
+    // The thinking header sits at the very top of the transcript; expand it.
+    const thinkingRow = visibleRows().findIndex((row) => row.includes('Thinking'));
+    assert.ok(thinkingRow >= 0, 'the active Thinking header must render before it can be expanded');
+    await mouse(0, 3, thinkingRow);
+    await mouse(0, 3, thinkingRow, true);
+    // Scroll until the block header is pinned at the conversation top.
+    const pinnedRow = (): string | undefined => visibleRows()[0].includes('▼') ? visibleRows()[0] : undefined;
+    for (let attempt = 0; attempt < 60 && !pinnedRow(); attempt++) await mouse(65, 3, 5);
+    const pinned = pinnedRow();
+    assert.ok(pinned, 'the active block header must pin at the conversation top');
+    const firstSeconds = pinned.match(/(\d+)s/)?.[1];
+    assert.ok(firstSeconds, `the pinned row must show elapsed seconds, got: ${JSON.stringify(pinned)}`);
+    // Wait for real time to advance past the next second boundary, then let
+    // spinner ticks repaint: the pinned row must show the larger value.
+    await wait(1300);
+    await mouse(65, 3, 5);
+    await wait(300);
+    const laterSeconds = visibleRows()[0].match(/(\d+)s/)?.[1];
+    assert.ok(laterSeconds, `the pinned row must still be present, got rows: ${JSON.stringify(visibleRows()[0])}`);
+    assert.ok(Number(laterSeconds) > Number(firstSeconds), `pinned seconds must tick (${firstSeconds} -> ${laterSeconds})`);
+    releaseThinking();
+  } finally {
+    releaseThinking();
+    await tui.cleanup();
+  }
+});
+
+test('a pinned header survives wrapped long lines and never pins a collapsed block', async () => {
+  const turns = [
+    // One single long line: blessed wraps it into many rendered rows, which
+    // makes logical content rows diverge from rendered rows inside the block.
+    { thinking: 'Long reasoning words '.repeat(150), content: 'First answer.' },
+    { thinking: 'Brief second thought.', content: 'Second answer.' },
+  ];
+  let call = 0;
+  const tui = await startTui({
+    modelStream: async function* () {
+      const turn = turns[call++]!;
+      yield { content: null, thinking: turn.thinking, done: false };
+      yield { content: turn.content, done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const mouse = async (button: number, x: number, y: number, release = false): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}${release ? 'm' : 'M'}`);
+      await tick();
+    };
+    const visibleRows = () => screen.lines.map((row) => row.map((cell) => cell[1]).join(''));
+    // Submit turns one at a time: messages queued before the previous turn
+    // starts are absorbed into that same turn by the runtime, so back-to-back
+    // submits would produce a single merged turn instead of two blocks.
+    for (const turn of turns) {
+      input.write('hi');
+      await tick();
+      editor.emit('keypress', '', { name: 'enter' });
+      for (let attempt = 0; !plainText(conversation.getContent()).includes(turn.content) && attempt < 200; attempt++) await wait(10);
+    }
+    // Scroll back to the top and expand the first (long, wrapped) block.
+    const findFirstThoughtRow = async (): Promise<number> => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const row = visibleRows().findIndex((row) => row.includes('Thought'));
+        if (row >= 0) return row;
+        await mouse(64, 3, 5);
+      }
+      return -1;
+    };
+    const thinkingRow = await findFirstThoughtRow();
+    assert.ok(thinkingRow >= 0, 'the first Thought header must be reachable');
+    await mouse(0, 3, thinkingRow);
+    await mouse(0, 3, thinkingRow, true);
+    assert.match(conversation.getContent(), /Long reasoning/, 'expansion shows the wrapped reasoning body');
+    // Scroll down towards the first answer; the arrow must stay visible the
+    // whole way: first as the real header, then as the pinned row across the
+    // whole wrapped body, without a gap in between.
+    const answerVisible = (): boolean => visibleRows().some((row) => row.includes('First answer.'));
+    for (let attempt = 0; attempt < 200 && !(await answerVisible()); attempt++) {
+      await mouse(65, 3, 5);
+      assert.ok(
+        visibleRows().some((row) => row.includes('▼')),
+        `the block header or pinned row must stay visible at childBase=${conversation.childBase}`,
+      );
+    }
+    assert.ok(await answerVisible(), 'the scenario must reach the first answer');
+    // The wrapped block is the last scrollable content before the answers, so
+    // the viewport may never scroll past its tail; the pinned row legitimately
+    // persists at the bottom limit and must still collapse the block on click.
+    for (let attempt = 0; attempt < 30; attempt++) await mouse(65, 3, 5);
+    assert.ok(visibleRows()[0].includes('▼'), 'the pinned row persists while the expanded block still owns the viewport top');
+    await mouse(0, 3, 0);
+    await mouse(0, 3, 0, true);
+    assert.doesNotMatch(conversation.getContent(), /Long reasoning/, 'clicking the pinned row collapses the wrapped block');
+    for (let attempt = 0; attempt < 20; attempt++) await wait(10);
+    // The collapsed second block must never get a pinned header.
+    for (let attempt = 0; attempt < 200 && visibleRows().some((row) => row.includes('▶ Thought')); attempt++) await mouse(65, 3, 5);
+    assert.ok(!visibleRows()[0].includes('Thought'), 'a collapsed block must not produce a pinned header');
+    assert.ok(visibleRows().some((row) => row.includes('Second answer')), `the second answer must remain reachable: ${JSON.stringify(visibleRows())}`);
+  } finally {
     await tui.cleanup();
   }
 });
@@ -441,6 +576,8 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     assert.equal(editor.getContent(), '');
   } finally {
     finishGeneration();
+    // Quit confirmation needs a second press within the 2s window.
+    screen?.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
     screen?.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
     await done;
     assert.ok(terminalOutput.includes('\x1b[?1000l'), 'exit restores normal terminal mouse behavior');
@@ -497,6 +634,184 @@ test('the assistant slot switches to Thinking on the first reasoning delta, not 
     firstToken();
     releaseThinking();
     finishGeneration();
+    await tui.cleanup();
+  }
+});
+
+test('an expanded Thought keeps a collapsible header pinned at the conversation top while its body is on screen', async () => {
+  const tui = await startTui({
+    modelStream: async function* () {
+      yield { content: null, thinking: Array.from({ length: 60 }, (_, index) => `Reasoning paragraph line ${index}`).join('\n'), done: false };
+      // A long answer is required so the viewport can actually scroll the whole
+      // thinking block (header + body) past the top later in the scenario.
+      yield { content: ['Answer text.', ...Array.from({ length: 120 }, (_, index) => `Answer detail line ${index}`)].join('\n'), done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const mouse = async (button: number, x: number, y: number, release = false): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}${release ? 'm' : 'M'}`);
+      await tick();
+    };
+    const visibleRows = () => screen.lines.map((row) => row.map((cell) => cell[1]).join(''));
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Thought') && attempt < 100; attempt++) await wait(10);
+    // The long answer pushes the collapsed header above the viewport once
+    // output-following lands at the bottom, so scroll back up to reach it.
+    const findThoughtRow = async (): Promise<number> => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const row = visibleRows().findIndex((row) => row.includes('Thought'));
+        if (row >= 0) return row;
+        await mouse(64, 3, 5);
+      }
+      return -1;
+    };
+    const thinkingRow = await findThoughtRow();
+    assert.ok(thinkingRow >= 0, 'the Thought header must render before it can be expanded');
+    await mouse(0, 3, thinkingRow);
+    await mouse(0, 3, thinkingRow, true);
+    assert.match(conversation.getContent(), /Reasoning paragraph line 0/, 'expansion shows the reasoning body');
+    // Expand the block, then scroll it so the real header leaves the viewport
+    // while the body still fills the screen: the header must pin at the top.
+    const headerGone = async (): Promise<boolean> => !visibleRows().slice(1).some((row) => row.includes('Reasoning paragraph line 0'));
+    for (let attempt = 0; attempt < 60 && !(await headerGone()); attempt++) {
+      await mouse(65, 3, 5);
+    }
+    assert.ok(await headerGone(), 'the scenario must scroll the block header off the top of the viewport');
+    assert.ok(visibleRows()[0].includes('▼'), 'the collapsed-state arrow must stay reachable at the conversation top');
+    assert.ok(visibleRows()[0].includes('Thought'), 'the pinned row must identify the block');
+    // The pinned row must still collapse the block; afterwards the sticky row
+    // disappears because the header row is back inside the viewport.
+    await mouse(0, 3, 0);
+    await mouse(0, 3, 0, true);
+    assert.doesNotMatch(conversation.getContent(), /Reasoning paragraph line 0/, 'clicking the pinned row collapses the block');
+    for (let attempt = 0; attempt < 20; attempt++) await wait(10);
+    assert.ok(!visibleRows().some((row) => row.includes('Thought') && row.includes('▼')), 'the pinned row must vanish once the header is visible again');
+    // Expanding again and scrolling the whole block (header + body) past the
+    // viewport top hides the pinned row even though later content follows.
+    const thoughtRow = await findThoughtRow();
+    assert.ok(thoughtRow >= 0);
+    await mouse(0, 3, thoughtRow);
+    await mouse(0, 3, thoughtRow, true);
+    const answerVisible = (): boolean => visibleRows().some((row) => row.includes('Answer text.'));
+    const stickyVisible = (): boolean => visibleRows().some((row) => row.includes('Thought') && row.includes('▼'));
+    for (let attempt = 0; attempt < 120 && !(await answerVisible()); attempt++) await mouse(65, 3, 5);
+    assert.ok(await answerVisible(), 'the scenario must scroll down to the answer');
+    for (let attempt = 0; attempt < 120 && (await stickyVisible()); attempt++) await mouse(65, 3, 5);
+    assert.ok(!(await stickyVisible()), 'scrolling past the body must hide the pinned header');
+    assert.ok(await answerVisible(), 'the answer must remain visible after the pinned header clears');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
+test('/aside queues a note without a turn and folds it into the next message', async () => {
+  let turnCount = 0;
+  const seenLastUser: string[] = [];
+  const tui = await startTui({
+    modelStream: async function* (_config, _system, messages) {
+      turnCount += 1;
+      seenLastUser.push(String(messages.filter((message) => message.role === 'user').at(-1)?.content ?? ''));
+      yield { content: `done ${turnCount}`, done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    input.write('/aside also check the flaky test');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    // The note must be acknowledged in the conversation without any model call.
+    let acknowledged = false;
+    for (let attempt = 0; attempt < 100 && !acknowledged; attempt++) {
+      await wait(10);
+      acknowledged = plainText(conversation.getContent()).includes('Noted.');
+    }
+    assert.ok(acknowledged, `queueing an aside must acknowledge it, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    assert.equal(turnCount, 0, 'queueing an aside must not start a turn');
+    input.write('continue the work');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let folded = false;
+    for (let attempt = 0; attempt < 100 && !folded; attempt++) {
+      await wait(10);
+      folded = plainText(conversation.getContent()).includes('Aside included with your message');
+    }
+    assert.ok(folded, `the folded aside must be announced, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('done 1') && attempt < 100; attempt++) await wait(10);
+    assert.match(seenLastUser.at(-1) ?? '', /also check the flaky test/);
+    assert.match(seenLastUser.at(-1) ?? '', /continue the work/);
+  } finally {
+    await tui.cleanup();
+  }
+});
+
+test('/goal shows in the status bar and /goal clear removes it', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const statusbar = screen.children[0] as blessed.Widgets.BoxElement;
+    input.write('/goal ship the refactor by Friday');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let visible = false;
+    for (let attempt = 0; attempt < 100 && !visible; attempt++) {
+      await wait(10);
+      visible = plainText(statusbar.getContent()).includes('ship the refactor by Friday');
+    }
+    assert.ok(visible, `the goal must show in the status bar, got: ${JSON.stringify(plainText(statusbar.getContent()))}`);
+    input.write('/goal clear');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let cleared = true;
+    for (let attempt = 0; attempt < 100; attempt++) {
+      await wait(10);
+      if (!plainText(statusbar.getContent()).includes('ship the refactor by Friday')) break;
+      cleared = attempt === 99;
+    }
+    assert.ok(cleared, 'clearing the goal must remove it from the status bar');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
+test('Ctrl+C parks a non-empty draft and Up restores it', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // pasteActive stays false under the harness input, so this Ctrl+C flows
+    // straight into the bare handler.
+    input.write('do not lose this draft');
+    await tick();
+    assert.equal(editor.getContent(), 'do not lose this draft');
+    screen.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+    await tick();
+    assert.equal(editor.getContent(), '', 'the first Ctrl+C must park the draft, not quit');
+    assert.ok(
+      screen.children.some((child) => plainText((child as blessed.Widgets.BoxElement).getContent()).includes('Draft saved')),
+      'the status area must announce the parked draft',
+    );
+    editor.emit('keypress', '', { name: 'up' });
+    await tick();
+    assert.equal(editor.getContent(), 'do not lose this draft', 'Up must restore the freshly parked draft');
+    // Submit the restored draft so the composer is empty again for cleanup:
+    // a non-empty composer turns cleanup's first Ctrl+C into another park.
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('ok') && attempt < 100; attempt++) await wait(10);
+    assert.match(plainText(conversation.getContent()), /ok/);
+  } finally {
     await tui.cleanup();
   }
 });

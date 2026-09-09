@@ -1,6 +1,6 @@
 import { readFile, writeFile, readdir, mkdir, stat, rename, rm } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { exec, execFile } from 'node:child_process';
+import { exec, execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ToolRegistry } from '../tools/registry.js';
@@ -370,7 +370,19 @@ async function withWriteLock<T>(
   path: string,
   action: () => Promise<T>,
 ): Promise<T> {
-  const release = await ctx?.acquireWriteLock?.(path);
+  if (!ctx) {
+    // Bare toolkit call without a runtime context (direct library use): no
+    // lock service exists to consult. Documented as unlocked.
+    return action();
+  }
+  if (!ctx.acquireWriteLock) {
+    // Never write unlocked when a runtime context is present: a silent
+    // unlocked write would lose updates against concurrent processes.
+    throw new Error(
+      `write lock unavailable for ${path}: the runtime context did not provide acquireWriteLock; refusing unlocked write`,
+    );
+  }
+  const release = await ctx.acquireWriteLock(path);
   try {
     return await action();
   } finally {
@@ -1254,6 +1266,20 @@ async function executeBuiltinTool(
           return `OK: no changes made to ${path}${log.length > 0 ? ` (${log.join('; ')})` : ''}`;
         }
 
+        // Optimistic conflict check: while holding the write lock, confirm the
+        // file on disk still matches the content these edits were based on.
+        // The cross-process lock excludes other runtime processes, so a
+        // mismatch means an external writer (editor, script) touched the file
+        // between our read and this write — refuse instead of clobbering it.
+        try {
+          const fresh = await readFile(targetPath, 'utf8');
+          if (contentVersion(fresh) !== currentVersion) {
+            return `Error: ${path} changed underneath this edit (modified by another process after it was read). No changes were applied. Read the file again and retry with fresh content.`;
+          }
+        } catch {
+          return `Error: ${path} could not be re-read before applying edits (it may have been deleted externally). No changes were applied.`;
+        }
+
         try {
           const writtenPath = await stagedWrite(path, content, ctx, (written) => {
             for (const edit of applied) {
@@ -1319,6 +1345,15 @@ async function executeBuiltinTool(
             existed = true;
           } catch {
             previous = '';
+          }
+          // Stale-read check: when this session read the file before and it has
+          // since changed (another process wrote it), a blind overwrite would
+          // silently destroy that work. Force a fresh read + retry instead.
+          if (ctx?.requirePriorRead && existed) {
+            const readVersion = ctx.getReadVersion?.(targetPath);
+            if (readVersion && readVersion !== contentVersion(previous)) {
+              return `Error: ${path} changed after it was read in this session (another process may have written it). Read the file again, then retry write_file.`;
+            }
           }
           const snapshot = existed ? await snapshotBeforeWrite(targetPath, workspaceRoot(ctx)) : { path: null as string | null };
           const writtenPath = await writeViaWorkspace(path, content, ctx);
@@ -1443,4 +1478,110 @@ export async function executeTool(
   ctx?: BuiltinToolContext,
 ): Promise<string> {
   return toolRegistry.execute(name, args, ctx);
+}
+
+/** Spawn a command without a shell layer around it, wired for incremental
+ * output: stdout/stderr chunks arrive through callbacks as the process runs,
+ * and `signal` (or the runtime timeout) kills the process tree. */
+function shellSpawn(
+  file: string,
+  args: readonly string[],
+  options: {
+    cwd: string;
+    signal: AbortSignal;
+    windowsVerbatimArguments?: boolean;
+    onStdout: (chunk: string) => void;
+    onStderr: (chunk: string) => void;
+  },
+): Promise<{ code: number | undefined; signal: NodeJS.Signals | undefined }> {
+  return new Promise((resolveExit) => {
+    let settled = false;
+    const settle = (code: number | undefined, signal: NodeJS.Signals | undefined): void => {
+      if (settled) return;
+      settled = true;
+      resolveExit({ code, signal });
+    };
+    let spawnError: NodeJS.ErrnoException | undefined;
+    const child = spawn(file, args, {
+      cwd: options.cwd,
+      signal: options.signal,
+      windowsVerbatimArguments: options.windowsVerbatimArguments,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    child.stdout?.on('data', (chunk: Buffer) => options.onStdout(chunk.toString('utf8')));
+    child.stderr?.on('data', (chunk: Buffer) => options.onStderr(chunk.toString('utf8')));
+    child.on('error', (error: NodeJS.ErrnoException) => {
+      spawnError = error;
+      // Spawn failures (missing shell, bad cwd) behave like a 127 exit.
+      settle(error.code === 'ENOENT' ? 127 : 1, undefined);
+    });
+    child.on('close', (code, signal) => {
+      if (spawnError) return;
+      settle(code ?? undefined, signal ?? undefined);
+    });
+  });
+}
+
+/** Run a user-typed `!command` directly in a shell, bypassing the agent loop
+ * and tool policy entirely: the user is the authorizer. Output is streamed to
+ * the TUI via `onChunk` (stdout and stderr interleaved as they arrive), and
+ * `abort` kills the process tree. Like a normal shell, a nonzero exit code is
+ * not an error for the caller — the exit code rides in the result. */
+export function runShellCommand(
+  command: string,
+  options: {
+    workspaceRoot: string;
+    signal?: AbortSignal;
+    onChunk?: (text: string) => void;
+    timeoutMs?: number;
+  },
+): Promise<{ output: string; exitCode: number | undefined }> {
+  const timeoutMs = Math.max(100, Math.min(Number(options.timeoutMs ?? 300_000), 600_000));
+  const nl = String.fromCharCode(10);
+  const maxChars = 16 * 1024 * 1024;
+  return new Promise((resolveShell) => {
+    const argv0 = process.platform === 'win32'
+      ? { file: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', command], verbatim: true }
+      : { file: '/bin/sh', args: ['-c', command], verbatim: false };
+    const controller = new AbortController();
+    if (options.signal) {
+      if (options.signal.aborted) controller.abort(options.signal.reason);
+      else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+    }
+    let output = '';
+    let truncated = false;
+    let timedOut = false;
+    let settled = false;
+    const push = (text: string): void => {
+      if (!text) return;
+      const room = maxChars - output.length;
+      if (room <= 0) { truncated = true; return; }
+      output += text.length > room ? text.slice(0, room) : text;
+      if (text.length > room) truncated = true;
+      options.onChunk?.(text);
+    };
+    const settle = (exitCode: number | undefined, note?: string): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolveShell({ output: `${output}${truncated ? `${nl}(output truncated)` : ''}${note ?? ''}`, exitCode });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, timeoutMs);
+    timer.unref?.();
+    void shellSpawn(argv0.file, argv0.args, {
+      cwd: options.workspaceRoot,
+      signal: controller.signal,
+      windowsVerbatimArguments: argv0.verbatim,
+      onStdout: push,
+      onStderr: push,
+    }).then(({ code, signal }) => {
+      if (timedOut) { settle(undefined, `${nl}Error: command timed out`); return; }
+      if (controller.signal.aborted || signal) { settle(undefined, `${nl}(stopped)`); return; }
+      settle(code ?? 0);
+    });
+  });
 }

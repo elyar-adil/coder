@@ -592,4 +592,52 @@ Always run npm test before committing.
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test('changeWorkspace switches the runtime root, project specs, and project context', async () => {
+    const prompts: string[] = [];
+    const { runtime, root } = await fixture(async function* (_config, system): AsyncGenerator<ChatChunk> {
+      prompts.push(system);
+      yield { content: 'ok', done: true };
+    });
+    try {
+      const target = join(root, 'target');
+      await mkdir(join(target, '.coder', 'agents'), { recursive: true });
+      await writeFile(join(target, 'AGENTS.md'), '# Target rules — Stay in the target tree.');
+      await writeFile(join(target, '.coder', 'agents', 'extra.md'), document('Extra'));
+
+      const events: { type: string; workspaceRoot?: string; previousRoot?: string }[] = [];
+      runtime.subscribe((event) => events.push(event));
+
+      // An unknown path rejects and leaves the current root untouched.
+      await assert.rejects(runtime.changeWorkspace('nowhere'), /cd: no such directory/);
+      assert.equal(runtime.workspace(), root);
+
+      const switched = await runtime.changeWorkspace(target);
+      assert.deepEqual(switched, { from: root, to: target });
+      assert.equal(runtime.workspace(), target);
+      assert.deepEqual(
+        events.filter((event) => event.type === 'workspace_changed').at(-1),
+        { type: 'workspace_changed', workspaceRoot: target, previousRoot: root, sessionId: undefined },
+      );
+      // Project-scope specs reload from <target>/.coder/agents.
+      assert.ok(runtime.listAgentSpecs().some((spec) => spec.id === 'extra'));
+
+      // The next turn composes its prompt with the new root and new project context.
+      await runtime.openSession('cd');
+      await runtime.submitMessage('cd', 'where are we');
+      await runtime.waitForIdle('cd');
+      const prompt = prompts.at(-1)!;
+      assert.ok(prompt.includes(`in workspace ${target}`));
+      assert.ok(prompt.includes('Stay in the target tree.'));
+      // Specs from the previous project root do not leak into the new one.
+      assert.ok(runtime.listAgentSpecs().every((spec) => spec.id !== 'gone'));
+      // Switching back restores the original root and spec set.
+      const back = await runtime.changeWorkspace(root);
+      assert.equal(back.to, root);
+      assert.ok(runtime.listAgentSpecs().every((spec) => spec.id !== 'extra'));
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

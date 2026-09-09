@@ -7,6 +7,8 @@ import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { AgentRegistry } from './runtime/agent-registry.js';
 import { AgentRuntime } from './runtime/agent-runtime.js';
+import { WorktreeManager } from './runtime/worktree.js';
+import { registerWorkspaceInstance } from './runtime/workspace-instances.js';
 import { runFullscreenTui } from './ui/fullscreen-tui.js';
 import { CODER_VERSION } from './version.js';
 
@@ -15,6 +17,7 @@ async function main(): Promise<void> {
   program.name('maw').description('Document-driven coding agent runtime').version(CODER_VERSION);
   program.allowExcessArguments(false).showSuggestionAfterError();
   program.option('--model <name>', 'default model name or .agentrc alias');
+  program.option('--worktree [name]', 'start inside an isolated managed git worktree (.coder/worktrees/<name>)');
 
   let config = await loadConfig();
   const selectedFromCli = (): string | undefined => program.opts<{ model?: string }>().model;
@@ -26,6 +29,20 @@ async function main(): Promise<void> {
     workspaceRoot: process.cwd(),
     defaultModel: selectedFromCli() ?? config.model,
     resolveModel: (alias) => resolveModelConfig(config, alias).config,
+  });
+
+  // Announce this instance so concurrent maw processes in the same workspace
+  // can surface a warning (and users can see who else is editing).
+  const stopInstanceHeartbeat = await registerWorkspaceInstance(process.cwd());
+
+  // /cd moves the runtime to a new workspace root; the tool policy must follow
+  // so read/write authorization keeps covering the new tree.
+  runtime.subscribe((event) => {
+    if (event.type !== 'workspace_changed') return;
+    setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', event.workspaceRoot));
+    void registerWorkspaceInstance(event.workspaceRoot).then((stop) => {
+      void stopInstanceHeartbeat().then(stop);
+    });
   });
 
   const configManager = {
@@ -76,6 +93,19 @@ async function main(): Promise<void> {
   program.action(async () => {
     if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('Interactive mode requires a terminal. Use maw run --prompt "..." for non-interactive execution.');
     await runtime.whenReady();
+    const worktreeArg = program.opts<{ worktree?: boolean | string }>().worktree;
+    if (worktreeArg !== undefined) {
+      const manager = new WorktreeManager(process.cwd());
+      if (!await manager.isGitRepository()) {
+        console.error('--worktree requires a git repository');
+        process.exitCode = 1;
+        return;
+      }
+      const name = typeof worktreeArg === 'string' && worktreeArg.trim() ? worktreeArg.trim() : `session-${Date.now()}`;
+      const info = await manager.create(name);
+      await runtime.changeWorkspace(info.path);
+      process.stdout.write(`worktree ready: ${info.path} (${info.branch})\n`);
+    }
     const requested = selectedFromCli();
     const selected = resolveModelConfig(config, requested);
     runtime.setDefaultModel(requested ?? config.model);
@@ -94,6 +124,7 @@ async function main(): Promise<void> {
 
   const shutdown = async (): Promise<void> => {
     await runtime.shutdown().catch(() => undefined);
+    await stopInstanceHeartbeat().catch(() => undefined);
     process.exit(0);
   };
   process.once('SIGTERM', () => { void shutdown(); });

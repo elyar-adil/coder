@@ -14,6 +14,7 @@ import { mkdtemp, rm, writeFile, readFile, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeTool } from '../src/infra/tools.js';
+import { withWriteLockProvider } from './helpers/lock-context.js';
 
 let tmpDir: string;
 
@@ -175,11 +176,11 @@ describe('edit_file SOTA semantics', () => {
     const path = join(tmpDir, 'leased.txt');
     await writeFile(path, 'before\n', 'utf8');
     const versions = new Map<string, string>();
-    const context = {
+    const context = withWriteLockProvider({
       requirePriorRead: true,
       getReadVersion: (target: string) => versions.get(target),
       recordReadVersion: (target: string, version: string) => versions.set(target, version),
-    };
+    }, join(tmpDir, 'locks'));
     const missing = await executeTool('edit_file', {
       path,
       edits: JSON.stringify([{ search: 'before', replace: 'after' }]),

@@ -5,6 +5,8 @@ import { commandMatches, SLASH_COMMANDS } from '../src/ui/commands.js';
 test('slash suggestions filter command prefixes and stop after arguments begin', () => {
   assert.equal(commandMatches('/').length, SLASH_COMMANDS.length);
   assert.deepEqual(commandMatches('/mo').map((item) => item.name), ['/model', '/mouse']);
+  assert.deepEqual(commandMatches('/cd').map((item) => item.name), ['/cd']);
+  assert.deepEqual(commandMatches('/pw').map((item) => item.name), ['/pwd']);
   assert.deepEqual(commandMatches('/unknown'), []);
   assert.deepEqual(commandMatches('/model luna'), []);
   assert.deepEqual(commandMatches('hello /'), []);

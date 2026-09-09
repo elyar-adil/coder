@@ -14,6 +14,7 @@ import { mkdtemp, realpath, rm, writeFile, readFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import { executeTool } from '../src/infra/tools.js';
+import { withWriteLockProvider } from './helpers/lock-context.js';
 
 // ── Temp directory shared across tests ───────────────────────────────────────
 let tmpDir: string;
@@ -94,16 +95,16 @@ describe('edit_file', () => {
   test('edits simple relative artifacts in the session artifact directory', async () => {
     const artifactDir = join(tmpDir, 'edit-artifacts');
     const artifactPath = join(artifactDir, 'notes.txt');
-    await executeTool('write_file', { path: 'notes.txt', content: 'draft artifact' }, {
+    await executeTool('write_file', { path: 'notes.txt', content: 'draft artifact' }, withWriteLockProvider({
       artifactDir,
-    });
+    }, tmpDir));
 
     const result = await executeTool('edit_file', {
       path: 'notes.txt',
       edits: JSON.stringify([{ search: 'draft', replace: 'final' }]),
-    }, {
+    }, withWriteLockProvider({
       artifactDir,
-    });
+    }, tmpDir));
 
     assert.match(result, new RegExp(artifactPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.equal(await readFile(artifactPath, 'utf8'), 'final artifact');
@@ -163,9 +164,9 @@ describe('write_file', () => {
 
   test('writes simple relative artifacts into the session artifact directory', async () => {
     const artifactDir = join(tmpDir, 'session-artifacts');
-    const result = await executeTool('write_file', { path: 'deck.pptx', content: 'ppt' }, {
+    const result = await executeTool('write_file', { path: 'deck.pptx', content: 'ppt' }, withWriteLockProvider({
       artifactDir,
-    });
+    }, tmpDir));
     const artifactPath = join(artifactDir, 'deck.pptx');
     assert.match(result, new RegExp(artifactPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
     assert.equal(await readFile(artifactPath, 'utf8'), 'ppt');

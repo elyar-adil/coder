@@ -17,6 +17,7 @@ import { executeTool, getToolPolicy, toolRegistry } from '../infra/tools.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { AgentRegistry, loadWorkspaceContext, matchesAgentSelector } from './agent-registry.js';
 import { AgentRuntimeStore } from './agent-store.js';
+import { CrossProcessLockManager, LockConflictError, type CrossProcessLockHandle, type LiveLockHolder } from './file-lock.js';
 import { FileLockManager } from './locks.js';
 import { recordTimeline } from './session-timeline.js';
 
@@ -59,7 +60,7 @@ function mergeUsage(previous: ModelUsage | undefined, next: ModelUsage): ModelUs
 }
 
 function asidePrefix(): string {
-  return 'Additional context noted earlier (btw):';
+  return 'Additional context noted earlier (aside):';
 }
 
 function mergeAgentUsage(previous: AgentInstance['usage'], usage: ModelUsage | undefined, firstTokenMs: number | undefined, durationMs: number, requests = 1): AgentInstance['usage'] {
@@ -173,7 +174,7 @@ const COMPACT_TOOL_DEFINITIONS: ToolDefinition[] = [
 export class AgentRuntime {
   readonly registry: AgentRegistry;
   private readonly store: AgentRuntimeStore;
-  private readonly workspaceRoot: string;
+  private workspaceRoot: string;
   private readonly resolveModel: (alias?: string) => BackendConfig;
   private readonly modelStream: ModelStream;
   private readonly maxConcurrentTurns: number;
@@ -193,7 +194,10 @@ export class AgentRuntime {
   private readonly running = new Set<string>();
   private readonly controllers = new Map<string, AbortController>();
   private readonly idleWaiters = new Set<() => void>();
-  private readonly fileLocks = new FileLockManager();
+  private readonly fileLocks: FileLockManager;
+  private readonly sessionLocks: CrossProcessLockManager;
+  private readonly sessionLockHandles = new Map<string, CrossProcessLockHandle>();
+  private readonly sessionLockHolders = new Map<string, LiveLockHolder>();
   private readonly ready: Promise<void>;
   private shuttingDown = false;
 
@@ -201,6 +205,11 @@ export class AgentRuntime {
     this.workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
     this.registry = options.registry ?? new AgentRegistry({ workspaceRoot: this.workspaceRoot });
     this.store = options.store ?? new AgentRuntimeStore();
+    // Locks live next to session state so tests (which pass a tmp store) and
+    // alternate CODER_DATA_HOME deployments never touch the default lock dir.
+    const lockDir = resolve(this.store.runtimeDir, 'locks');
+    this.fileLocks = new FileLockManager(lockDir);
+    this.sessionLocks = new CrossProcessLockManager(lockDir);
     this.resolveModel = options.resolveModel;
     this.defaultModel = options.defaultModel;
     this.modelStream = options.modelStream ?? ((config, system, messages, tools, signal) => (
@@ -258,10 +267,119 @@ export class AgentRuntime {
     return this.registry.list();
   }
 
+  /** Absolute workspace root tools resolve relative paths against (/cd target). */
+  workspace(): string {
+    return this.workspaceRoot;
+  }
+
+  /** Switch the workspace for this runtime (/cd). Resolves `path` against the
+   * current root, revalidates it, reloads project agent specs and AGENTS.md,
+   * and re-reads project context so every following turn runs in the new root.
+   * Ongoing turns keep their already-composed prompts; the change lands on the
+   * next turn. */
+  async changeWorkspace(path: string, options: { sessionId?: string } = {}): Promise<{ from: string; to: string }> {
+    await this.ready;
+    const previousRoot = this.workspaceRoot;
+    const target = resolve(previousRoot, path.trim());
+    let stat: Awaited<ReturnType<typeof import('node:fs/promises').stat>>;
+    try {
+      stat = await import('node:fs/promises').then((fs) => fs.stat(target));
+    } catch {
+      throw new Error(`cd: no such directory: ${path}`);
+    }
+    if (!stat.isDirectory()) throw new Error(`cd: not a directory: ${target}`);
+    if (target === previousRoot) return { from: previousRoot, to: target };
+    this.workspaceRoot = target;
+    this.registry.setProjectDir(target);
+    this.projectContext = await loadWorkspaceContext(target);
+    this.readVersions.clear();
+    this.failureCounts.clear();
+    try {
+      await this.registry.load();
+      this.validateSpecs();
+    } catch (error) {
+      // Roll back so the runtime never stays half-switched between roots.
+      this.workspaceRoot = previousRoot;
+      this.registry.setProjectDir(previousRoot);
+      this.projectContext = await loadWorkspaceContext(previousRoot).catch(() => undefined);
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    this.emit({ type: 'workspace_changed', sessionId: options.sessionId, workspaceRoot: target, previousRoot });
+    return { from: previousRoot, to: target };
+  }
+
+  // ── Cross-process session access (single writer, many read-only viewers) ───
+
+  private sessionLockTarget(sessionId: string): string {
+    return this.store.sessionPath(sessionId);
+  }
+
+  private sessionLockTimeout(): number {
+    return Math.max(250, Number(process.env.AGENT_SESSION_LOCK_TIMEOUT_MS ?? 5_000));
+  }
+
+  /**
+   * Try to become the session's cross-process writer. Returns `writable: false`
+   * (instead of throwing) when another process owns the session; the caller
+   * opens the session in read-only mode.
+   */
+  private async ensureSessionLock(sessionId: string): Promise<{ writable: boolean; holder?: LiveLockHolder }> {
+    if (this.sessionLockHandles.has(sessionId)) return { writable: true };
+    try {
+      const handle = await this.sessionLocks.acquire(this.sessionLockTarget(sessionId), {
+        timeoutMs: this.sessionLockTimeout(),
+        purpose: `session:${sessionId}`,
+        session: sessionId,
+      });
+      this.sessionLockHandles.set(sessionId, handle);
+      this.sessionLockHolders.delete(sessionId);
+      return { writable: true };
+    } catch (error) {
+      if (!(error instanceof LockConflictError)) throw error;
+      const holder = error.holder ?? await this.sessionLocks.holder(this.sessionLockTarget(sessionId));
+      if (holder) this.sessionLockHolders.set(sessionId, holder);
+      return { writable: false, holder };
+    }
+  }
+
+  private async releaseSessionLock(sessionId: string): Promise<void> {
+    const handle = this.sessionLockHandles.get(sessionId);
+    if (!handle) return;
+    this.sessionLockHandles.delete(sessionId);
+    this.sessionLockHolders.delete(sessionId);
+    await handle.release();
+  }
+
+  /** Cross-process access state for UI status display. */
+  sessionAccess(sessionId: string): { writable: boolean; holderPid?: number; holderSession?: string } {
+    if (this.sessionLockHandles.has(sessionId)) return { writable: true };
+    if (!this.sessions.has(sessionId)) return { writable: true }; // never opened here; no restriction known
+    const holder = this.sessionLockHolders.get(sessionId);
+    if (!holder) return { writable: false };
+    return { writable: false, holderPid: holder.pid, holderSession: holder.session };
+  }
+
+  /** Gate for mutating entry points. Opens the session, then self-heals a
+   * read-only state when the previous writer has since exited; otherwise
+   * fails with guidance (review or /fork). */
+  private async requireSessionWrite(sessionId: string): Promise<void> {
+    await this.openSession(sessionId);
+    if (this.sessionLockHandles.has(sessionId)) return;
+    const access = await this.ensureSessionLock(sessionId);
+    if (access.writable) return;
+    const holder = access.holder ?? this.sessionLockHolders.get(sessionId);
+    const who = holder ? `pid ${holder.pid}${holder.session ? ` (session ${holder.session})` : ''}` : 'another process';
+    throw new Error(
+      `Session is read-only: it is currently being written by ${who}. ` +
+        'You can keep reviewing the conversation; to continue working from this point, run /fork to get your own writable copy.',
+    );
+  }
+
   async openSession(sessionId = `session-${Date.now()}`): Promise<AgentSession> {
     await this.ready;
     const current = this.sessions.get(sessionId);
     if (current) return cloneSession(current);
+    const access = await this.ensureSessionLock(sessionId);
     const persisted = await this.store.load(sessionId);
     if (persisted) {
       const session = persisted.session;
@@ -273,11 +391,22 @@ export class AgentRuntime {
         }
         this.instances.set(instance.instanceId, instance);
       }
-      for (const instance of persisted.instances.filter((item) => item.status === 'queued')) this.enqueue(instance.instanceId);
+      // Read-only viewers never schedule recovered turns: the writer process
+      // that crashed owned that queue, and re-running it from here would race.
+      if (access.writable) {
+        for (const instance of persisted.instances.filter((item) => item.status === 'queued')) this.enqueue(instance.instanceId);
+      }
       this.emit({ type: 'session_opened', session: cloneSession(session) });
       return cloneSession(session);
     }
 
+    if (!access.writable) {
+      const holder = access.holder;
+      const who = holder ? `pid ${holder.pid}${holder.session ? ` (session ${holder.session})` : ''}` : 'another process';
+      throw new Error(
+        `Session ${sessionId} is currently being written by ${who}. Pick a new session id, or wait for the other process to exit.`,
+      );
+    }
     if (!this.registry.get('main')) throw new Error('No main agent spec found');
     const createdAt = now();
     const main = this.newInstance(sessionId, 'main', undefined, 0, createdAt);
@@ -327,11 +456,30 @@ export class AgentRuntime {
       this.queued.delete(id);
     }
     this.sessions.delete(sessionId);
-    await this.store.remove(sessionId);
+    await this.releaseSessionLock(sessionId);
+    // Deleting is itself a cross-process mutation: refuse when another
+    // process currently owns the session.
+    try {
+      const handle = await this.sessionLocks.acquire(this.sessionLockTarget(sessionId), {
+        timeoutMs: 2_000,
+        purpose: `session:${sessionId}:delete`,
+        session: sessionId,
+      });
+      try {
+        await this.store.remove(sessionId);
+      } finally {
+        await handle.release();
+      }
+    } catch (error) {
+      if (error instanceof LockConflictError) {
+        throw new Error(`Session ${sessionId} cannot be removed while another process is using it (pid ${error.holder?.pid ?? 'unknown'}).`);
+      }
+      throw error;
+    }
   }
 
   async clearSession(sessionId: string): Promise<void> {
-    if (!this.sessions.has(sessionId)) await this.openSession(sessionId);
+    await this.requireSessionWrite(sessionId);
     await this.cancelSession(sessionId);
     const session = this.sessions.get(sessionId)!;
     session.messages = [];
@@ -354,6 +502,7 @@ export class AgentRuntime {
   }
 
   async cancelSession(sessionId: string): Promise<void> {
+    if (!this.sessionLockHandles.has(sessionId)) await this.requireSessionWrite(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) return;
     for (const id of session.instanceIds) {
@@ -371,11 +520,11 @@ export class AgentRuntime {
     this.notifyIdleWaiters();
   }
 
-  /** Queue an aside (/btw): folds into the next submitted message without starting a turn. */
+  /** Queue an aside (/aside): folds into the next submitted message without starting a turn. */
   async addAside(sessionId: string, content: string): Promise<{ queued: boolean; detail: string }> {
     const text = content.trim();
     if (!text) throw new Error('Aside cannot be empty');
-    await this.openSession(sessionId);
+    await this.requireSessionWrite(sessionId);
     const session = this.sessions.get(sessionId)!;
     const hadAsides = (session.pendingAsides?.length ?? 0) > 0;
     (session.pendingAsides ??= []).push(text);
@@ -392,7 +541,7 @@ export class AgentRuntime {
   /** Set or clear the standing session goal (/goal). Injected into every agent's prompt until cleared. */
   async setSessionGoal(sessionId: string, goal: string): Promise<{ set: boolean; detail: string }> {
     const text = goal.trim();
-    await this.openSession(sessionId);
+    await this.requireSessionWrite(sessionId);
     const session = this.sessions.get(sessionId)!;
     session.goal = text || undefined;
     session.updatedAt = now();
@@ -402,10 +551,38 @@ export class AgentRuntime {
     return { set: Boolean(text), detail: text ? `Goal set. It now applies to every agent in this session: ${text}` : 'Goal cleared.' };
   }
 
+  /** Emit a session-scoped timeline notice that never reaches the model. */
+  async emitSystemNotice(sessionId: string, content: string): Promise<void> {
+    if (!this.sessions.has(sessionId)) await this.openSession(sessionId);
+    this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content, createdAt: now() } });
+  }
+
+  /** Fork a session into a new persisted copy (used by /fork and /btw side conversations).
+   * Works from a read-only session: the copy is taken from the persisted file
+   * and the fork's lock is held while copying so a concurrent opener of the
+   * same new id either waits or loses the race cleanly. */
+  async forkSession(sessionId: string, newSessionId = `session-${Date.now()}`): Promise<{ sessionId: string; detail: string }> {
+    await this.openSession(sessionId);
+    await this.persistSession(sessionId);
+    const handle = await this.sessionLocks.acquire(this.sessionLockTarget(newSessionId), {
+      timeoutMs: this.sessionLockTimeout(),
+      purpose: `session:${newSessionId}:fork`,
+      session: newSessionId,
+    });
+    try {
+      await this.store.copySession(sessionId, newSessionId);
+    } finally {
+      await handle.release();
+    }
+    const detail = `Forked into ${newSessionId}. /sessions lists both; the original stays untouched.`;
+    this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: detail, createdAt: now() } });
+    return { sessionId: newSessionId, detail };
+  }
+
   async submitMessage(sessionId: string, content: string): Promise<string> {
     const text = content.trim();
     if (!text) throw new Error('Message cannot be empty');
-    await this.openSession(sessionId);
+    await this.requireSessionWrite(sessionId);
     const session = this.sessions.get(sessionId)!;
     const main = this.instances.get(session.mainInstanceId)!;
     const turnId = randomUUID();
@@ -597,6 +774,9 @@ ${queuedAsides.map((aside, index) => `${index + 1}. ${aside}`).join('\n')}`
     for (const controller of this.controllers.values()) controller.abort('Runtime shutdown');
     for (const sessionId of this.sessions.keys()) await this.persistSession(sessionId);
     await this.store.flush();
+    for (const sessionId of [...this.sessionLockHandles.keys()]) {
+      await this.releaseSessionLock(sessionId).catch(() => undefined);
+    }
   }
 
   private newInstance(sessionId: string, agentId: string, parentInstanceId?: string, depth = 0, createdAt = now()): AgentInstance {
@@ -1145,6 +1325,9 @@ ${queuedAsides.map((aside, index) => `${index + 1}. ${aside}`).join('\n')}`
   private async persistSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    // Read-only viewers never persist: the session file belongs to the
+    // cross-process writer holding the session lock.
+    if (!this.sessionLockHandles.has(sessionId)) return;
     const snapshot: PersistedAgentSession = {
       version: 1,
       session: cloneSession(session),
