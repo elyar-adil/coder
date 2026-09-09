@@ -35,6 +35,13 @@ export function recordTimeline(session: AgentSession, event: AgentEvent): void {
     });
     return;
   }
+  if (event.type === 'system_message') {
+    if (!entries.some(entry => entry.id === event.message.messageId)) entries.push({
+      id: event.message.messageId, kind: 'message', role: 'system', content: event.message.content,
+      status: 'completed',
+    });
+    return;
+  }
   if (!('instanceId' in event) || !event.instanceId) {
     if (event.type === 'instance_updated' && ['idle', 'failed', 'cancelled', 'queued'].includes(event.instance.status)) {
       const active = index.get(event.instance.instanceId) ?? [];

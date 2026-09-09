@@ -96,6 +96,10 @@ export interface AgentSession {
   sessionId: string;
   mainInstanceId: string;
   defaultModel?: string;
+  /** Standing directive injected into every agent prompt of this session until cleared (/goal). */
+  goal?: string;
+  /** Aside notes queued with /btw that fold into the next submitted message without starting a turn. */
+  pendingAsides?: string[];
   messages: SessionMessage[];
   instanceIds: string[];
   createdAt: string;
@@ -126,6 +130,7 @@ export type AgentEvent =
   | { type: 'user_message'; sessionId: string; message: SessionMessage }
   | { type: 'assistant_delta'; sessionId: string; instanceId: string; turnId: string; text: string }
   | { type: 'assistant_message'; sessionId: string; instanceId: string; message: SessionMessage }
+  | { type: 'system_message'; sessionId: string; message: SessionMessage }
   | { type: 'instance_created'; instance: AgentInstance }
   | { type: 'instance_updated'; instance: AgentInstance }
   | { type: 'mailbox_message'; instanceId: string; message: AgentMailboxMessage }

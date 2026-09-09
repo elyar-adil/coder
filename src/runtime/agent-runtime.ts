@@ -15,10 +15,12 @@ import type {
 } from '../domain/agent.js';
 import { executeTool, getToolPolicy, toolRegistry } from '../infra/tools.js';
 import type { ToolDefinition } from '../tools/types.js';
-import { AgentRegistry, matchesAgentSelector } from './agent-registry.js';
+import { AgentRegistry, loadWorkspaceContext, matchesAgentSelector } from './agent-registry.js';
 import { AgentRuntimeStore } from './agent-store.js';
 import { FileLockManager } from './locks.js';
 import { recordTimeline } from './session-timeline.js';
+
+const WORKSPACE_CONTEXT_LABEL = 'AGENTS.md';
 
 type ModelStream = (
   config: BackendConfig,
@@ -40,6 +42,8 @@ export interface AgentRuntimeOptions {
   maxChildrenPerTurn?: number;
   /** Maximum model/tool steps per turn. Main defaults to 64, child agents to 48. */
   maxSteps?: number;
+  /** Optional AGENTS.md-style project context injected into every agent's system prompt. When omitted it is loaded from the workspace root. */
+  projectContext?: string;
 }
 
 function now(): string {
@@ -52,6 +56,10 @@ function mergeUsage(previous: ModelUsage | undefined, next: ModelUsage): ModelUs
     if (next[key] !== undefined) result[key] = (result[key] ?? 0) + next[key]!;
   }
   return result;
+}
+
+function asidePrefix(): string {
+  return 'Additional context noted earlier (btw):';
 }
 
 function mergeAgentUsage(previous: AgentInstance['usage'], usage: ModelUsage | undefined, firstTokenMs: number | undefined, durationMs: number, requests = 1): AgentInstance['usage'] {
@@ -172,6 +180,7 @@ export class AgentRuntime {
   private readonly maxAgentDepth: number;
   private readonly maxChildrenPerTurn: number;
   private readonly maxSteps?: number;
+  private projectContext?: string;
   private readonly readVersions = new Map<string, Map<string, string>>();
   private readonly failureCounts = new Map<string, Map<string, number>>();
   private defaultModel?: string;
@@ -201,7 +210,13 @@ export class AgentRuntime {
     this.maxAgentDepth = Math.max(1, options.maxAgentDepth ?? Number(process.env.AGENT_MAX_DEPTH ?? 4));
     this.maxChildrenPerTurn = Math.max(1, options.maxChildrenPerTurn ?? Number(process.env.AGENT_MAX_CHILDREN_PER_TURN ?? 3));
     this.maxSteps = options.maxSteps;
-    this.ready = Promise.all([this.registry.load(), this.store.init()]).then(() => this.validateSpecs());
+    const contextPromise = options.projectContext !== undefined
+      ? Promise.resolve(options.projectContext)
+      : loadWorkspaceContext(this.workspaceRoot);
+    this.ready = Promise.all([this.registry.load(), this.store.init(), contextPromise]).then(([, , context]) => {
+      this.projectContext = context;
+      this.validateSpecs();
+    });
   }
 
   whenReady(): Promise<void> {
@@ -321,6 +336,8 @@ export class AgentRuntime {
     const session = this.sessions.get(sessionId)!;
     session.messages = [];
     session.timeline = [];
+    session.pendingAsides = [];
+    session.goal = undefined;
     session.updatedAt = now();
     const main = this.instances.get(session.mainInstanceId);
     if (main) {
@@ -354,6 +371,37 @@ export class AgentRuntime {
     this.notifyIdleWaiters();
   }
 
+  /** Queue an aside (/btw): folds into the next submitted message without starting a turn. */
+  async addAside(sessionId: string, content: string): Promise<{ queued: boolean; detail: string }> {
+    const text = content.trim();
+    if (!text) throw new Error('Aside cannot be empty');
+    await this.openSession(sessionId);
+    const session = this.sessions.get(sessionId)!;
+    const hadAsides = (session.pendingAsides?.length ?? 0) > 0;
+    (session.pendingAsides ??= []).push(text);
+    session.updatedAt = now();
+    await this.persistSession(sessionId);
+    this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: hadAsides
+      ? `Noted — another aside is already queued; both will be included with your next message.`
+      : `Noted. This will be included with your next message without starting a turn.`, createdAt: now() } });
+    return { queued: true, detail: hadAsides
+      ? 'Queued behind one earlier aside; both will be included with the next message.'
+      : 'Queued. It will be included with the next message without starting a turn.' };
+  }
+
+  /** Set or clear the standing session goal (/goal). Injected into every agent's prompt until cleared. */
+  async setSessionGoal(sessionId: string, goal: string): Promise<{ set: boolean; detail: string }> {
+    const text = goal.trim();
+    await this.openSession(sessionId);
+    const session = this.sessions.get(sessionId)!;
+    session.goal = text || undefined;
+    session.updatedAt = now();
+    await this.persistSession(sessionId);
+    this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system',
+      content: text ? `Session goal set: ${text}` : 'Session goal cleared.', createdAt: now() } });
+    return { set: Boolean(text), detail: text ? `Goal set. It now applies to every agent in this session: ${text}` : 'Goal cleared.' };
+  }
+
   async submitMessage(sessionId: string, content: string): Promise<string> {
     const text = content.trim();
     if (!text) throw new Error('Message cannot be empty');
@@ -361,16 +409,35 @@ export class AgentRuntime {
     const session = this.sessions.get(sessionId)!;
     const main = this.instances.get(session.mainInstanceId)!;
     const turnId = randomUUID();
-    const message: SessionMessage = { messageId: randomUUID(), role: 'user', content: text, createdAt: now(), turnId };
+    const queuedAsides = session.pendingAsides ?? [];
+    session.pendingAsides = [];
+    const composed = queuedAsides.length
+      ? `${text}
+
+${asidePrefix()}
+${queuedAsides.map((aside, index) => `${index + 1}. ${aside}`).join('\n')}`
+      : text;
+    const message: SessionMessage = { messageId: randomUUID(), role: 'user', content: composed, createdAt: now(), turnId };
     session.messages.push(message);
     session.updatedAt = message.createdAt;
     if (main.status === 'running' || main.status === 'waiting') {
       this.controllers.get(main.instanceId)?.abort('Superseded by a newer user message');
     }
     if (main.status === 'cancelled') main.status = 'idle';
-    this.deliver(main, text, undefined, turnId);
+    // The model must see the folded asides, so deliver the composed message.
+    // The TUI renders the asides as separate system entries from the emitted
+    // system_message events above, while this user message keeps them inline.
+    this.deliver(main, composed, undefined, turnId);
     await this.persistSession(sessionId);
     this.emit({ type: 'user_message', sessionId, message: { ...message } });
+    if (queuedAsides.length) {
+      // Timeline-only notices; the user message itself already carries the
+      // asides inline for the model.
+      this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: `Aside${queuedAsides.length > 1 ? 's' : ''} included with your message:`, createdAt: now() } });
+      for (const aside of queuedAsides) {
+        this.emit({ type: 'system_message', sessionId, message: { messageId: randomUUID(), role: 'system', content: `· ${aside}`, createdAt: now() } });
+      }
+    }
     this.enqueue(main.instanceId);
     return turnId;
   }
@@ -634,8 +701,11 @@ export class AgentRuntime {
     // live status here invalidates provider prompt caches and burns input tokens;
     // child results are delivered through the mailbox and remain visible in the
     // normal conversation context.
+    const session = this.sessions.get(instance.sessionId);
     return [
       spec.instructions,
+      ...(session?.goal ? ['', `Standing goal for this session (highest priority; stay aligned with it unless the user says otherwise):`, session.goal] : []),
+      ...(this.projectContext ? ['', `Project context (${WORKSPACE_CONTEXT_LABEL}):`, this.projectContext] : []),
       '',
       'Runtime contract:',
       `- You are agent "${spec.id}" in workspace ${this.workspaceRoot}.`,

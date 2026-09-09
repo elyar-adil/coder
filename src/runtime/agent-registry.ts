@@ -1,6 +1,6 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { relative, resolve, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 
 import type { AgentSpec, AgentSpecScope } from '../domain/agent.js';
 
@@ -86,6 +86,25 @@ async function markdownFiles(root: string): Promise<string[]> {
 
 function specId(root: string, file: string): string {
   return relative(root, file).split(sep).join('/').replace(/\.md$/i, '');
+}
+
+/** Names checked in order when loading project context. The lowercase form
+ * covers case-insensitive filesystems; the capitalized forms follow the
+ * agents.md convention used by other coding agents. */
+const WORKSPACE_CONTEXT_FILENAMES = ['AGENTS.md', 'AGENT.md', 'agents.md'] as const;
+
+/** Loads an optional AGENTS.md-style project context document from the
+ * workspace root. Plain Markdown with no frontmatter; a missing, empty, or
+ * unreadable file is not an error — the convention is opt-in per workspace. */
+export async function loadWorkspaceContext(root: string): Promise<string | undefined> {
+  for (const name of WORKSPACE_CONTEXT_FILENAMES) {
+    try {
+      const content = (await readFile(join(root, name), 'utf8')).replace(/^\uFEFF/, '').trim();
+      if (content) return content;
+      // An empty file counts as absent; keep looking at the remaining names.
+    } catch { /* try the next candidate name */ }
+  }
+  return undefined;
 }
 
 function matchesSelector(id: string, selector: string): boolean {

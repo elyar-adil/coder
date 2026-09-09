@@ -435,4 +435,161 @@ describe('AgentRuntime', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  test('injects workspace AGENTS.md into the agent system prompt', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'coder-agent-context-'));
+    try {
+      await mkdir(join(root, 'agents'));
+      await writeFile(join(root, 'agents', 'main.md'), document('Entry'));
+      await writeFile(join(root, 'AGENTS.md'), `# Workspace rules
+
+Always run npm test before committing.
+`);
+      let systemPrompt = '';
+      const runtime = new AgentRuntime({
+        registry: new AgentRegistry({ builtinDir: join(root, 'agents'), userDir: join(root, 'user'), projectDir: join(root, 'project') }),
+        store: new AgentRuntimeStore(root),
+        workspaceRoot: root,
+        defaultModel: 'test',
+        resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+        modelStream: async function* (_config, system): AsyncGenerator<ChatChunk> {
+          systemPrompt = system;
+          yield { content: 'ok', done: false };
+          yield { content: null, done: true };
+        },
+      });
+      await runtime.whenReady();
+      await runtime.openSession('context');
+      await runtime.submitMessage('context', 'hello');
+      await runtime.waitForIdle('context');
+      await runtime.shutdown();
+
+      const specIndex = systemPrompt.indexOf('Act according to this test spec.');
+      const contextIndex = systemPrompt.indexOf('Project context (AGENTS.md):');
+      assert.ok(specIndex >= 0, 'spec instructions missing');
+      assert.ok(contextIndex > specIndex, 'project context should follow spec instructions');
+      assert.match(systemPrompt, /Always run npm test before committing\./);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('explicit projectContext option overrides workspace loading', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'coder-agent-context-'));
+    try {
+      await mkdir(join(root, 'agents'));
+      await writeFile(join(root, 'agents', 'main.md'), document('Entry'));
+      let systemPrompt = '';
+      const runtime = new AgentRuntime({
+        registry: new AgentRegistry({ builtinDir: join(root, 'agents'), userDir: join(root, 'user'), projectDir: join(root, 'project') }),
+        store: new AgentRuntimeStore(root),
+        workspaceRoot: root,
+        defaultModel: 'test',
+        resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+        modelStream: async function* (_config, system): AsyncGenerator<ChatChunk> {
+          systemPrompt = system;
+          yield { content: 'ok', done: false };
+          yield { content: null, done: true };
+        },
+        projectContext: 'Use tabs, never spaces.',
+      });
+      await runtime.whenReady();
+      await runtime.openSession('context-option');
+      await runtime.submitMessage('context-option', 'hello');
+      await runtime.waitForIdle('context-option');
+      await runtime.shutdown();
+
+      assert.match(systemPrompt, /Use tabs, never spaces\./);
+      assert.match(systemPrompt, /Project context \(AGENTS\.md\):/);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('omits the project context section when no AGENTS.md exists', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'coder-agent-context-'));
+    try {
+      await mkdir(join(root, 'agents'));
+      await writeFile(join(root, 'agents', 'main.md'), document('Entry'));
+      const systemPrompts: string[] = [];
+      const runtime = new AgentRuntime({
+        registry: new AgentRegistry({ builtinDir: join(root, 'agents'), userDir: join(root, 'user'), projectDir: join(root, 'project') }),
+        store: new AgentRuntimeStore(root),
+        workspaceRoot: root,
+        defaultModel: 'test',
+        resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+        modelStream: async function* (_config, system): AsyncGenerator<ChatChunk> {
+          systemPrompts.push(system);
+          yield { content: 'ok', done: false };
+          yield { content: null, done: true };
+        },
+      });
+      await runtime.whenReady();
+      await runtime.openSession('no-context');
+      await runtime.submitMessage('no-context', 'hello');
+      await runtime.waitForIdle('no-context');
+      await runtime.shutdown();
+
+      assert.ok(systemPrompts.length > 0, 'model was not called');
+      assert.equal(systemPrompts.some((system) => system.includes('Project context (AGENTS.md):')), false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('asides fold into the next submitted message for the model and persist', async () => {
+    const delivered: string[] = [];
+    const { runtime, root, store } = await fixture(async function* (_config, _system, messages: AgentModelMessage[]): AsyncGenerator<ChatChunk> {
+      delivered.push(String(messages.at(-1)?.content ?? ''));
+      yield { content: 'ok', done: true };
+    });
+    try {
+      await assert.rejects(runtime.addAside('asides', '   '), /Aside cannot be empty/);
+      const queued = await runtime.addAside('asides', 'Run npm test before committing');
+      assert.equal(queued.queued, true);
+      await runtime.submitMessage('asides', 'please continue');
+      await runtime.waitForIdle('asides');
+      // The model must see the folded aside, not just the raw user text.
+      assert.match(delivered.at(-1) ?? '', /Run npm test before committing/);
+      assert.match(delivered.at(-1) ?? '', /please continue/);
+      // The persisted user message carries the aside inline; the queue is empty.
+      const persisted = (await store.load('asides'))!.session;
+      const userMessage = persisted.messages.find((message) => message.role === 'user');
+      assert.ok(userMessage?.content.includes('Run npm test before committing'));
+      assert.equal(persisted.pendingAsides?.length ?? 0, 0, 'asides clear after folding');
+      // A queued aside survives a persist round trip.
+      await runtime.addAside('asides', 'second note');
+      assert.deepEqual((await store.load('asides'))!.session.pendingAsides, ['second note']);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('setSessionGoal injects the goal into agent prompts until cleared', async () => {
+    const prompts: string[] = [];
+    const { runtime, root, store } = await fixture(async function* (_config, system): AsyncGenerator<ChatChunk> {
+      prompts.push(system);
+      yield { content: 'ok', done: true };
+    });
+    try {
+      const set = await runtime.setSessionGoal('goaled', 'Finish the migration without touching the public API');
+      assert.equal(set.set, true);
+      await runtime.submitMessage('goaled', 'go');
+      await runtime.waitForIdle('goaled');
+      assert.ok(prompts.some((prompt) => prompt.includes('Standing goal for this session') && prompt.includes('Finish the migration without touching the public API')));
+      assert.equal((await store.load('goaled'))!.session.goal, 'Finish the migration without touching the public API');
+      const cleared = await runtime.setSessionGoal('goaled', '');
+      assert.equal(cleared.set, false);
+      assert.equal(runtime.getSession('goaled')?.goal, undefined);
+      prompts.length = 0;
+      await runtime.submitMessage('goaled', 'again');
+      await runtime.waitForIdle('goaled');
+      assert.ok(prompts.length > 0, 'model was not called after clearing');
+      assert.ok(prompts.every((prompt) => !prompt.includes('Standing goal for this session')));
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

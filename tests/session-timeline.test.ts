@@ -27,6 +27,22 @@ test('timeline updates stay indexed after a long history', () => {
   assert.equal(session.timeline?.at(-1)?.content, 'ab');
 });
 
+test('system_message events become system timeline entries', () => {
+  const session: AgentSession = {
+    sessionId: 'sys', mainInstanceId: 'main', messages: [], instanceIds: ['main'],
+    createdAt: '', updatedAt: '',
+  };
+  recordTimeline(session, { type: 'system_message', sessionId: 'sys', message: { messageId: 'm1', role: 'system', content: 'Noted. This will be included with your next message without starting a turn.', createdAt: 'now' } });
+  assert.equal(session.timeline?.length, 1);
+  const entry = session.timeline?.[0];
+  assert.equal(entry?.kind, 'message');
+  assert.equal(entry?.role, 'system');
+  assert.equal(entry?.id, 'm1');
+  assert.ok(entry?.content.includes('Noted'));
+  recordTimeline(session, { type: 'system_message', sessionId: 'sys', message: { messageId: 'm1', role: 'system', content: 'duplicate', createdAt: 'now' } });
+  assert.equal(session.timeline?.length, 1, 'duplicate messageId must not create a second entry');
+});
+
 test('replacing a cleared timeline resets its running-entry index', () => {
   const session: AgentSession = {
     sessionId: 'clear', mainInstanceId: 'main', messages: [], instanceIds: ['main'],

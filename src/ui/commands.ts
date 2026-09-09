@@ -1,6 +1,8 @@
 export const SLASH_COMMANDS = [
   { name: '/provider', description: 'Manage providers' },
   { name: '/model', description: 'Choose a model' },
+  { name: '/btw', description: 'Queue an aside to fold into the next message' },
+  { name: '/goal', description: 'Set a standing goal for this session' },
   { name: '/theme', description: 'Switch color theme' },
   { name: '/agents', description: 'Inspect agent specs' },
   { name: '/sessions', description: 'Open a saved conversation' },
