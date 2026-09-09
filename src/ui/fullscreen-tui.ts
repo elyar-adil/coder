@@ -10,7 +10,7 @@ import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
-import { diffPreview, elapsedLabel, isWaitingForFirstToken, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
+import { diffPreview, elapsedLabel, isWaitingForFirstToken, spinnerGlyph, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
 import { attachPillScrollbar, type PillScrollbarHandle, type PillScrollbarTheme, pillScrollbarColors } from './scrollbar.js';
 import { recordTimeline } from '../runtime/session-timeline.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
@@ -177,6 +177,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const statusbar = blessed.box({
     parent: screen, bottom: 0, left: 0, width: '100%', height: 1, tags: true,
     padding: { left: 1, right: 1 }, style: { bg: COLOR().background, fg: COLOR().muted },
+  });
+  // Persistent reminder that a /goal is active; cleared and rebuilt in renderStatus.
+  const goalLabel = blessed.box({
+    parent: statusbar, top: 0, left: 0, height: 1, tags: true, shrink: true,
+    style: { bg: COLOR().background, fg: COLOR().accent },
   });
   const conversation = blessed.box({
     parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
@@ -392,6 +397,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     renderComposerFrame();
   };
 
+  // The thinking header spins on a fixed 60ms cadence; spinnerGlyphFrame maps
+  // each tick onto an eased burst-and-pause rhythm (fast, then slow) so the
+  // animation feels alive instead of metronome-slow.
   const startSpinner = (): void => {
     if (spinnerTimer || pendingTurns.size === 0) return;
     spinnerTimer = setInterval(() => {
@@ -400,10 +408,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         return;
       }
       if (nativeSelection || hasSelection()) return;
-      spinnerFrame = (spinnerFrame + 1) % 20;
+      spinnerFrame += 1;
       conversationDirty = true;
       scheduleRefresh();
-    }, 800);
+    }, 60);
     spinnerTimer.unref?.();
   };
 
@@ -605,7 +613,16 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const width = Math.max(1, Number(screen.width) - 2);
     const left = `maw  ${activeModel}`;
     const right = Number(screen.width) >= 78 ? `${activityText}${usageText}  ·  Ctrl+K commands` : `${activityText}${usageText}`;
-    const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(right));
+    const goal = session.goal;
+    if (goal) {
+      goalLabel.setContent(`{${COLOR().accent}-fg} ⚑ ${safe(oneLine(goal, Math.max(8, width - 30)))}{/${COLOR().accent}-fg}`);
+      goalLabel.show();
+    } else {
+      goalLabel.setContent('');
+      goalLabel.hide();
+    }
+    const rightWidth = Number(statusbar.strWidth(right)) + (goal ? Number(statusbar.strWidth(` ⚑ ${oneLine(goal, Math.max(8, width - 30))}`)) : 0);
+    const gap = width - Number(statusbar.strWidth(left)) - rightWidth;
     statusbar.setContent(gap >= 3
       ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}${' '.repeat(gap)}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(right)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
       : `{bold}maw{/bold}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}`);
@@ -749,10 +766,19 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind !== 'tool').length,
       sessionHasTimeline: Boolean(session.timeline),
     })) {
-      pushConversationLine('');
-      pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
-      pushConversationLine(waitingIndicatorFrame(waitingFrame, { accent: COLOR().accent, subtle: COLOR().subtle }));
-      pushConversationLine('');
+      // Only a confirmed thinking delta switches the slot to Thinking; until
+      // then the ellipsis stands. Deltas emit through onEvent, which always
+      // coalesces into a refresh via scheduleRefresh, so the very next frame
+      // after the first reasoning token shows the Thinking header.
+      const pendingBlock = [...thinkingBlocks.values()].reverse().find((block) => block.status === 'active' && block.thinking);
+      if (pendingBlock) {
+        renderThinkingBlock(pendingBlock);
+      } else {
+        pushConversationLine('');
+        pushConversationLine(`{${COLOR().muted}-fg}{bold}TokenMaw{/bold}{/${COLOR().muted}-fg}`);
+        pushConversationLine(waitingIndicatorFrame(waitingFrame, { accent: COLOR().accent, subtle: COLOR().subtle }));
+        pushConversationLine('');
+      }
     }
     if (!session.timeline && pendingTurns.size > 0) {
       const turnId = [...pendingTurns][0];
@@ -798,13 +824,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const renderThinkingBlock = (block: ThinkingBlock): void => {
     const headerLine = lineCursor;
     const toggle = block.expanded ? '▼' : '▶';
-    const icon = block.status === 'active'
-      ? ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'][spinnerFrame % 10]
-      : toggle;
+    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : toggle;
     const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
-    const label = block.thinking
-      ? (block.status === 'active' ? 'Thinking' : 'Thought')
-      : (block.status === 'active' ? 'Working' : 'Activity');
+    // An active block with nothing to show yet is the pre-first-token state:
+    // the model is reasoning, so label it Thinking, not Working.
+    const label = block.status === 'active'
+      ? (block.thinking || block.content.length === 0 ? 'Thinking' : 'Working')
+      : (block.thinking ? 'Thought' : 'Activity');
     const duration = elapsedLabel(block.startedAt, block.finishedAt);
     const durationText = duration ? `  ${duration}` : '';
     if (block.status === 'active') {
@@ -1250,6 +1276,23 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         refresh();
         break;
       }
+      // /btw queues a side note without starting a turn; it folds into the
+      // next submitted message. /goal sets a standing directive shown in the
+      // status bar and injected into every agent's prompt until cleared.
+      case 'btw': {
+        const note = args.join(' ');
+        if (!note) { notice = 'Usage: /btw <note>'; refresh(); break; }
+        const result = await runtime.addAside(sessionId, note);
+        notice = result.detail;
+        break;
+      }
+      case 'goal': {
+        const result = await runtime.setSessionGoal(sessionId, args.join(' '));
+        session.goal = runtime.getSession(sessionId)?.goal;
+        notice = result.detail;
+        refresh();
+        break;
+      }
       case 'help': await commandPalette(); break;
       case 'select': setMouseInteraction(false); break;
       case 'mouse': setMouseInteraction(nativeSelection); break;
@@ -1325,6 +1368,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
     if (event.type === 'assistant_message' && !session.messages.some((message) => message.messageId === event.message.messageId)) {
       session.messages.push({ ...event.message });
+    }
+    if (event.type === 'system_message') {
+      // System notices render only in the timeline stream, never in the
+      // persisted message list; recordTimeline dedupes by messageId.
+      conversationDirty = true;
     }
     recordTimeline(session, event);
     if (event.type === 'thinking_delta') {

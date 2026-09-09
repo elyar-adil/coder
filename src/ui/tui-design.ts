@@ -148,6 +148,47 @@ export function waitingIndicatorFrame(frame: number, colors: { accent: string; s
   return `{${fallback}-fg}...{/${fallback}-fg}`;
 }
 
+/** Braille dot glyphs, ordered like the classic "dots" spinner. */
+const SPINNER_GLYPHS = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/** Ticks per ease cycle (~0.48s at the 60ms timer cadence). */
+const SPINNER_CYCLE = 8;
+/** Glyphs advanced per tick while resting (the slow phase). */
+const SPINNER_REST = 0.35;
+/** Extra glyphs per tick at the top of the beat (the fast phase). */
+const SPINNER_SWING = 0.65;
+
+/** Eased per-tick advance: rest → accelerate → sweep → settle. */
+const SPINNER_STEPS = Array.from(
+  { length: SPINNER_CYCLE },
+  (_, k) => SPINNER_REST + SPINNER_SWING * (1 - Math.cos((k / SPINNER_CYCLE) * Math.PI * 2)) / 2,
+);
+/** Glyphs swept per full ease cycle. */
+const SPINNER_TRAVEL = SPINNER_STEPS.reduce((sum, step) => sum + step, 0);
+/** Running position at the start of each phase within a cycle. */
+const SPINNER_OFFSETS = SPINNER_STEPS.map((_, k) => SPINNER_STEPS.slice(0, k).reduce((sum, step) => sum + step, 0));
+
+/**
+ * Eased activity spinner pacing. A fixed interval reads as either sluggish
+ * (slow enough to stay calm) or frantic (fast enough to feel alive), so the
+ * glyph index instead rides an eased cosine: quick sweeps, then a graceful
+ * pause, forever. Position is a running total of the eased per-tick advance,
+ * which keeps the spin strictly forward while its speed breathes. Pure and
+ * deterministic so callers and tests can scrub the timeline.
+ */
+export function spinnerGlyphFrame(tick: number): number {
+  const safeTick = Number.isFinite(tick) ? Math.max(0, Math.floor(tick)) : 0;
+  const cycle = Math.floor(safeTick / SPINNER_CYCLE);
+  const offset = SPINNER_OFFSETS[safeTick % SPINNER_CYCLE] ?? 0;
+  const travel = cycle * SPINNER_TRAVEL + offset;
+  return Math.floor(travel % SPINNER_GLYPHS.length);
+}
+
+/** Resolved glyph for an activity tick; falls back to the first glyph. */
+export function spinnerGlyph(tick: number): string {
+  return SPINNER_GLYPHS[spinnerGlyphFrame(tick)] ?? SPINNER_GLYPHS[0]!;
+}
+
 /** A turn is pending with no streamed token yet: show the waiting ellipsis. */
 export function isWaitingForFirstToken(state: {
   pendingTurns: number;

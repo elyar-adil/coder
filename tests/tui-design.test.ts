@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { diffPreview, elapsedLabel, isWaitingForFirstToken, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from '../src/ui/tui-design.js';
+import { diffPreview, elapsedLabel, isWaitingForFirstToken, spinnerGlyph, spinnerGlyphFrame, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from '../src/ui/tui-design.js';
 
 test('responsive layout protects transcript width', () => {
   assert.equal(tuiLayout(120, true).activity, 'split');
@@ -64,6 +64,36 @@ test('waitingIndicatorFrame degrades gracefully for non-hex colors', () => {
   assert.doesNotThrow(() => waitingIndicatorFrame(7, { accent: undefined as unknown as string, subtle: '' }));
   assert.doesNotThrow(() => waitingIndicatorFrame(Number.NaN, { accent: '#88c0d0', subtle: '#7b88a1' }));
   assert.equal(waitingIndicatorFrame(Number.NaN, { accent: '#88c0d0', subtle: '#7b88a1' }).replace(/\{[^}]*\}/g, ''), '...');
+});
+
+test('spinnerGlyphFrame paces the spin fast-then-slow and always forward', () => {
+  const frames = Array.from({ length: 64 }, (_, tick) => spinnerGlyphFrame(tick));
+  const deltas: number[] = [];
+  let lastChange = 0;
+  for (let tick = 1; tick < frames.length; tick++) {
+    if (frames[tick] !== frames[tick - 1]) { deltas.push(tick - lastChange); lastChange = tick; }
+  }
+  assert.ok(deltas.length >= 16, `spinner must move often, saw ${deltas.length} changes in 64 ticks`);
+  assert.ok(Math.max(...deltas) <= 3, `no pause longer than 3 ticks (180ms), saw ${Math.max(...deltas)}`);
+  assert.ok(Math.min(...deltas) === 1, 'fast phase advances one glyph per tick');
+  assert.notEqual(new Set(deltas).size, 1, 'pacing must breathe instead of ticking metronomically');
+  // Pure function: the same tick always resolves to the same glyph.
+  const again = Array.from({ length: 64 }, (_, tick) => spinnerGlyphFrame(tick));
+  assert.deepEqual(again, frames);
+});
+
+test('spinnerGlyph maps ticks onto glyphs deterministically and forward-only', () => {
+  assert.equal(spinnerGlyph(0), '⠋');
+  assert.equal(spinnerGlyph(Number.NaN), '⠋', 'non-finite ticks degrade to the first glyph');
+  assert.equal(spinnerGlyph(-5), '⠋');
+  const sequence = Array.from({ length: 32 }, (_, tick) => spinnerGlyphFrame(tick));
+  for (let tick = 1; tick < sequence.length; tick++) {
+    // Ring distance: 9 -> 0 wraps forward, so measure modulo the glyph count.
+    const distance = (sequence[tick] - sequence[tick - 1] + 10) % 10;
+    assert.ok(distance <= 1, `spin must sweep at most one glyph per tick at tick ${tick}, jumped ${distance}`);
+  }
+  assert.ok(sequence.every((frame) => frame >= 0 && frame <= 9), 'glyph index stays within the braille set');
+  assert.ok(new Set(sequence).size > 4, 'the spin must traverse the glyph set, not stick at one glyph');
 });
 
 test('first-token gating follows the live render state', () => {

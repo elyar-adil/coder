@@ -450,3 +450,53 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('the assistant slot switches to Thinking on the first reasoning delta, not before', async () => {
+  let firstToken!: () => void;
+  let releaseThinking!: () => void;
+  let finishGeneration!: () => void;
+  const firstTokenGate = new Promise<void>((resolve) => { firstToken = resolve; });
+  const thinkingGate = new Promise<void>((resolve) => { releaseThinking = resolve; });
+  const generationGate = new Promise<void>((resolve) => { finishGeneration = resolve; });
+  const tui = await startTui({
+    modelStream: async function* () {
+      await firstTokenGate;
+      yield { content: null, thinking: 'Inspecting the request. ', done: false };
+      await thinkingGate;
+      yield { content: 'Answer.', done: false };
+      await generationGate;
+      yield { content: ' Done', done: true };
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // Before any model output the slot must stay the ellipsis, never Thinking.
+    for (let attempt = 0; attempt < 12; attempt++) {
+      await wait(30);
+      const idle = plainText(conversation.getContent());
+      assert.doesNotMatch(idle, /Thinking/, `no Thinking before the first reasoning token: ${JSON.stringify(idle)}`);
+      assert.ok(idle.includes('...'), 'the waiting ellipsis holds the assistant slot until reasoning starts');
+    }
+    // The moment a reasoning delta lands, the very next frame shows Thinking.
+    firstToken();
+    let sawThinking = false;
+    for (let attempt = 0; attempt < 100 && !sawThinking; attempt++) {
+      await wait(10);
+      sawThinking = plainText(conversation.getContent()).includes('Thinking');
+    }
+    assert.ok(sawThinking, `first reasoning delta must flip the slot to Thinking, got: ${JSON.stringify(plainText(conversation.getContent()))}`);
+    releaseThinking();
+    finishGeneration();
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Answer.') && attempt < 100; attempt++) await wait(10);
+  } finally {
+    firstToken();
+    releaseThinking();
+    finishGeneration();
+    await tui.cleanup();
+  }
+});
