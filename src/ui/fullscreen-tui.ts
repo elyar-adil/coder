@@ -107,6 +107,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let welcomeTimer: NodeJS.Timeout | undefined;
   let welcomeFrame = 0;
   let welcomeStartedAt = 0;
+  // Set between a committed theme change and the next renderConversation():
+  // the welcome clock is then rebased so the mark replays its one-second
+  // opening act under the new palette. Preview highlights and Esc/✕ rollbacks
+  // restore the previous palette without a change and never set this.
+  let themeIntroReplay = false;
   // Terminal focus lifecycle (DECSET 1004). While the window is unfocused the
   // app must be frugal with PTY writes: a refocusing terminal replays the
   // bytes it did not render, and a backlog of pending updates is what users
@@ -909,6 +914,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     // streaming output, thinking, or transcript entries like shell runs.
     const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0 && !(session.timeline?.length);
     if (welcomeVisible) {
+      // A committed theme change rebases the welcome clock so the mark replays
+      // its opening act under the new palette; preview highlights and Esc/✕
+      // rollbacks never set the flag, so they only recolor in place.
+      if (themeIntroReplay) {
+        themeIntroReplay = false;
+        // Rebase the welcome clock: the next timer tick derives frame 1 from
+        // this moment, and the loop's own shine phase restarts seamlessly
+        // because every intro lands on the settled frame-20 state.
+        welcomeStartedAt = performance.now();
+        welcomeFrame = 0;
+      }
       for (const line of renderWelcome(
         Number(conversation.width) - Number(conversation.iwidth) - 1,
         Number(conversation.height) - Number(conversation.iheight), Number(screen.height), welcomeFrame,
@@ -931,9 +947,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         }, 50);
         welcomeTimer.unref?.();
       }
-    } else if (welcomeTimer) {
-      clearInterval(welcomeTimer);
-      welcomeTimer = undefined;
+    } else {
+      // The welcome screen is hidden: a pending replay would otherwise fire
+      // stale months later (e.g. when /clear finally reveals the banner).
+      themeIntroReplay = false;
+      if (welcomeTimer) {
+        clearInterval(welcomeTimer);
+        welcomeTimer = undefined;
+      }
     }
     const renderedBlocks = new Set<string>();
     if (session.timeline) {
@@ -1637,8 +1658,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     return next;
   };
 
-  const applyTheme = async (name: string): Promise<void> => {
+  // Commits a theme choice. `changed` must be decided against the theme the
+  // picker was opened with, not the live one: previewing already swaps the
+  // active palette, so by Enter/click time it equals the chosen name. Any
+  // commit path that actually changes the theme (Enter, mouse click, or a
+  // future caller) replays the welcome logo's opening act under the new
+  // palette; preview highlights and Esc/✕ rollbacks never do.
+  const applyTheme = async (name: string, changed = activeTuiTheme().name !== name): Promise<void> => {
     const next = applyThemeVisuals(name);
+    if (changed) themeIntroReplay = true;
     notice = `Theme set to ${next.label}`;
     await options.configManager.saveConfig({ ...options.configManager.getConfig(), theme: next.name });
     refresh();
@@ -1664,7 +1692,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       },
     });
     if (index >= 0) {
-      await applyTheme(names[index]!);
+      await applyTheme(names[index]!, names[index] !== original);
     } else if (activeTuiTheme().name !== original) {
       // Picker dismissed: roll back to the theme chosen before previewing.
       applyThemeVisuals(original);

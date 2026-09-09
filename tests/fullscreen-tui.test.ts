@@ -475,6 +475,11 @@ test('dismissing the theme picker reverts to the previously selected theme witho
     const { screen, input, savedConfigs } = tui;
     const activity = screen.children.find((child) => child.type === 'list' && child.style.bg === '#11161c') as blessed.Widgets.ListElement;
     const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    // Let the opening intro finish before the picker opens: the no-replay
+    // check compares settled glyph skeletons, and a mid-intro baseline would
+    // keep growing under its own clock.
+    await wait(1200);
     input.write('/theme');
     await tick();
     input.write('\t');
@@ -497,6 +502,90 @@ test('dismissing the theme picker reverts to the previously selected theme witho
     for (let attempt = 0; activity.style.bg !== '#11161c' && attempt < 100; attempt++) await wait(10);
     assert.equal(activity.style.bg, '#11161c', 'dismissing the picker must roll back to midnight');
     assert.ok(!savedConfigs.some((config) => config.theme === 'nord'), 'a dismissed preview must not persist anything');
+    // Dismissing without a change must not restart the welcome animation: the
+    // glyph skeleton stays identical once the rollback repaint lands. The
+    // settled shine loop keeps recoloring cells forever, so the comparison
+    // must ignore SGR codes — a replay would restart from a blank frame and
+    // change the glyphs themselves.
+    themeList.emit('key escape', '', { name: 'escape', full: 'escape' });
+    await wait(120);
+    const settled = plainText(conversation.getContent());
+    await wait(120);
+    assert.equal(plainText(conversation.getContent()), settled, 'an Esc dismissal without a change must not replay the welcome intro');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
+test('committing a theme change replays the welcome intro, dismissal does not', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+    config: { theme: 'midnight' },
+  });
+  try {
+    const { screen, input, savedConfigs } = tui;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    let bannerPainted = false;
+    for (let attempt = 0; attempt < 100 && !bannerPainted; attempt++) {
+      await wait(10);
+      bannerPainted = plainText(conversation.getContent()).includes('█');
+    }
+    assert.ok(bannerPainted, 'the welcome banner must be on screen before the picker opens');
+    // Let the initial intro finish so the pre-picker state is the settled loop.
+    await wait(1200);
+    input.write('/theme');
+    await tick();
+    input.write('	');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let themeList: blessed.Widgets.ListElement | undefined;
+    for (let attempt = 0; !themeList && attempt < 100; attempt++) {
+      await wait(10);
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => item.getContent().includes('midnight'))) themeList = nested;
+      }
+    }
+    assert.ok(themeList, 'choosing /theme must open the theme picker');
+    // Settled welcome screen: capture the glyph skeleton as the replay baseline.
+    // The settled shine loop keeps recoloring cells forever, so the comparison
+    // must ignore SGR codes — a replay would restart from a blank frame and
+    // change the glyphs themselves.
+    const settledBefore = plainText(conversation.getContent());
+    // Esc must dismiss without any replay: the settled glyphs stay identical.
+    themeList.emit('key escape', '', { name: 'escape', full: 'escape' });
+    await wait(200);
+    assert.equal(plainText(conversation.getContent()), settledBefore, 'Esc must dismiss the picker without replaying the welcome intro');
+    // Reopen and commit a different theme with Enter: the intro must restart.
+    input.write('/theme');
+    await tick();
+    input.write('	');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let themeList2: blessed.Widgets.ListElement | undefined;
+    for (let attempt = 0; !themeList2 && attempt < 100; attempt++) {
+      await wait(10);
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => item.getContent().includes('midnight'))) themeList2 = nested;
+      }
+    }
+    assert.ok(themeList2, 'reopening /theme must show the picker again');
+    themeList2.emit('keypress', '', { name: 'down' });
+    for (let attempt = 0; savedConfigs.at(-1)?.theme !== 'nord' && attempt < 100; attempt++) {
+      themeList2.emit('keypress', '', { name: 'enter' });
+      await wait(10);
+    }
+    assert.equal(savedConfigs.at(-1)?.theme, 'nord', 'the Enter commit must persist nord');
+    // Committed change: frame must restart from blank and re-enter the intro.
+    const blankish = (value: string): number => (plainText(value).match(/[█║╗╝╔╚═]/g) ?? []).length;
+    let sawReplay = false;
+    for (let attempt = 0; attempt < 40 && !sawReplay; attempt++) {
+      await wait(25);
+      if (blankish(conversation.getContent()) < 20) sawReplay = true;
+    }
+    assert.ok(sawReplay, 'committing a theme change must restart the welcome intro from near-blank');
   } finally {
     await tui.cleanup();
   }
