@@ -18,6 +18,7 @@ test('markdown highlights follow the active theme and the render cache is theme-
 });
 
 test('patches use deep, near-black diff backgrounds with readable light text', () => {
+  setActiveTheme('midnight');
   const rendered = renderTuiMarkdown('```diff\n--- app.ts\n+++ app.ts\n@@ -1 +1 @@\n-old\n+{red-fg}new\n```', 80);
   assert.ok(rendered.includes('{#2b1215-bg}{#d99f9f-fg}-old'));
   assert.ok(rendered.includes('{#10281a-bg}{#9fd0a6-fg}+{open}red-fg{close}'));

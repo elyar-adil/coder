@@ -30,6 +30,25 @@ export interface TuiTheme {
   syntax: [string, string, string, string, string];
 }
 
+const aurora: TuiTheme = {
+  name: 'aurora',
+  label: 'Aurora · polar night',
+  ui: {
+    background: '#0b1020', panel: '#0d1425', composer: '#121a30', activity: '#0e1526',
+    elevated: '#1b2540', modal: '#101830', modalRule: '#263354', line: '#263354',
+    text: '#dde7f5', muted: '#9fb0cc', subtle: '#5d6f92', accent: '#5eead4', success: '#7ee2a8',
+    warning: '#f2c66d', error: '#f07a8a',
+  },
+  markdown: {
+    text: '#dde7f5', muted: '#8fa1c0', accent: '#5eead4',
+    heading: '#a78bfa', headingStrong: '#f0f6ff',
+    codeBg: '#101a30', codeText: '#d6e2f2', codeFence: '#44548a',
+    diffAddBg: '#12291e', diffAddText: '#8fe3b0',
+    diffDelBg: '#2e1620', diffDelText: '#f09aa8',
+  },
+  syntax: ['#5d6f92', '#7ee2a8', '#a78bfa', '#5eead4', '#f2a2c0'],
+};
+
 const midnight: TuiTheme = {
   name: 'midnight',
   label: 'Midnight · deep blue-black',
@@ -205,13 +224,13 @@ const githubLight: TuiTheme = {
 };
 
 export const THEMES: Record<string, TuiTheme> = {
-  midnight, nord, dracula, dawn, solarized, 'rose-pine': rosePine,
+  aurora, midnight, nord, dracula, dawn, solarized, 'rose-pine': rosePine,
   'tokyo-night': tokyoNight, 'catppuccin-mocha': catppuccinMocha, 'catppuccin-latte': catppuccinLatte,
   'gruvbox-dark': gruvboxDark, 'one-dark': oneDark, monokai, kanagawa, everforest, synthwave,
   matrix, 'solarized-light': solarizedLight, 'github-light': githubLight,
 };
 
-export const DEFAULT_THEME = 'midnight';
+export const DEFAULT_THEME = 'aurora';
 
 export function themeNames(): string[] {
   return Object.keys(THEMES);

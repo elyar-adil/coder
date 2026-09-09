@@ -106,6 +106,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let spinnerTimer: NodeJS.Timeout | undefined;
   let welcomeTimer: NodeJS.Timeout | undefined;
   let welcomeFrame = 0;
+  let welcomeStartedAt = 0;
+  // Terminal focus lifecycle (DECSET 1004): while the window is unfocused the
+  // periodic repaints pause — otherwise 20fps of screen updates flood the PTY
+  // and the terminal replays the backlog the moment the window regains focus.
+  let windowFocused = true;
   let streamTimer: NodeJS.Timeout | undefined;
   let shellAbort: AbortController | undefined;
   let shellAnimationFrame = 0;
@@ -202,6 +207,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     style: { bg: COLOR().background, fg: COLOR().text },
   });
   screen.program.write(BRACKETED_PASTE_ENABLE);
+  // Blessed defers alt-buffer entry to terminfo's smcup, which is empty on
+  // several TERM entries — the app then paints into the scrollback and every
+  // animated repaint shoves the native scrollbar around. Force ?1049 so the
+  // TUI owns the alternate screen (restored on exit) regardless of terminfo.
+  screen.program.decset('1049');
+  screen.program.decset('1004');
   let fullRedrawPending = true;
   const requestFullRedraw = (): void => { fullRedrawPending = true; };
   const renderScreen = (): void => {
@@ -471,7 +482,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         stopSpinner();
         return;
       }
-      if (nativeSelection || hasSelection()) return;
+      if (nativeSelection || hasSelection() || !windowFocused) return;
       spinnerFrame += 1;
       conversationDirty = true;
       scheduleRefresh();
@@ -502,7 +513,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         return;
       }
       // Native text selection owns the screen; never dirty or repaint under it.
-      if (nativeSelection || hasSelection()) return;
+      if (nativeSelection || hasSelection() || !windowFocused) return;
       const runningEntry = [...(session.timeline ?? [])].find((entry) => entry.status === 'running' && entry.kind !== 'tool' && entry.kind !== 'shell');
       if (streams.size > 0 || runningEntry) {
         const liveText = [...streams.values()].join('')
@@ -537,6 +548,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     /** Type-to-filter row: printable keys narrow the list live; the resolved
      * index always refers to the original `items` order. */
     searchable?: boolean;
+    /** Item index preselected when the modal opens (e.g. the current value). */
+    initial?: number;
   }
   /** A small clickable ✕ pinned to a modal's top-right corner. Modals already
    * close on Escape; this gives mouse users the same affordance. */
@@ -696,6 +709,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       list.key(['escape', 'q'], () => finish(-1));
     }
     list.focus();
+    if (typeof options.initial === 'number' && options.initial > 0) list.select(options.initial);
     renderFilterRow();
     void heading;
     void rule;
@@ -859,9 +873,16 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         Number(conversation.height) - Number(conversation.iheight), Number(screen.height), welcomeFrame,
       )) pushConversationLine(line);
       if (!welcomeTimer) {
+        welcomeStartedAt = performance.now();
         welcomeTimer = setInterval(() => {
-          if (nativeSelection || hasSelection() || screen.focused !== composer) return;
-          welcomeFrame = (welcomeFrame + 1) % 80;
+          if (!windowFocused || nativeSelection || hasSelection() || screen.focused !== composer) return;
+          // The frame derives from the monotonic clock instead of a counter:
+          // after sleep or background suspension the animation lands on the
+          // correct phase in one step, with no backlog of missed ticks.
+          welcomeFrame = Math.floor((performance.now() - welcomeStartedAt) / 50);
+          // The frame only reaches the screen if the conversation actually
+          // re-renders; a bare refresh would early-return on a clean buffer.
+          conversationDirty = true;
           scheduleRefresh();
         }, 50);
         welcomeTimer.unref?.();
@@ -1276,6 +1297,19 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     }
   };
 
+  // Focus regained is treated like a resize: one invalidate + full redraw so
+  // blessed's diff buffers, the viewport, and the overlay scrollbar positions
+  // are all rebuilt from the live state instead of a stale frame.
+  screen.program.on('focus', () => {
+    windowFocused = true;
+    requestFullRedraw();
+    conversationDirty = true;
+    scheduleRefresh();
+  });
+  screen.program.on('blur', () => {
+    windowFocused = false;
+  });
+
   const applyModel = async (alias: string): Promise<void> => {
     const resolved = options.resolveModel(alias);
     if (!resolved.config.model) throw new Error('Selected model is not configured.');
@@ -1563,6 +1597,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       detail: resolveTheme(name).label,
     })), {
       searchable: true,
+      // Open with the active theme preselected so browsing starts from where
+      // the user is, not from the top of an arbitrary list.
+      initial: Math.max(0, names.indexOf(original)),
       onHighlight: (highlight) => {
         const name = names[highlight];
         if (name && name !== activeTuiTheme().name) {
@@ -1944,6 +1981,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     // frames as the waiting indicator) so a live job is obvious at a glance.
     const animation = setInterval(() => {
       if (closed) { clearInterval(animation); return; }
+      if (!windowFocused) return;
       shellAnimationFrame += 1;
       conversationDirty = true;
       scheduleRefresh();
@@ -1988,8 +2026,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     unsubscribe();
     // Release bracketed paste mode before the screen goes away so the shell
     // after exit does not keep accumulating pasted text without newlines.
+    // Leave the alternate buffer for the same reason: the forced ?1049 entry
+    // must not outlive the TUI even where terminfo's rmcup is empty.
     try {
       screen.program.write(BRACKETED_PASTE_DISABLE);
+      screen.program.decrst('1004');
+      screen.program.decrst('1049');
       screen.program.flush();
     } catch {
       // The program may already be torn down; the reset is best effort.
