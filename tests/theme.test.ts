@@ -7,6 +7,7 @@ test('unknown theme names fall back to the default theme', () => {
   assert.equal(resolveTheme('nope').name, DEFAULT_THEME);
   assert.equal(resolveTheme(undefined).name, DEFAULT_THEME);
   assert.equal(resolveTheme('NORD').name, 'nord');
+  assert.equal(resolveTheme('MATRIX').name, 'matrix');
 });
 
 test('every theme ships a complete palette', () => {

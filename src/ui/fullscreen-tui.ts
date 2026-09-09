@@ -534,6 +534,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   interface ChooseOptions {
     /** Invoked whenever the highlighted entry changes; enables live preview. */
     onHighlight?: (index: number) => void;
+    /** Type-to-filter row: printable keys narrow the list live; the resolved
+     * index always refers to the original `items` order. */
+    searchable?: boolean;
   }
   /** A small clickable ✕ pinned to a modal's top-right corner. Modals already
    * close on Escape; this gives mouse users the same affordance. */
@@ -549,12 +552,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const choose = (title: string, items: ChoiceItem[], options: ChooseOptions = {}): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
+    const searchable = options.searchable === true;
     const renderItem = (item: ChoiceItem): string => typeof item === 'string'
       ? safe(item)
       : `{bold}${safe(item.label)}{/bold}${item.detail ? `  {${COLOR().muted}-fg}${safe(item.detail)}{/${COLOR().muted}-fg}` : ''}`;
     const itemWidths = items.map((item) => typeof item === 'string' ? item.length : Math.max(item.label.length, item.detail?.length ?? 0));
     const width = Math.min(Math.max(28, Number(screen.width) - 4), 82, Math.max(36, ...itemWidths.map((item) => item + 8)));
-    const height = Math.min(items.length + 4, 22, Math.max(6, Number(screen.height) - 2));
+    const height = Math.min(items.length + (searchable ? 5 : 4), 22, Math.max(searchable ? 7 : 6, Number(screen.height) - 2));
     const modal = blessed.box({
       parent: screen, top: 'center', left: 'center', width, height,
       tags: true, style: { bg: COLOR().modal, fg: COLOR().text },
@@ -563,15 +567,67 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       parent: modal, top: 0, left: 1, right: 1, height: 1, tags: true,
       content: `{bold}${safe(title)}{/bold}`, style: { bg: COLOR().modal, fg: COLOR().text },
     });
+    const filterRow = searchable
+      ? blessed.box({
+          parent: modal, top: 1, left: 1, right: 1, height: 1, tags: true,
+          style: { bg: COLOR().modal, fg: COLOR().subtle },
+        })
+      : undefined;
     const rule = blessed.box({
-      parent: modal, top: 1, left: 1, right: 1, height: 1, tags: true,
+      parent: modal, top: searchable ? 2 : 1, left: 1, right: 1, height: 1, tags: true,
       content: `{${COLOR().modalRule}-fg}${'─'.repeat(Math.max(0, width - 2))}{/${COLOR().modalRule}-fg}`,
       style: { bg: COLOR().modal, fg: COLOR().modalRule },
     });
     const list = blessed.list({
-      parent: modal, top: 2, left: 1, right: 1, bottom: 1, items: items.map(renderItem), tags: true, keys: true, vi: true, mouse: true,
+      parent: modal, top: searchable ? 3 : 2, left: 1, right: 1, bottom: 1,
+      items: items.map(renderItem), tags: true, keys: true, vi: !searchable, mouse: true,
       scrollable: true, style: { bg: COLOR().modal, fg: COLOR().text, selected: { bg: COLOR().modal, fg: COLOR().accent, bold: true } },
     });
+    // Type-to-filter state: `currentMap` maps displayed rows back to the
+    // original items order so selection and highlight stay stable under
+    // filtering.
+    let filterText = '';
+    let currentMap: number[] = items.map((_, index) => index);
+    const renderFilterRow = (): void => {
+      if (!filterRow) return;
+      const c = COLOR();
+      filterRow.setContent(filterText
+        ? `{${c.accent}-fg}/ ${safe(filterText)}{/${c.accent}-fg}{${c.subtle}-fg}▌{/${c.subtle}-fg}`
+        : `{${c.subtle}-fg}type to filter…{/${c.subtle}-fg}`);
+    };
+    const applyFilter = (): void => {
+      const query = filterText.trim().toLowerCase();
+      currentMap = query
+        ? items.map((_, index) => index).filter((index) => {
+            const item = items[index]!;
+            const haystack = typeof item === 'string' ? item : `${item.label} ${item.detail ?? ''}`;
+            return haystack.toLowerCase().includes(query);
+          })
+        : items.map((_, index) => index);
+      if (currentMap.length) {
+        list.setItems(currentMap.map((index) => renderItem(items[index]!)));
+        list.select(0);
+      } else {
+        list.setItems([`{${COLOR().subtle}-fg}  no matches{/${COLOR().subtle}-fg}`]);
+      }
+      renderFilterRow();
+      screen.render();
+    };
+    if (searchable && filterRow) {
+      list.on('keypress', (ch: string | undefined, key: { name?: string; ctrl?: boolean; meta?: boolean } | undefined) => {
+        if (done || key?.ctrl || key?.meta) return;
+        if (key?.name === 'backspace') {
+          if (!filterText) return;
+          filterText = filterText.slice(0, -1);
+          applyFilter();
+          return;
+        }
+        const printable = typeof ch === 'string' && ch.length === 1 && ch >= ' ' && ch !== '\x7f';
+        if (!printable) return;
+        filterText += ch;
+        applyFilter();
+      });
+    }
     const closeButton = attachCloseButton(modal, () => finish(-1));
     // The modal captures style objects at creation time; while a live preview
     // swaps the active palette, re-patch it so it does not keep the palette
@@ -585,6 +641,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       rule.style.bg = c.modal;
       rule.style.fg = c.modalRule;
       rule.setContent(`{${c.modalRule}-fg}${'─'.repeat(Math.max(0, width - 2))}{/${c.modalRule}-fg}`);
+      if (filterRow) {
+        filterRow.style.bg = c.modal;
+        renderFilterRow();
+      }
       list.style.bg = c.modal;
       list.style.fg = c.text;
       // Row elements resolve their palette from list.style.item on render;
@@ -594,7 +654,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       closeButton.style.bg = c.modal;
       closeButton.style.fg = c.muted;
       closeButton.style.hover = { bg: c.modal, fg: c.error };
-      list.setItems(items.map(renderItem));
+      // Respect the active filter instead of resetting to the full list.
+      if (currentMap.length) list.setItems(currentMap.map((index) => renderItem(items[index]!)));
+      else list.setItems([`{${c.subtle}-fg}  no matches{/${c.subtle}-fg}`]);
     };
     let done = false;
     const finish = (value: number): void => {
@@ -606,23 +668,35 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       focusComposer();
       resolveChoice(value);
     };
-    list.on('select', (_item, index) => finish(index));
+    list.on('select', (_item, index) => {
+      const mapped = typeof index === 'number' ? currentMap[index] : undefined;
+      if (typeof mapped === 'number') finish(mapped);
+    });
     // setItems() re-emits 'select item' while restoring the selection, so the
     // preview handler must be re-entrancy guarded or it recurses forever.
     let restyling = false;
     list.on('select item', (_item, index) => {
       if (done || restyling || !options.onHighlight || typeof index !== 'number' || index < 0) return;
+      const mapped = currentMap[index];
+      if (typeof mapped !== 'number') return;
       restyling = true;
       try {
-        options.onHighlight(index);
+        options.onHighlight(mapped);
         restyleModal();
         renderScreen();
       } finally {
         restyling = false;
       }
     });
-    list.key(['escape', 'q'], () => finish(-1));
+    if (searchable) {
+      // `q` types into the filter here, so Escape (and ✕) are the only
+      // dismissal shortcuts.
+      list.key(['escape'], () => finish(-1));
+    } else {
+      list.key(['escape', 'q'], () => finish(-1));
+    }
     list.focus();
+    renderFilterRow();
     void heading;
     void rule;
     renderScreen();
@@ -1222,7 +1296,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         label: `${alias}${alias === activeModel ? '  ✓' : ''}`,
         detail: entry ? `${providerName(entry)} · ${entry.model}` : 'Session model',
       };
-    }));
+    }), { searchable: true });
     if (index >= 0) await applyModel(aliases[index]!);
   };
 
@@ -1245,7 +1319,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (remoteResult.error) notice = 'Could not load models. Enter a model name manually.';
     let model: string;
     if (remoteModels.length) {
-      const index = await choose('Provider model', [...remoteModels, 'Type manually…']);
+      const index = await choose('Provider model', [...remoteModels, 'Type manually…'], { searchable: true });
       if (index < 0) return;
       model = index < remoteModels.length ? remoteModels[index]! : await ask('Provider model name');
     } else {
@@ -1315,7 +1389,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const index = await choose('Agent specs', specs.map((spec) => ({
       label: spec.id,
       detail: `${spec.scope} · ${spec.model ?? 'inherit'} · ${oneLine(spec.description, 42)}`,
-    })));
+    })), { searchable: true });
     if (index < 0) return;
     const spec = specs[index]!;
     await choose(spec.id, [
@@ -1368,7 +1442,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const index = await choose('Sessions', [
       ...sessions.map((item) => ({ label: item.sessionId, detail: `${item.messages} messages${item.sessionId.startsWith('btw-') ? '  [side]' : ''}` })),
       { label: 'New session', detail: 'Start a blank conversation' },
-    ]);
+    ], { searchable: true });
     if (index < 0) return;
     await switchSession(index === sessions.length ? `session-${Date.now()}` : sessions[index]!.sessionId);
   };
@@ -1488,6 +1562,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       label: `${name}${name === original ? '  ✓' : ''}`,
       detail: resolveTheme(name).label,
     })), {
+      searchable: true,
       onHighlight: (highlight) => {
         const name = names[highlight];
         if (name && name !== activeTuiTheme().name) {
@@ -1696,7 +1771,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       { label: 'Toggle activity', detail: 'Show or hide the agent tree' },
       { label: 'Exit', detail: 'Close TokenMaw' },
     ];
-    const index = await choose('Command palette', actions);
+    const index = await choose('Command palette', actions, { searchable: true });
     if (index === 0) await openProvider();
     if (index === 1) await openModel();
     if (index === 2) await openTheme();

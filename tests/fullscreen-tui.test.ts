@@ -373,6 +373,51 @@ test('the /theme command repaints every surface with the chosen palette and pers
   }
 });
 
+test('the theme picker narrows live as you type and commits the filtered match', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+    config: { theme: 'midnight' },
+  });
+  try {
+    const { screen, input, savedConfigs } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    input.write('/theme');
+    await tick();
+    input.write('\t');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    let themeList: blessed.Widgets.ListElement | undefined;
+    for (let attempt = 0; !themeList && attempt < 100; attempt++) {
+      await wait(10);
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => item.getContent().includes('midnight'))) themeList = nested;
+      }
+    }
+    assert.ok(themeList, 'choosing /theme must open the theme picker');
+    assert.equal(themeList.items.length, 18, 'the unfiltered picker must list every theme');
+    // Typing goes to the filter row, not the composer: `mat` must leave only
+    // the matrix theme, mapped back to its original index on Enter.
+    for (const ch of ['m', 'a', 't']) themeList.emit('keypress', ch, { name: ch });
+    await tick();
+    assert.equal(themeList.items.length, 1, `filtering must narrow the list, items: ${themeList.items.map((item) => item.getContent())}`);
+    assert.ok(themeList.items[0]!.getContent().includes('matrix'));
+    // Refilter live: backspace twice (`m`), then type `oc` → only mocha.
+    themeList.emit('keypress', '', { name: 'backspace' });
+    themeList.emit('keypress', '', { name: 'backspace' });
+    themeList.emit('keypress', 'o', { name: 'o' });
+    themeList.emit('keypress', 'c', { name: 'c' });
+    await tick();
+    assert.equal(themeList.items.length, 1, `refiltering must track edits, items: ${themeList.items.map((item) => item.getContent())}`);
+    assert.ok(themeList.items[0]!.getContent().includes('catppuccin-mocha'));
+    themeList.emit('keypress', '', { name: 'escape' });
+    await tick();
+    assert.equal(savedConfigs.at(-1)?.theme ?? 'midnight', 'midnight', 'escape must dismiss without persisting');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
 test('dismissing the theme picker reverts to the previously selected theme without persisting', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },

@@ -11,7 +11,7 @@
   ],
   "scripts": {
     "clean": "node -e \"const fs=require('fs'),path=require('path'),p=path.resolve('dist');if(path.basename(p)!=='dist')throw new Error('unsafe clean target');fs.rmSync(p,{recursive:true,force:true})\"",
-    "build": "npm run clean && tsc -p tsconfig.json",
+    "build": "npm run clean && tsc -p tsconfig.json && node -e \"const fs=require('fs');const p='dist/cli.js';if(fs.existsSync(p))fs.chmodSync(p,0o755)\"",
     "start": "node dist/cli.js",
     "dev": "tsx src/cli.ts",
     "test": "node --import tsx/esm --test tests/*.test.ts tests/**/*.test.ts",

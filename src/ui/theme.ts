@@ -183,6 +183,13 @@ const synthwave: TuiTheme = {
   syntax: ['#6f6a8a', '#fede5d', '#ff7edb', '#36f9f6', '#fe8b48'],
 };
 
+const matrix: TuiTheme = {
+  name: 'matrix', label: 'Matrix · phosphor green',
+  ui: { background: '#000d05', panel: '#000a03', composer: '#00180a', activity: '#001206', elevated: '#022412', modal: '#001708', modalRule: '#0b4a22', line: '#0b4a22', text: '#8dffb4', muted: '#3f9e5f', subtle: '#1e5f38', accent: '#00ff41', success: '#39ff14', warning: '#aaff00', error: '#ff4141' },
+  markdown: { text: '#8dffb4', muted: '#2e7a4a', accent: '#00ff41', heading: '#7dff8e', headingStrong: '#c8ffd9', codeBg: '#01180c', codeText: '#8dffb4', codeFence: '#1e5f38', diffAddBg: '#032d16', diffAddText: '#4dff88', diffDelBg: '#3a0d12', diffDelText: '#ff6b6b' },
+  syntax: ['#2e7a4a', '#7dffa0', '#00ff41', '#aaff00', '#39ff14'],
+};
+
 const solarizedLight: TuiTheme = {
   name: 'solarized-light', label: 'Solarized Light · paper',
   ui: { background: '#fdf6e3', panel: '#eee8d5', composer: '#f4eedd', activity: '#ece5d3', elevated: '#ddd5c1', modal: '#f2ecdb', modalRule: '#ccc4ae', line: '#afa897', text: '#657b83', muted: '#93a1a1', subtle: '#a4aeab', accent: '#268bd2', success: '#859900', warning: '#b58900', error: '#dc322f' },
@@ -201,7 +208,7 @@ export const THEMES: Record<string, TuiTheme> = {
   midnight, nord, dracula, dawn, solarized, 'rose-pine': rosePine,
   'tokyo-night': tokyoNight, 'catppuccin-mocha': catppuccinMocha, 'catppuccin-latte': catppuccinLatte,
   'gruvbox-dark': gruvboxDark, 'one-dark': oneDark, monokai, kanagawa, everforest, synthwave,
-  'solarized-light': solarizedLight, 'github-light': githubLight,
+  matrix, 'solarized-light': solarizedLight, 'github-light': githubLight,
 };
 
 export const DEFAULT_THEME = 'midnight';
