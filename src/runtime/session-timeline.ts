@@ -18,7 +18,13 @@ function runningIndex(session: AgentSession, entries: SessionTimelineEntry[]): M
 }
 
 function finish(entries: SessionTimelineEntry[], predicate: (entry: SessionTimelineEntry) => boolean, status: SessionTimelineEntry['status'] = 'completed'): void {
-  for (const entry of entries) if (predicate(entry)) entry.status = status;
+  const endedAt = Date.now();
+  // Freeze endedAt only on the transition to a terminal status so a repeated
+  // finish pass never re-extends a duration that was already frozen.
+  for (const entry of entries) if (predicate(entry) && !entry.endedAt && entry.status !== status) {
+    entry.status = status;
+    entry.endedAt = endedAt;
+  }
 }
 
 /** Record display order at event time, not grouped retrospectively by turn. */
@@ -60,7 +66,7 @@ export function recordTimeline(session: AgentSession, event: AgentEvent): void {
     if (!entry || entry.kind !== kind || entry.turnId !== event.turnId) {
       finish(active, previous => previous.kind !== 'tool');
       entry = { id: randomUUID(), kind, instanceId: event.instanceId, turnId: event.turnId,
-        role: 'assistant', content: '', status: 'running' };
+        role: 'assistant', content: '', status: 'running', startedAt: Date.now() };
       entries.push(entry);
       index.set(event.instanceId, [...active.filter(previous => previous.status === 'running'), entry]);
     }
@@ -75,7 +81,7 @@ export function recordTimeline(session: AgentSession, event: AgentEvent): void {
     const active = own();
     finish(active, entry => entry.kind !== 'tool');
     const entry: SessionTimelineEntry = { id: randomUUID(), kind: 'tool', instanceId: event.instanceId,
-      turnId: event.turnId, tool: event.tool, input: event.input, content: '', status: 'running' };
+      turnId: event.turnId, tool: event.tool, input: event.input, content: '', status: 'running', startedAt: Date.now() };
     entries.push(entry);
     index.set(event.instanceId, [...active.filter(previous => previous.status === 'running'), entry]);
   } else if (event.type === 'tool_finished') {
@@ -84,6 +90,7 @@ export function recordTimeline(session: AgentSession, event: AgentEvent): void {
     if (entry) {
       entry.content = event.output;
       entry.status = /^(?:\w*Error:|Error\b)|"ok"\s*:\s*false/.test(event.output) ? 'failed' : 'completed';
+      entry.endedAt = Date.now();
       const remaining = active.filter(previous => previous.status === 'running');
       if (remaining.length) index.set(event.instanceId, remaining);
       else index.delete(event.instanceId);

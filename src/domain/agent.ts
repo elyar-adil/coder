@@ -116,6 +116,10 @@ export interface SessionTimelineEntry {
   tool?: string;
   input?: string;
   status: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Epoch ms when this entry started (first delta / tool start). */
+  startedAt?: number;
+  /** Epoch ms when this entry reached a terminal status; frozen once set. */
+  endedAt?: number;
 }
 
 export interface PersistedAgentSession {
@@ -137,6 +141,7 @@ export type AgentEvent =
   | { type: 'tool_started'; instanceId: string; turnId: string; tool: string; input: string }
   | { type: 'tool_finished'; instanceId: string; turnId: string; tool: string; output: string }
   | { type: 'context_compacted'; sessionId: string; instanceId: string; agentId: string; reason: 'auto' | 'manual'; archivedMessages: number; charsBefore: number; charsAfter: number }
+  | { type: 'workspace_changed'; sessionId?: string; workspaceRoot: string; previousRoot: string }
   | { type: 'runtime_error'; sessionId?: string; instanceId?: string; error: string };
 
 export interface RuntimeTool {

@@ -116,15 +116,27 @@ function matchesSelector(id: string, selector: string): boolean {
 export class AgentRegistry {
   private readonly specs = new Map<string, AgentSpec>();
   private readonly roots: Array<{ path: string; scope: AgentSpecScope }>;
+  private readonly builtinDir: string;
+  private readonly userDir: string;
+  private projectDir?: string;
 
   constructor(options: AgentRegistryOptions = {}) {
     const workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
-    const builtinDir = resolve(options.builtinDir ?? resolve(import.meta.dirname, '..', '..', 'agents'));
+    this.builtinDir = resolve(options.builtinDir ?? resolve(import.meta.dirname, '..', '..', 'agents'));
+    this.userDir = resolve(options.userDir ?? resolve(homedir(), '.coder', 'agents'));
+    this.projectDir = options.projectDir ? resolve(options.projectDir) : undefined;
     this.roots = [
-      { path: builtinDir, scope: 'builtin' },
-      { path: resolve(options.userDir ?? resolve(homedir(), '.coder', 'agents')), scope: 'user' },
-      { path: resolve(options.projectDir ?? resolve(workspaceRoot, '.coder', 'agents')), scope: 'project' },
+      { path: this.builtinDir, scope: 'builtin' },
+      { path: this.userDir, scope: 'user' },
+      { path: this.projectDir ?? resolve(workspaceRoot, '.coder', 'agents'), scope: 'project' },
     ];
+  }
+
+  /** Point the project-scope spec root at another workspace (<root>/.coder/agents).
+   * Takes effect on the next load(); used by /cd when switching workspaces. */
+  setProjectDir(workspaceRoot: string): void {
+    this.projectDir = resolve(workspaceRoot, '.coder', 'agents');
+    this.roots[this.roots.length - 1] = { path: this.projectDir, scope: 'project' };
   }
 
   async load(): Promise<void> {
