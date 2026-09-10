@@ -67,7 +67,9 @@ function cacheFilePath(): string {
 }
 
 function updateCheckDisabled(): boolean {
-  if (process.env.CI === 'true' || process.env.CI === '1') return true;
+  // Note: CI is intentionally NOT checked here. The library must stay testable
+  // under test runners that set CI=true; the CLI call site gates on isTTY,
+  // which already suppresses notices on non-interactive environments.
   return ['MAW_NO_UPDATE_CHECK', 'CODER_NO_UPDATE_CHECK', 'NO_UPDATE_NOTIFIER']
     .some((name) => {
       const value = process.env[name];
