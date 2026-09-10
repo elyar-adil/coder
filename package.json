@@ -43,5 +43,11 @@
     "coder": "dist/cli.js",
     "coding-agent": "dist/cli.js"
   },
-  "description": "TUI-first, document-driven multi-agent coding runtime"
+  "description": "TUI-first, document-driven multi-agent coding runtime",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elyar-adil/coder.git"
+  },
+  "homepage": "https://github.com/elyar-adil/coder#readme",
+  "bugs": "https://github.com/elyar-adil/coder/issues"
 }
