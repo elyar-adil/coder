@@ -18,25 +18,16 @@ jobs:
       # NOTE: no registry-url. Setting it makes setup-node write an (empty)
       # _authToken line into .npmrc, which blocks npm's OIDC trusted-publishing
       # detection (ENEEDAUTH). Trusted publishing needs no token at all.
-      # Node 24 bundled npm >= 11.5.1 supports OIDC trusted publishing
-      - name: Setup Node.js
+      # Node 22 is used for the test suite (verified green); Node 24 is
+      # switched in right before publishing because its bundled npm (>= 11.5.1)
+      # is required for OIDC trusted publishing.
+      - name: Setup Node.js (tests)
         uses: actions/setup-node@v4
         with:
-          node-version: 24
+          node-version: 22
           cache: npm
 
       - run: npm ci
-
-      - name: Verify npm supports trusted publishing
-        run: |
-          node -v
-          npm -v
-          node -e "
-            const v = parseInt(require('child_process').execSync('npm -v').toString().trim());
-            const [maj] = String(v).split('.').map(Number);
-            if (maj < 11) { console.error('npm < 11: no trusted publishing support'); process.exit(1); }
-          "
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
 
       - name: Verify tag matches package.json version
         run: |
@@ -52,6 +43,22 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+
+      - name: Setup Node.js (publish, npm >= 11.5.1)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Verify npm supports trusted publishing
+        run: |
+          node -v
+          npm -v
+          node -e "
+            const v = parseInt(require('child_process').execSync('npm -v').toString().trim(), 10);
+            if (v < 11) { console.error('npm < 11: no OIDC trusted publishing support'); process.exit(1); }
+          "
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
 
       - name: Publish
         # Trusted publishing: no token. npm (>=11.5.1) detects the OIDC
