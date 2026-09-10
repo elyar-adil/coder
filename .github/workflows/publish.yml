@@ -18,17 +18,25 @@ jobs:
       # NOTE: no registry-url. Setting it makes setup-node write an (empty)
       # _authToken line into .npmrc, which blocks npm's OIDC trusted-publishing
       # detection (ENEEDAUTH). Trusted publishing needs no token at all.
+      # Node 24 bundled npm >= 11.5.1 supports OIDC trusted publishing
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
 
       - run: npm ci
 
-      # npm >= 11.5.1 才支持 OIDC trusted publishing
-      - name: Upgrade npm
-        run: npm install -g npm@latest
+      - name: Verify npm supports trusted publishing
+        run: |
+          node -v
+          npm -v
+          node -e "
+            const v = parseInt(require('child_process').execSync('npm -v').toString().trim());
+            const [maj] = String(v).split('.').map(Number);
+            if (maj < 11) { console.error('npm < 11: no trusted publishing support'); process.exit(1); }
+          "
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL=${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
 
       - name: Verify tag matches package.json version
         run: |
@@ -50,4 +58,6 @@ jobs:
         # environment from ACTIONS_ID_TOKEN_REQUEST_* and authenticates against
         # the trusted-publisher mapping configured on npmjs.com. Provenance is
         # generated automatically for public repo/package publishes.
-        run: npm publish
+        run: npm publish --loglevel=verbose
+        env:
+          NODE_AUTH_TOKEN: "" # keep stale/secret tokens from interfering
