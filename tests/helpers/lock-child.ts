@@ -1,4 +1,4 @@
-import { appendFile, writeFile } from 'node:fs/promises';
+import { appendFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 
 import { executeTool } from '../../src/infra/tools.js';
@@ -36,7 +36,8 @@ if (mode === 'hold') {
     workspaceRoot: dirname(file),
     acquireWriteLock: (path: string) => locks.acquire(path),
   };
-  await writeFile(file, 'start\nEND\n', 'utf8');
+  // File init happens in the parent test before spawning, so concurrent
+  // children never race their own startup write against each other's edits.
   for (let i = 1; i <= count; i += 1) {
     const result = await executeTool('edit_file', {
       path: file,

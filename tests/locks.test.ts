@@ -146,6 +146,11 @@ describe('FileLockManager (cross-process)', () => {
     const p1 = join(root, 'edit-xp', 'p1.log');
     const p2 = join(root, 'edit-xp', 'p2.log');
     const each = 8;
+    // Initialize the file BEFORE spawning the children. The child helper no
+    // longer writes it: two concurrent children racing their own init write
+    // could clobber the other's first committed edit, producing a flaky
+    // off-by-one failure on slow CI machines.
+    await writeFile(file, 'start\nEND\n', 'utf8');
     const [r1, r2] = await Promise.all([
       runChild(['edit', lockDir, file, String(each), p1]),
       runChild(['edit', lockDir, file, String(each), p2]),
