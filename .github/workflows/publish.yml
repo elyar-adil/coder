@@ -44,4 +44,10 @@ jobs:
       - run: npm test
 
       - name: Publish
+        # actions/setup-node injects the repo's NODE_AUTH_TOKEN secret into the
+        # generated .npmrc when registry-url is set. If that token is stale or
+        # lacks publish rights, npm never falls back to OIDC trusted publishing
+        # and PUT returns 404. Unset it so provenance-based OIDC auth is used.
+        env:
+          NODE_AUTH_TOKEN: ""
         run: npm publish --provenance
