@@ -21,6 +21,7 @@ import type { TuiTheme, TuiThemeColors, Tone } from './theme.js';
 import { resetTuiMarkdownCache } from './markdown.js';
 import { BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, enableBracketedPaste } from './bracketed-paste.js';
 import { WorktreeManager, type WorktreeInfo } from '../runtime/worktree.js';
+import { installBlessedEmojiWidthSupport } from './blessed-unicode.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 
@@ -53,6 +54,10 @@ function safe(value: string): string {
 
 
 export async function runFullscreenTui(runtime: AgentRuntime, options: FullscreenTuiOptions): Promise<void> {
+  // Blessed's Unicode table treats modern emoji as one column even though the
+  // terminal paints them as two. Fix its shared width table before creating
+  // any widgets so incremental redraws do not leave a stale emoji tail cell.
+  installBlessedEmojiWidthSupport((blessed as unknown as { unicode: { charWidth: (value: string | number, index?: number) => number; codePointAt: (value: string, index?: number) => number } }).unicode);
   let sessionId = `session-${Date.now()}`;
   let session = await runtime.openSession(sessionId);
   const instanceCache = new Map(runtime.listInstances(sessionId).map((instance) => [instance.instanceId, instance]));
@@ -199,7 +204,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const pasteInput = enableBracketedPaste(process.stdin);
   const screen = blessed.screen({
     input: pasteInput,
-    smartCSR: true, fullUnicode: true, title: 'TokenMaw',
+    smartCSR: true, fullUnicode: true, forceUnicode: true, title: 'TokenMaw',
     style: { bg: COLOR().background, fg: COLOR().text },
   });
   screen.program.write(BRACKETED_PASTE_ENABLE);

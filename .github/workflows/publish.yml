@@ -4,6 +4,15 @@ on:
   push:
     tags:
       - "v*"
+  # A failed publish cannot be retried by pushing the same immutable tag.
+  # Keep the tag trigger for automatic releases, and offer an explicit retry
+  # path that checks out and validates the selected release tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish (for example, v0.4.1)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -14,6 +23,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       # NOTE: no registry-url. Setting it makes setup-node write an (empty)
       # _authToken line into .npmrc, which blocks npm's OIDC trusted-publishing
@@ -30,10 +41,12 @@ jobs:
       - run: npm ci
 
       - name: Verify tag matches package.json version
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           node -e "
             const pkg = require('./package.json');
-            const tag = process.env.GITHUB_REF_NAME;
+            const tag = process.env.RELEASE_TAG;
             if ('v' + pkg.version !== tag) {
               console.error('Tag ' + tag + ' does not match package.json version v' + pkg.version);
               process.exit(1);
