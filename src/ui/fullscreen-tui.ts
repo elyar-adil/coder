@@ -2,11 +2,11 @@ import { resolve as resolvePath, sep } from 'node:path';
 import blessed from 'blessed';
 
 import type { BackendConfig } from '../backend.js';
-import type { AgentConfig, AgentModelConfig } from '../config.js';
+import type { AgentConfig } from '../config.js';
+import { createProviderFlows } from './provider-models.js';
 import type { AgentEvent, AgentInstance, AgentSession } from '../domain/agent.js';
 import { renderTuiMarkdown, toolDiff } from './markdown.js';
 import type { AgentRuntime } from '../runtime/agent-runtime.js';
-import { resilientFetch } from '../fetch.js';
 import { layoutComposer } from './composer-layout.js';
 import { renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
@@ -23,13 +23,6 @@ import { BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, enableBracketedPaste }
 import { WorktreeManager, type WorktreeInfo } from '../runtime/worktree.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
-type Provider = {
-  id: 'openai' | 'openrouter' | 'anthropic' | 'ollama' | 'opencode-go' | 'custom';
-  label: string;
-  backend: AgentModelConfig['backend'];
-  baseUrl: string;
-  needsKey: boolean;
-};
 
 type ConfigManager = {
   getConfig: () => AgentConfig;
@@ -45,15 +38,6 @@ export interface FullscreenTuiOptions {
   configManager: ConfigManager;
 }
 
-const PROVIDERS: Provider[] = [
-  { id: 'openai', label: 'OpenAI', backend: 'openai', baseUrl: 'https://api.openai.com/v1', needsKey: true },
-  { id: 'openrouter', label: 'OpenRouter', backend: 'openai', baseUrl: 'https://openrouter.ai/api/v1', needsKey: true },
-  { id: 'anthropic', label: 'Anthropic', backend: 'anthropic', baseUrl: 'https://api.anthropic.com', needsKey: true },
-  { id: 'opencode-go', label: 'OpenCode Go', backend: 'openai', baseUrl: 'https://opencode.ai/zen/go/v1', needsKey: true },
-  { id: 'ollama', label: 'Ollama · local', backend: 'ollama', baseUrl: 'http://localhost:11434', needsKey: false },
-  { id: 'custom', label: 'Custom · OpenAI compatible', backend: 'openai', baseUrl: '', needsKey: false },
-];
-
 const COLOR = (): TuiThemeColors => activeTuiTheme().ui;
 
 const TONE_COLOR = (tone: Tone): string => COLOR()[tone];
@@ -67,28 +51,6 @@ function safe(value: string): string {
   return blessed.escape(value);
 }
 
-function providerName(config: AgentModelConfig): string {
-  if (config.backend === 'anthropic') return 'Anthropic';
-  if (config.backend === 'ollama') return 'Ollama';
-  if (config.baseUrl?.includes('openrouter.ai')) return 'OpenRouter';
-  if (config.baseUrl?.includes('opencode.ai/zen')) return 'OpenCode Go';
-  return 'OpenAI compatible';
-}
-
-async function fetchRemoteModels(baseUrl: string, apiKey: string | undefined, backend: AgentModelConfig['backend']): Promise<{ models: string[]; error?: string }> {
-  try {
-    const trimmed = baseUrl.replace(/\/+$/, '');
-    const url = backend === 'anthropic' ? `${trimmed}/v1/models` : backend === 'ollama' ? `${trimmed}/v1/models` : `${trimmed}/models`;
-    const headers: Record<string, string> = backend === 'anthropic'
-      ? { 'x-api-key': apiKey ?? '', 'anthropic-version': '2023-06-01' }
-      : apiKey ? { authorization: `Bearer ${apiKey}` } : {};
-    const response = await resilientFetch(url, { headers, retries: 0, timeout: 15000 });
-    const body = await response.json() as { data?: Array<{ id?: string }> };
-    return { models: [...new Set((body.data ?? []).map((model) => model.id).filter((id): id is string => Boolean(id)))].sort() };
-  } catch (error) {
-    return { models: [], error: error instanceof Error ? error.message : String(error) };
-  }
-}
 
 export async function runFullscreenTui(runtime: AgentRuntime, options: FullscreenTuiOptions): Promise<void> {
   let sessionId = `session-${Date.now()}`;
@@ -159,6 +121,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   }
   const thinkingBlocks = new Map<string, ThinkingBlock>();
   const thinkingBlockLines = new Map<string, { headerLine: number; lastLine: number }>();
+  // Rendered header row per collapsible entry, captured while the transcript
+  // is built. The pinned overlay reuses it verbatim so a Read/Run row keeps
+  // its status icon and detail instead of a generic label.
+  const stickyHeaderLines = new Map<string, string>();
   // Sticky collapse header: when an expanded block's own header has scrolled
   // above the viewport while the block body is still on screen, the header is
   // redrawn pinned to the first conversation row so it can always be clicked
@@ -188,6 +154,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let composerRow = 0;
   let composerColumn = 0;
   let notice = '';
+  // Live model-request count for the main instance's running turn. Informational
+  // only: the runtime has no step budget, so this never implies a hard limit.
+  let activeTurnStep: number | undefined;
   let completionIndex = 0;
   let completionQuery = '';
   let dismissedCompletion = '';
@@ -242,15 +211,49 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   screen.program.decset('1004');
   let fullRedrawPending = true;
   const requestFullRedraw = (): void => { fullRedrawPending = true; };
-  const renderScreen = (): void => {
+  // Frame atomicity. Blessed already double-buffers — every frame is a diff
+  // against its previous buffer (lines/olines) — but it streams that diff to
+  // the terminal as it computes it. A frame whose cells are scattered across
+  // the screen (the matrix theme's rain wets rows top to bottom every frame)
+  // is then painted while arriving: the terminal shows half-frames, the
+  // cursor jumps across the screen, and the animation reads as flicker.
+  // DEC 2026 synchronized output brackets the frame so a supporting terminal
+  // buffers the whole update and swaps it in once — the terminal-side half
+  // of a double-buffer swap. Terminals without support ignore unknown DEC
+  // modes and behave exactly as before, so this is safe to always send.
+  const SYNC_BEGIN = '\x1b[?2026h';
+  const SYNC_END = '\x1b[?2026l';
+  // _write is blessed's buffered writer (Program.prototype._write); the public
+  // typings omit it, so reach it through a structural cast.
+  const bufferedWrite = (text: string): void => {
+    (screen.program as unknown as { _write(text: string): void })._write(text);
+  };
+  const renderScreen = (afterRender?: () => void): void => {
+    // Order matters. program.write() (_owrite) writes straight to the pty,
+    // while the frame body goes through _write -> _buffer -> nextTick flush.
+    // Bracketing with write() would emit END before the frame even starts.
+    // _write appends to the same blessed buffer the frame is flushed into:
+    // draw() absorbs any pending _buf at its top, so BEGIN is re-buffered
+    // ahead of the frame, END follows it, and one nextTick writes the whole
+    // frame out in order.
+    bufferedWrite(SYNC_BEGIN);
     if (fullRedrawPending) {
       // Blessed's smart CSR occasionally leaves the tail of a wide/long line
       // behind when an element shrinks or disappears. Reallocating only for
       // structural transitions clears both its current and previous buffers.
+      // This must run inside the bracket: realloc() calls program.clear(),
+      // whose \x1b[2J would otherwise escape the frame and visibly blank
+      // the screen before the atomic swap.
       screen.realloc();
       fullRedrawPending = false;
     }
     screen.render();
+    // Cursor position is part of an atomic frame under DEC 2026: terminals
+    // swap the cursor along with the cells. Any cursor write emitted after
+    // the closing bracket lands outside the synchronized update and jumps
+    // mid-paint, so callers place the caret through this callback instead.
+    afterRender?.();
+    bufferedWrite(SYNC_END);
   };
   const screenBuffer = screen as unknown as { lines: Array<Array<[number, string]> & { dirty: boolean }> };
 
@@ -281,7 +284,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   });
   const composer = blessed.box({
     parent: screen, bottom: 1, left: 3, width: '100%-4', height: 2,
-    input: true, keys: true, mouse: true, padding: { left: 0, right: 1 },
+    input: true, keys: true, mouse: true, autoFocus: false, padding: { left: 0, right: 1 },
     tags: true,
     style: { bg: COLOR().composer, fg: COLOR().text },
   });
@@ -405,12 +408,18 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (completionsWereHidden !== completions.hidden) requestFullRedraw();
   };
 
+  // The caret position and cursor visibility ride inside the bracketed frame
+  // (see renderScreen): a post-render cursor write lands outside the atomic
+  // update and makes the caret jump while the frame paints.
+  const syncComposerCursor = (): void => {
+    placeComposerCursor();
+    screen.program.showCursor();
+  };
+
   const renderComposerFrame = (): void => {
     renderComposer();
     screen.program.hideCursor();
-    renderScreen();
-    placeComposerCursor();
-    screen.program.showCursor();
+    renderScreen(syncComposerCursor);
   };
 
   const updateHistory = (direction: -1 | 1): void => {
@@ -581,12 +590,34 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     streamTimer.unref?.();
   };
 
+  // Depth of open modal dialogs. While any dialog is up, mouse clicks must
+  // neither steal focus from the dialog nor let the app's click handlers run:
+  // a single stray press (for example after copying a key from another
+  // window) used to blur the dialog's textbox, which fires `cancel` inside
+  // readInput and silently aborts the whole wizard.
+  let modalDepth = 0;
+
   const focusComposer = (): void => {
-    if (closed) return;
+    if (closed || modalDepth > 0) return;
     composerPinned = true;
     if (screen.focused !== composer) composer.focus();
     renderComposerFrame();
   };
+
+  /** Hands keyboard focus back to the composer once the last dialog closed. */
+  const restoreModalFocus = (): void => {
+    modalDepth = Math.max(0, modalDepth - 1);
+    if (modalDepth === 0) {
+      composerPinned = true;
+      focusComposer();
+    }
+  };
+
+  /** Absorbs clicks landing on a modal's own surface (title, rule, hint
+   * rows). Without it, such clicks fall through to the conversation below and
+   * its click handler stole focus, which blurs the dialog's textbox —
+   * readInput treats that blur as a cancel and silently aborts the wizard. */
+  const showModalSurfaceGuard = (): void => {};
 
   type ChoiceItem = string | { label: string; detail?: string };
   interface ChooseOptions {
@@ -612,6 +643,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const choose = (title: string, items: ChoiceItem[], options: ChooseOptions = {}): Promise<number> => new Promise((resolveChoice) => {
     composerPinned = false;
+    modalDepth++;
     const searchable = options.searchable === true;
     const renderItem = (item: ChoiceItem): string => typeof item === 'string'
       ? safe(item)
@@ -621,8 +653,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const height = Math.min(items.length + (searchable ? 5 : 4), 22, Math.max(searchable ? 7 : 6, Number(screen.height) - 2));
     const modal = blessed.box({
       parent: screen, top: 'center', left: 'center', width, height,
-      tags: true, style: { bg: COLOR().modal, fg: COLOR().text },
+      tags: true, clickable: true, autoFocus: false, style: { bg: COLOR().modal, fg: COLOR().text },
     });
+    modal.on('click', showModalSurfaceGuard);
     const heading = blessed.box({
       parent: modal, top: 0, left: 1, right: 1, height: 1, tags: true,
       content: `{bold}${safe(title)}{/bold}`, style: { bg: COLOR().modal, fg: COLOR().text },
@@ -671,7 +704,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         list.setItems([`{${COLOR().subtle}-fg}  no matches{/${COLOR().subtle}-fg}`]);
       }
       renderFilterRow();
-      screen.render();
+      renderScreen();
     };
     if (searchable && filterRow) {
       list.on('keypress', (ch: string | undefined, key: { name?: string; ctrl?: boolean; meta?: boolean } | undefined) => {
@@ -724,8 +757,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       done = true;
       modal.destroy();
       requestFullRedraw();
-      composerPinned = true;
-      focusComposer();
+      restoreModalFocus();
       resolveChoice(value);
     };
     list.on('select', (_item, index) => {
@@ -765,11 +797,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const ask = (label: string, initial = '', secret = false): Promise<string> => new Promise((resolveAnswer) => {
     composerPinned = false;
+    modalDepth++;
     const width = Math.min(76, Math.max(28, Number(screen.width) - 4));
     const modal = blessed.box({
       parent: screen, top: 'center', left: 'center', width, height: 7,
-      style: { bg: COLOR().modal, fg: COLOR().text },
+      tags: true, clickable: true, autoFocus: false, style: { bg: COLOR().modal, fg: COLOR().text },
     });
+    modal.on('click', showModalSurfaceGuard);
     blessed.box({
       parent: modal, top: 0, left: 1, right: 1, height: 1, tags: true,
       content: `{bold}${safe(label)}{/bold}`, style: { bg: COLOR().modal, fg: COLOR().text },
@@ -788,6 +822,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       content: 'Enter confirm  ·  Esc cancel', style: { bg: COLOR().modal, fg: COLOR().modalRule },
     });
     attachCloseButton(modal, () => finish(''));
+    // Title/rule/hint rows have no handlers of their own: a click on them
+    // falls through to the conversation unless the modal surface absorbs it.
     input.setValue(initial);
     let done = false;
     const finish = (value: string): void => {
@@ -795,8 +831,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       done = true;
       modal.destroy();
       requestFullRedraw();
-      composerPinned = true;
-      focusComposer();
+      restoreModalFocus();
       resolveAnswer(value.trim());
     };
     input.on('submit', (value) => finish(String(value ?? '')));
@@ -817,7 +852,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const changed = found.length !== otherInstances.length
         || found.some((item, index) => item.pid !== otherInstances[index]?.pid);
       otherInstances = found;
-      if (changed) { renderStatus(); screen.render(); }
+      if (changed) { renderStatus(); renderScreen(); }
     }).catch(() => undefined);
   }, 15_000);
   instancePoll.unref?.();
@@ -834,7 +869,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const renderStatus = (): void => {
     const active = instances().filter((item) => item.status === 'running' || item.status === 'waiting' || item.status === 'queued').length;
-    const activityText = active ? `${active} active` : 'Ready';
+    const activityText = active ? `${active} active${activeTurnStep !== undefined ? ` · step ${activeTurnStep}` : ''}` : 'Ready';
     const usage = instances().reduce((total, item) => {
       total.input += item.usage?.inputTokens ?? 0;
       total.output += item.usage?.outputTokens ?? 0;
@@ -879,7 +914,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const gap = width - Number(statusbar.strWidth(left)) - Number(statusbar.strWidth(rightText));
     statusbar.setContent(gap >= 3
       ? `{bold}maw{/bold}  {${COLOR().muted}-fg}${safe(activeModel)}{/${COLOR().muted}-fg}  {${COLOR().muted}-fg}${safe(cwdText)}{/${COLOR().muted}-fg}${isBtw() ? `  {${COLOR().accent}-fg}[side]{/${COLOR().accent}-fg}` : ''}${accessBadge}${instanceBadge}${' '.repeat(Math.max(0, gap))}{${active ? COLOR().accent : COLOR().muted}-fg}${safe(rightText)}{/${active ? COLOR().accent : COLOR().muted}-fg}`
-      : `{bold}maw{/bold}${goal ? `  {${COLOR().accent}-fg}⚑ ${safe(oneLine(goal, goalBudget))}{/${COLOR().accent}-fg}` : ''}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}${accessBadge}${instanceBadge}`);
+      : `{bold}maw{/bold}${goal ? `  {${COLOR().accent}-fg}⚑ ${safe(oneLine(goal, goalBudget))}{/${COLOR().accent}-fg}` : ''}${active ? `  {${COLOR().accent}-fg}${active} active{/${COLOR().accent}-fg}` : ''}${activeTurnStep !== undefined ? `  {${COLOR().accent}-fg}step ${activeTurnStep}{/${COLOR().accent}-fg}` : ''}${accessBadge}${instanceBadge}`);
   };
 
   const conversationAtBottom = (): boolean => {
@@ -910,6 +945,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const metrics = tuiLayout(screenWidth, activityVisible);
     const markdownCols = Math.max(10, Math.min(120, metrics.conversationWidth - metrics.horizontalPadding * 2 - 2));
     thinkingBlockLines.clear();
+    stickyHeaderLines.clear();
     // The welcome screen yields to any conversation content — messages,
     // streaming output, thinking, or transcript entries like shell runs.
     const welcomeVisible = !session.messages.length && !streams.size && thinkingBlocks.size === 0 && !(session.timeline?.length);
@@ -1019,7 +1055,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           renderThinkingBlock(block);
         } else {
           const headerLine = lineCursor;
-          thinkingBlockLines.set(entry.id, { headerLine, lastLine: headerLine });
           latestThinkingTurnId = entry.id;
           const agent = entry.instanceId ? instanceCache.get(entry.instanceId)?.agentId : undefined;
           const state = entry.status === 'running'
@@ -1033,7 +1068,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
           const presentation = toolPresentation(entry.tool ?? '', entry.input);
           const owner = agent && agent !== 'main' ? `${agent} · ` : '';
           const detail = presentation.detail ? `  ${oneLine(presentation.detail, Math.max(18, markdownCols - presentation.label.length - owner.length - 12))}` : '';
-          pushConversationLine(`{${color}-fg}${expanded ? '▼' : '▶'} ${state.icon}{/${color}-fg} {${COLOR().muted}-fg}${safe(owner)}${safe(presentation.label)}${safe(detail)}{/${COLOR().muted}-fg}`);
+          const headerText = `{${color}-fg}${expanded ? '▾' : '▸'} ${state.icon}{/${color}-fg} {${COLOR().muted}-fg}${safe(owner)}${safe(presentation.label)}${safe(detail)}{/${COLOR().muted}-fg}`;
+          pushConversationLine(headerText);
+          stickyHeaderLines.set(entry.id, headerText);
           if (expanded) {
             if (entry.input) {
               pushConversationLine(`  {${COLOR().subtle}-fg}Input{/${COLOR().subtle}-fg}`);
@@ -1047,6 +1084,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
             if (entry.status === 'failed') pushConversationLine(`  {${COLOR().error}-fg}${safe(oneLine(entry.content, markdownCols - 2))}{/${COLOR().error}-fg}`);
           }
           pushConversationLine('');
+          // Recorded after the body so the pinned header vanishes once the
+          // whole expanded block (not just its header) leaves the viewport top.
+          thinkingBlockLines.set(entry.id, { headerLine, lastLine: Math.max(headerLine, lineCursor - 1) });
         }
       }
     }
@@ -1156,8 +1196,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         if (!bucket || bucket.length === 0) return { first: real, last: real };
         return { first: Number(bucket[0]), last: Number(bucket[bucket.length - 1]) };
       };
-      const pinFor = (turnId: string, block: ThinkingBlock, position: { headerLine: number; lastLine: number }): StickyHeader => {
-        const line = stickyHeaderLine(block);
+      const pinFor = (turnId: string, position: { headerLine: number; lastLine: number }): StickyHeader => {
+        const line = stickyHeaderLines.get(turnId) ?? '';
         return {
           turnId,
           line,
@@ -1173,13 +1213,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       // body has not fully scrolled past it yet.
       const pos = stickyHeader ? thinkingBlockLines.get(stickyHeader.turnId) : undefined;
       const keptBlock = stickyHeader && pos ? thinkingBlocks.get(stickyHeader.turnId) : undefined;
-      if (stickyHeader && pos && keptBlock?.expanded) {
+      if (stickyHeader && pos && keptBlock?.expanded && stickyHeaderLines.has(stickyHeader.turnId)) {
         const header = logicalSpan(pos.headerLine);
         const tail = logicalSpan(pos.lastLine);
         if (header.first < topRow && tail.last >= topRow) {
           // Regenerate the row so a live block's spinner glyph and elapsed
           // seconds keep updating instead of freezing at the pinning frame.
-          sticky = pinFor(stickyHeader.turnId, keptBlock, pos);
+          sticky = pinFor(stickyHeader.turnId, pos);
         }
       }
       if (!sticky) {
@@ -1187,11 +1227,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         // is the unique block whose rendered span still contains the top row.
         for (const [turnId, position] of thinkingBlockLines) {
           const block = thinkingBlocks.get(turnId);
-          if (!block?.expanded) continue;
+          if (!block?.expanded || !stickyHeaderLines.has(turnId)) continue;
           const header = logicalSpan(position.headerLine);
           const tail = logicalSpan(position.lastLine);
           if (header.first < topRow && tail.last >= topRow) {
-            sticky = pinFor(turnId, block, position);
+            sticky = pinFor(turnId, position);
             break;
           }
         }
@@ -1211,8 +1251,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       // `fixed` exempts the overlay from the scrollable parent's childBase
       // offset, so it stays anchored at the viewport's top row instead of
       // scrolling out of view together with the conversation content.
-      const wrapper = blessed.box({ parent: conversation, top: 0, left: 0, width: '100%', height: 1, tags: true, mouse: true, fixed: true, padding: { left: 2, right: 2 }, style: { bg: COLOR().background } });
+      const wrapper = blessed.box({ parent: conversation, top: 0, left: 0, width: '100%', height: 1, tags: true, mouse: true, fixed: true, autoFocus: false, padding: { left: 2, right: 2 }, style: { bg: COLOR().background } });
       wrapper.on('click', () => {
+        if (modalDepth > 0) return;
         // Blessed bubbles this click up to the conversation box; the flag
         // consumes the bubbled copy so the block is toggled exactly once.
         stickyClickHandled = true;
@@ -1227,25 +1268,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     conversationExt._listWrapper.setContent(sticky.line);
   };
 
-  const stickyHeaderLine = (block: ThinkingBlock): string => {
-    const toggle = block.expanded ? '▼' : '▶';
-    // Completed blocks reuse the toggle glyph as their icon; keep only one so
-    // the pinned header never shows "▼ ▼".
-    const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : '';
-    const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
-    const label = block.status === 'active'
-      ? (block.thinking || block.content.length === 0 ? 'Thinking' : 'Working')
-      : (block.thinking ? 'Thought' : 'Activity');
-    const duration = elapsedLabel(block.startedAt, block.finishedAt);
-    const durationText = duration ? `  ${duration}` : '';
-    return `{${color}-fg}${toggle}${icon ? ` ${icon}` : ''} ${label}${durationText}{/${color}-fg}`;
-  };
-
   const renderThinkingBlock = (block: ThinkingBlock): void => {
     const headerLine = lineCursor;
-    const toggle = block.expanded ? '▼' : '▶';
+    const toggle = block.expanded ? '▾' : '▸';
     // Completed blocks reuse the toggle glyph as their icon; keep only one so
-    // the header never shows "▼ ▼" or "▶ ▶".
+    // the header never shows "▾ ▾" or "▸ ▸".
     const icon = block.status === 'active' ? spinnerGlyph(spinnerFrame) : '';
     const color = block.status === 'active' ? COLOR().accent : COLOR().muted;
     // An active block with nothing to show yet is the pre-first-token state:
@@ -1255,12 +1282,15 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       : (block.thinking ? 'Thought' : 'Activity');
     const duration = elapsedLabel(block.startedAt, block.finishedAt);
     const durationText = duration ? `  ${duration}` : '';
+    let headerText: string;
     if (block.status === 'active') {
       const scanLabel = `{${COLOR().accent}-fg}${label}{/${COLOR().accent}-fg}`;
-      pushConversationLine(`{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}{${COLOR().subtle}-fg}${durationText}{/${COLOR().subtle}-fg}`);
+      headerText = `{${color}-fg}${toggle} ${icon}{/${color}-fg} ${scanLabel}{${COLOR().subtle}-fg}${durationText}{/${COLOR().subtle}-fg}`;
     } else {
-      pushConversationLine(`{${color}-fg}${toggle}${icon ? ` ${icon}` : ''} ${label}${durationText}{/${color}-fg}`);
+      headerText = `{${color}-fg}${toggle}${icon ? ` ${icon}` : ''} ${label}${durationText}{/${color}-fg}`;
     }
+    pushConversationLine(headerText);
+    stickyHeaderLines.set(block.turnId, headerText);
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
       if (block.thinking) {
@@ -1359,11 +1389,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     conversationScrollbar.sync();
     activityScrollbar.sync();
     activityDetailScrollbar.current?.sync();
-    renderScreen();
-    if (composerFocused) {
-      placeComposerCursor();
-      screen.program.showCursor();
-    }
+    renderScreen(composerFocused ? syncComposerCursor : undefined);
   };
 
   // Focus regained is treated like a resize, and only when the blur window
@@ -1393,103 +1419,19 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     refresh();
   };
 
-  const openModel = async (): Promise<void> => {
-    const config = options.configManager.getConfig();
-    const aliases = [...new Set([...(config.model ? [config.model] : []), ...Object.keys(config.models ?? {}), ...(options.modelAliases ?? [])])];
-    if (!aliases.length) { await openProvider(); return; }
-    const index = await choose('Model', aliases.map((alias) => {
-      const entry = config.models?.[alias];
-      return {
-        label: `${alias}${alias === activeModel ? '  ✓' : ''}`,
-        detail: entry ? `${providerName(entry)} · ${entry.model}` : 'Session model',
-      };
-    }), { searchable: true });
-    if (index >= 0) await applyModel(aliases[index]!);
-  };
-
-  const addProvider = async (): Promise<void> => {
-    const providerIndex = await choose('Add provider', PROVIDERS.map((provider) => provider.label));
-    if (providerIndex < 0) return;
-    const provider = PROVIDERS[providerIndex]!;
-    const baseUrl = await ask('Base URL', provider.baseUrl);
-    if (!baseUrl) return;
-    let apiKey: string | undefined;
-    if (provider.needsKey) {
-      const envName = provider.id === 'openrouter' ? 'OPENROUTER_API_KEY' : provider.id === 'anthropic' ? 'ANTHROPIC_API_KEY' : provider.id === 'opencode-go' ? 'OPENCODE_API_KEY' : 'OPENAI_API_KEY';
-      apiKey = await ask(`API key · blank uses ${envName}`, '', true) || process.env[envName];
-      if (!apiKey) return;
-    } else if (provider.id === 'custom') {
-      apiKey = await ask('API key · optional', '', true) || undefined;
-    }
-    const remoteResult = await fetchRemoteModels(baseUrl, apiKey, provider.backend);
-    const remoteModels = remoteResult.models;
-    if (remoteResult.error) notice = 'Could not load models. Enter a model name manually.';
-    let model: string;
-    if (remoteModels.length) {
-      const index = await choose('Provider model', [...remoteModels, 'Type manually…'], { searchable: true });
-      if (index < 0) return;
-      model = index < remoteModels.length ? remoteModels[index]! : await ask('Provider model name');
-    } else {
-      model = await ask('Provider model name');
-    }
-    if (!model) return;
-    const suggested = provider.id === 'openrouter' ? model.split('/').at(-1)! : model.split(':')[0]!;
-    const alias = await ask('Local alias', suggested);
-    if (!alias) return;
-    const contextRaw = await ask('Context window · optional');
-    const contextWindow = Number.parseInt(contextRaw, 10);
-    const current = options.configManager.getConfig();
-    if (current.models?.[alias] && await choose(`Replace ${alias}?`, ['Replace', 'Cancel']) !== 0) return;
-    const next: AgentConfig = {
-      ...current,
-      model: current.model || alias,
-      models: {
-        ...(current.models ?? {}),
-        [alias]: {
-          model, baseUrl, backend: provider.backend,
-          ...(apiKey ? { apiKey } : {}),
-          ...(Number.isFinite(contextWindow) && contextWindow > 0 ? { contextWindow } : {}),
-        },
-      },
-    };
-    await options.configManager.saveConfig(next);
-    if (!current.model) await applyModel(alias);
-  };
-
-  const removeProvider = async (): Promise<void> => {
-    const current = options.configManager.getConfig();
-    const entries = Object.entries(current.models ?? {});
-    if (!entries.length) return;
-    const index = await choose('Remove provider', entries.map(([alias, config]) => `${alias}  ·  ${providerName(config)}  ·  ${config.model}`));
-    if (index < 0) return;
-    const alias = entries[index]![0];
-    if (await choose(`Remove ${alias}?`, ['Remove', 'Cancel']) !== 0) return;
-    const models = { ...(current.models ?? {}) };
-    delete models[alias];
-    const model = current.model === alias ? Object.keys(models)[0] : current.model;
-    await options.configManager.saveConfig({ ...current, model, models });
-    if (activeModel === alias && model) await applyModel(model);
-  };
-
-  const openProvider = async (): Promise<void> => {
-    const entries = Object.entries(options.configManager.getConfig().models ?? {});
-    const actions = [
-      ...entries.map(([alias, config]) => ({ label: `${alias}  ·  ${providerName(config)}  ·  ${config.model}${alias === activeModel ? '  ✓' : ''}`, action: 'select', alias })),
-      { label: '+  Add provider', action: 'add', alias: '' },
-      ...(entries.length ? [{ label: '−  Remove provider', action: 'remove', alias: '' }] : []),
-    ];
-    const index = await choose('Provider', actions.map((item) => {
-      if (item.action === 'add') return { label: 'Add provider', detail: 'Configure a model endpoint' };
-      if (item.action === 'remove') return { label: 'Remove provider', detail: 'Delete a configured endpoint' };
-      const config = options.configManager.getConfig().models?.[item.alias];
-      return { label: `${item.alias}${item.alias === activeModel ? '  ✓' : ''}`, detail: config ? `${providerName(config)} · ${config.model}` : undefined };
-    }));
-    if (index < 0) return;
-    const selected = actions[index]!;
-    if (selected.action === 'select') await applyModel(selected.alias);
-    else if (selected.action === 'add') await addProvider();
-    else await removeProvider();
-  };
+  // Provider/model management lives in provider-models.ts: saved providers
+  // hold the connection once (URL + key), models reference them, and
+  // /provider walks providers → their models without ever re-asking for a
+  // stored URL or key.
+  const { openProvider, openModel } = createProviderFlows({
+    configManager: options.configManager,
+    choose: (title, items, chooseOptions) => choose(title, [...items], chooseOptions),
+    ask,
+    notify: (message) => { notice = message; refresh(); },
+    applyModel,
+    activeModel: () => activeModel,
+    modelAliases: options.modelAliases,
+  });
 
   const showAgents = async (): Promise<void> => {
     const specs = runtime.listAgentSpecs();
@@ -1525,8 +1467,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     activityLog.clear();
     thinkingBlocks.clear();
     thinkingBlockLines.clear();
+    stickyHeaderLines.clear();
     thinkingStartedAt.clear();
     pendingTurns.clear();
+    activeTurnStep = undefined;
     stickyHeader = undefined;
     lastStickyKey = undefined;
     (conversation as blessed.Widgets.BoxElement & { _listWrapper?: blessed.Widgets.BoxElement })._listWrapper?.hide();
@@ -1599,14 +1543,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const showActivityDetail = async (): Promise<void> => {
     const instance = instances()[selectedActivityIndex];
     if (!instance) return;
+    if (activityDetail) modalDepth = Math.max(0, modalDepth - 1);
     activityDetail?.modal.destroy();
     composerPinned = false;
+    modalDepth++;
     const width = Math.min(88, Math.max(36, Number(screen.width) - 6));
     const height = Math.min(24, Math.max(9, Number(screen.height) - 4));
     const modal = blessed.box({
       parent: screen, top: 'center', left: 'center', width, height,
-      tags: true, style: { bg: COLOR().modal, fg: COLOR().text },
+      tags: true, clickable: true, autoFocus: false, style: { bg: COLOR().modal, fg: COLOR().text },
     });
+    modal.on('click', showModalSurfaceGuard);
     blessed.box({
       parent: modal, top: 0, left: 2, right: 2, height: 1, tags: true,
       content: `{bold}${safe(instance.agentId)} progress{/bold}`,
@@ -1633,8 +1580,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       activityDetail = undefined;
       modal.destroy();
       requestFullRedraw();
-      composerPinned = true;
-      focusComposer();
+      restoreModalFocus();
     };
     body.key(['escape', 'q'], closeDetail);
     attachCloseButton(modal, closeDetail);
@@ -1719,6 +1665,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         streams.clear();
         thinkingBlocks.clear();
         thinkingBlockLines.clear();
+        stickyHeaderLines.clear();
         thinkingStartedAt.clear();
         pendingTurns.clear();
         stickyHeader = undefined;
@@ -1771,6 +1718,47 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         const result = await runtime.setSessionGoal(sessionId, args.join(' '));
         session.goal = runtime.getSession(sessionId)?.goal;
         notice = result.detail;
+        refresh();
+        break;
+      }
+      // /board shows the shared session scratchpad; add/todo/clear manage it
+      // from the keyboard. The agent owns day-to-day upkeep, this is for the
+      // user to pin requirements or prune a full board.
+      case 'board': {
+        const [sub = '', ...rest] = args;
+        const value = rest.join(' ').trim();
+        if (!sub) {
+          const entries = await runtime.boardEntries(sessionId);
+          if (!entries.length) {
+            notice = 'Session board is empty. /board add <text> or /board todo <text>.';
+            refresh();
+            break;
+          }
+          await choose('Session board', [
+            ...entries.map((entry) => ({
+              label: `[${entry.id}] ${entry.kind ?? 'note'}${entry.status ? ` · ${entry.status}` : ''}`,
+              detail: oneLine(entry.text, 56),
+            })),
+            'Close',
+          ], { searchable: true });
+          break;
+        }
+        if (sub === 'add' || sub === 'todo') {
+          if (!value) { notice = `Usage: /board ${sub} <text>`; refresh(); break; }
+          const entry = await runtime.addBoardEntry(sessionId, value, sub === 'todo' ? { kind: 'todo', status: 'open' } : {});
+          session.board = runtime.getSession(sessionId)?.board;
+          notice = `Board entry ${entry.id} added.`;
+          refresh();
+          break;
+        }
+        if (sub === 'clear') {
+          const count = await runtime.clearBoard(sessionId);
+          session.board = runtime.getSession(sessionId)?.board;
+          notice = `Board cleared (${count} ${count === 1 ? 'entry' : 'entries'} removed).`;
+          refresh();
+          break;
+        }
+        notice = 'Usage: /board | /board add <text> | /board todo <text> | /board clear';
         refresh();
         break;
       }
@@ -2013,10 +2001,14 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         stopStreamTimer();
       }
     }
+    if (event.type === 'turn_progress' && event.sessionId === sessionId && event.instanceId === session.mainInstanceId) {
+      activeTurnStep = event.step;
+    }
     if (event.type === 'instance_updated' && event.instance.instanceId === session.mainInstanceId
       && event.instance.activeTurnId && ['running', 'waiting'].includes(event.instance.status)) {
       const turnId = event.instance.activeTurnId;
       conversationDirty = true;
+      activeTurnStep = undefined;
       pendingTurns.clear();
       pendingTurns.add(turnId);
       for (const [id, block] of thinkingBlocks) {
@@ -2033,6 +2025,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       && ['idle', 'failed', 'cancelled'].includes(event.instance.status)) {
       const block = [...thinkingBlocks.values()].find(b => b.status === 'active');
       conversationDirty = true;
+      activeTurnStep = undefined;
       if (block) {
         block.status = 'completed';
         block.finishedAt = Date.now();
@@ -2147,11 +2140,21 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   screen.key(['C-b'], toggleActivity);
   // Conversation and activity panes are mouse-scrollable. Focus returns to the
   // composer after generation or when a modal closes.
+  /** Rendered (wrapped) conversation row for a logical content line. */
+  const renderedConversationRow = (real: number): number => {
+    const bucket = (conversation as unknown as { _clines?: { ftor?: Array<unknown[]> } })._clines?.ftor?.[real];
+    return bucket && bucket.length > 0 ? Number(bucket[0]) : real;
+  };
   const toggleThinkingBlock = (turnId: string): void => {
     const block = thinkingBlocks.get(turnId);
     if (!block) return;
     conversationFollowOutput = false;
-    conversationScrollOffset = conversation.childBase;
+    // A block whose header has scrolled above the viewport is toggled through
+    // its pinned overlay. That row stays put at the top: restoring the raw
+    // scroll offset instead would land somewhere else once the body folds away.
+    const pos = thinkingBlockLines.get(turnId);
+    const headerRow = pos ? renderedConversationRow(pos.headerLine) : conversation.childBase;
+    conversationScrollOffset = headerRow < conversation.childBase ? headerRow : conversation.childBase;
     block.expanded = !block.expanded;
     conversationDirty = true;
     requestFullRedraw();
@@ -2180,6 +2183,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   composer.on('click', focusComposer);
 
   conversation.on('click', (data: { x: number; y: number }) => {
+    if (modalDepth > 0) return;
     if (hasSelection()) return;
     focusConversation();
     if (!data || data.y === undefined) return;
@@ -2199,13 +2203,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     // RenderThinkingBlock records indices in the raw `lines` array, but blessed
     // re-parses/wraps content into `_clines`. Translate via ftor so the click
     // still hits the header even when a preceding long line was wrapped.
-    const clines = (conversation as unknown as { _clines?: { ftor?: Array<unknown[]> } })._clines;
-    const renderedLine = (real: number): number => {
-      const bucket = clines?.ftor?.[real];
-      return bucket && bucket.length > 0 ? Number(bucket[0]) : real;
-    };
     for (const [turnId, pos] of thinkingBlockLines) {
-      if (row === renderedLine(pos.headerLine)) {
+      if (row === renderedConversationRow(pos.headerLine)) {
         toggleThinkingBlock(turnId);
         return;
       }
@@ -2215,6 +2214,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (latestThinkingTurnId) toggleThinkingBlock(latestThinkingTurnId);
   });
   activity.on('click', (data: { y?: number }) => {
+    if (modalDepth > 0) return;
     const list = activity as unknown as { items: blessed.Widgets.BlessedElement[]; selected: number };
     const selectedItem = list.items[list.selected];
     const bounds = selectedItem?.lpos;
@@ -2226,23 +2226,24 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   // itself; the list only sees the bubbled `element click`. Resolve the row
   // back to its agent so a click opens that agent's progress directly.
   activity.on('element click', (el: blessed.Widgets.BlessedElement) => {
+    if (modalDepth > 0) return;
     const list = activity as unknown as { items: blessed.Widgets.BlessedElement[] };
     const index = list.items.indexOf(el);
     if (index < 0) return;
     selectedActivityIndex = index;
     runAction(showActivityDetail);
   });
-  conversation.on('mousedown', focusConversation);
+  conversation.on('mousedown', () => { if (modalDepth === 0) focusConversation(); });
   conversation.on('wheelup', () => {
     selection = undefined;
-    focusConversation();
+    if (modalDepth === 0) focusConversation();
     conversationFollowOutput = false;
     conversationScrollOffset = conversation.childBase;
     refresh();
   });
   conversation.on('wheeldown', () => {
     selection = undefined;
-    focusConversation();
+    if (modalDepth === 0) focusConversation();
     conversationScrollOffset = conversation.childBase;
     conversationFollowOutput = conversationAtBottom();
     refresh();
@@ -2263,7 +2264,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!composerPinned && screen.focused !== conversation) return;
     focusConversation();
     conversation.scroll((key.name === 'pageup' ? -1 : 1) * Math.max(1, Number(conversation.height) - 2));
-    screen.render();
+    renderScreen();
   });
   screen.key(['C-x'], () => { void command('/cancel').catch((error) => { notice = String(error); refresh(); }); });
   screen.key(['tab', 'escape'], () => {
@@ -2301,7 +2302,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (motion && selection?.dragging) {
       data.action = 'mousemove';
       selection.end = { x: Math.max(selection.left, Math.min(selection.right - 1, data.x)), y: Math.max(selection.top, Math.min(selection.bottom - 1, data.y)) };
-      screen.render();
+      renderScreen();
     } else if (data.action === 'mousedown' && data.button === 'left'
       && data.x >= bounds.xi + Number(conversation.ileft) && data.x < bounds.xl - (Number(conversation.iwidth) - Number(conversation.ileft)) - 1
       && data.y >= bounds.yi && data.y < bounds.yl) {

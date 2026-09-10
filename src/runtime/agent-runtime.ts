@@ -2,8 +2,10 @@ import { createHash, randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 
 import { chatStream, type BackendConfig, type ChatChunk } from '../backend.js';
+import { FetchError } from '../fetch.js';
 import type {
   AgentEvent,
+  AgentBoardEntry,
   AgentInstance,
   AgentMailboxMessage,
   AgentModelMessage,
@@ -41,8 +43,6 @@ export interface AgentRuntimeOptions {
   maxConcurrentTurns?: number;
   maxAgentDepth?: number;
   maxChildrenPerTurn?: number;
-  /** Maximum model/tool steps per turn. Main defaults to 64, child agents to 48. */
-  maxSteps?: number;
   /** Optional AGENTS.md-style project context injected into every agent's system prompt. When omitted it is loaded from the workspace root. */
   projectContext?: string;
 }
@@ -71,6 +71,47 @@ function sessionChildren(instances: Map<string, AgentInstance>, parentId: string
 /** Tools whose success constitutes real progress (state changed on disk). */
 const PROGRESS_TOOLS = new Set(['edit_file', 'write_file']);
 
+// ── Stuck detection ──────────────────────────────────────────────────────────
+//
+// A turn no longer has a step budget: the model works until it stops calling
+// tools, the user cancels, or its context is compacted. What actually burns
+// time is spinning — repeating an action whose observation never changes, or
+// retrying the same failing call. Detection pauses the turn gracefully instead
+// of failing it, so progress and usage are preserved and the work can resume.
+
+const STUCK_REPEATED_ACTION_LIMIT = 4;
+const STUCK_REPEATED_FAILURE_LIMIT = 3;
+const STUCK_LABEL_LIMIT = 160;
+
+interface StuckTracker {
+  actions: Map<string, { count: number; label: string }>;
+  failures: Map<string, { count: number; label: string }>;
+}
+
+function createStuckTracker(): StuckTracker {
+  return { actions: new Map(), failures: new Map() };
+}
+
+function stuckCallLabel(name: string, args: Record<string, unknown>, suffix?: string): string {
+  const input = JSON.stringify(args ?? {});
+  const call = `${name}(${input.length > 120 ? `${input.slice(0, 117)}…` : input})`;
+  return suffix ? `${call} → ${suffix}` : call;
+}
+
+function describeStuck(tracker: StuckTracker): string | undefined {
+  for (const { count, label } of tracker.actions.values()) {
+    if (count >= STUCK_REPEATED_ACTION_LIMIT) {
+      return `repeated ${label} ${count} times with the same result and no progress`;
+    }
+  }
+  for (const { count, label } of tracker.failures.values()) {
+    if (count >= STUCK_REPEATED_FAILURE_LIMIT) {
+      return `the same failure repeated ${count} times: ${label}`;
+    }
+  }
+  return undefined;
+}
+
 // ── Context compaction ───────────────────────────────────────────────────────
 
 const COMPACT_SYSTEM_PROMPT = 'You are a context compaction assistant. Produce a faithful, information-dense digest of the archived conversation so a coding agent can continue the work without the original messages. Never invent facts; keep file paths, ids, decisions, and pending work exact.';
@@ -79,6 +120,24 @@ const COMPACT_MIN_ARCHIVED_MESSAGES = 6;
 const AUTO_COMPACT_MIN_MESSAGES = 12;
 const DEFAULT_AUTO_COMPACT_RATIO = 0.75;
 const SUMMARY_MESSAGE_SNIPPET_LIMIT = 4000;
+/** Assumed characters per token when estimating the context budget. */
+const CHARS_PER_TOKEN = 4;
+/** Fraction of the model context window maw is willing to fill per request. */
+const CONTEXT_BUDGET_RATIO = 0.72;
+/** Cap for a single tool result entering model context (chars). */
+const DEFAULT_TOOL_RESULT_MAX_CHARS = 24_000;
+/** Cap for the re-anchored original request when trimming drops it. */
+const TASK_ANCHOR_MAX_CHARS = 4000;
+/** Retries for a model stream that fails before emitting any output. */
+const STREAM_RETRY_LIMIT = 2;
+
+function isRetriableStreamError(error: unknown): boolean {
+  if (error instanceof FetchError) return error.retriable;
+  const message = error instanceof Error ? error.message : String(error);
+  return /(429|rate.?limit|overloaded|timeout|timed out|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|socket hang up|fetch failed|502|503|504)/i.test(message);
+}
+
+const waitMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 function messageSize(message: AgentModelMessage): number {
   return String(message.content ?? '').length
@@ -113,7 +172,13 @@ function cloneInstance(instance: AgentInstance): AgentInstance {
 }
 
 function cloneSession(session: AgentSession): AgentSession {
-  return { ...session, timeline: session.timeline?.map(entry => ({ ...entry })), messages: session.messages.map((message) => ({ ...message })), instanceIds: [...session.instanceIds] };
+  return {
+    ...session,
+    board: session.board?.map((entry) => ({ ...entry })),
+    timeline: session.timeline?.map(entry => ({ ...entry })),
+    messages: session.messages.map((message) => ({ ...message })),
+    instanceIds: [...session.instanceIds],
+  };
 }
 
 function parseStringList(value: unknown): string[] {
@@ -167,6 +232,49 @@ const COMPACT_TOOL_DEFINITIONS: ToolDefinition[] = [
   }, ['query']),
 ];
 
+// ── Session board (scratchpad) ───────────────────────────────────────────────
+
+const BOARD_ENTRY_MAX_CHARS = 2000;
+const BOARD_PROMPT_MAX_CHARS = 4000;
+const BOARD_MAX_ENTRIES = 50;
+const BOARD_MAX_CHARS = 12_000;
+
+const BOARD_TOOL_DEFINITIONS: ToolDefinition[] = [
+  toolDefinition('board', `Read or update the session scratchpad (shared by every agent in this session). Use it for the plan, todos, decisions, risks, and caveats. It is injected into every prompt and survives context compaction, so keep it current and concise. Capacity: at most ${BOARD_MAX_ENTRIES} entries and ~${BOARD_MAX_CHARS} characters total; prune or remove finished items instead of letting the board fill up.`, {
+    action: { type: 'string', description: 'One of: read, add, update, remove, prune, clear. prune removes all done entries.' },
+    id: { type: 'string', description: 'Entry id, for update or remove.' },
+    text: { type: 'string', description: 'Entry text for add, or the new text for update.' },
+    kind: { type: 'string', description: 'Optional: note, todo, risk, or decision.' },
+    status: { type: 'string', description: 'Optional: open or done. Todos default to open.' },
+  }, ['action']),
+];
+
+function boardEntryLine(entry: AgentBoardEntry): string {
+  const tags = [entry.kind, entry.status].filter(Boolean).join('/');
+  return `- [${entry.id}]${tags ? ` (${tags})` : ''} ${entry.text}`;
+}
+
+function formatBoard(board: AgentBoardEntry[]): string {
+  if (!board.length) return 'The session board is empty.';
+  return board.map(boardEntryLine).join('\n');
+}
+
+/** Compact digest injected into prompts: open items first, then recent notes,
+ * capped so a busy board can never crowd out the actual request. */
+function boardDigest(board: AgentBoardEntry[], maxChars = BOARD_PROMPT_MAX_CHARS): string {
+  const ordered = [...board].sort((a, b) => Number(a.status === 'done') - Number(b.status === 'done') || b.updatedAt.localeCompare(a.updatedAt));
+  const kept: string[] = [];
+  let total = 0;
+  for (const entry of ordered) {
+    const line = boardEntryLine(entry);
+    if (total + line.length > maxChars) break;
+    kept.push(line);
+    total += line.length + 1;
+  }
+  if (kept.length < board.length) kept.push(`… ${board.length - kept.length} more entries; use the board tool to read them.`);
+  return kept.join('\n');
+}
+
 export class AgentRuntime {
   readonly registry: AgentRegistry;
   private readonly store: AgentRuntimeStore;
@@ -176,10 +284,8 @@ export class AgentRuntime {
   private readonly maxConcurrentTurns: number;
   private readonly maxAgentDepth: number;
   private readonly maxChildrenPerTurn: number;
-  private readonly maxSteps?: number;
   private projectContext?: string;
   private readonly readVersions = new Map<string, Map<string, string>>();
-  private readonly failureCounts = new Map<string, Map<string, number>>();
   private defaultModel?: string;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly instances = new Map<string, AgentInstance>();
@@ -214,7 +320,6 @@ export class AgentRuntime {
     this.maxConcurrentTurns = Math.max(1, options.maxConcurrentTurns ?? Number(process.env.AGENT_MAX_CONCURRENT_TURNS ?? 4));
     this.maxAgentDepth = Math.max(1, options.maxAgentDepth ?? Number(process.env.AGENT_MAX_DEPTH ?? 4));
     this.maxChildrenPerTurn = Math.max(1, options.maxChildrenPerTurn ?? Number(process.env.AGENT_MAX_CHILDREN_PER_TURN ?? 3));
-    this.maxSteps = options.maxSteps;
     const contextPromise = options.projectContext !== undefined
       ? Promise.resolve(options.projectContext)
       : loadWorkspaceContext(this.workspaceRoot);
@@ -289,7 +394,6 @@ export class AgentRuntime {
     this.registry.setProjectDir(target);
     this.projectContext = await loadWorkspaceContext(target);
     this.readVersions.clear();
-    this.failureCounts.clear();
     try {
       await this.registry.load();
       this.validateSpecs();
@@ -850,6 +954,7 @@ export class AgentRuntime {
       '- Decide your own next step from your spec, messages, tools, and available agent catalog.',
       '- Do not invent agent ids. Agent calls outside the catalog are rejected.',
       '- Keep agent messages self-contained because child agents do not receive your full conversation.',
+      '- When delegating, give one concrete objective with relevant paths, constraints, and acceptance checks. When reporting back, lead with status, files changed, evidence, blockers, and the recommended next step; keep it short.',
       instance.parentInstanceId
         ? '- Your output is private to the parent agent. Report concise progress and results; never address the end user directly.'
         : '- You are the session entry instance. Your natural-language output is shown directly to the user.',
@@ -857,6 +962,8 @@ export class AgentRuntime {
         ? `Available agents:\n${catalog.map((agent) => `- ${agent.id}: ${agent.description}`).join('\n')}`
         : 'Available agents: none.',
       'Existing instances are communicated through mailbox messages. Reuse an existing related agent when possible; do not spawn duplicates.',
+      '- Maintain the shared session board (board tool): keep the plan, open todos, decisions and their reasons, risks, and hard-won facts there. Mark todos done as they complete and keep entries short and concrete, because the board survives compaction while raw conversation does not. The board is deliberately small (a few dozen entries), so fold related notes together and prune finished ones instead of letting it fill up. Never use it as a log for raw output.',
+      ...(session?.board?.length ? ['', 'Shared session board (scratchpad; injected every turn):', boardDigest(session.board)] : []),
     ].join('\n');
   }
 
@@ -870,12 +977,14 @@ export class AgentRuntime {
     if (spec.agents.length > 0 && this.registry.allowedAgents(spec).length > 0) {
       tools.push(...AGENT_TOOL_DEFINITIONS);
     }
-    tools.push(...COMPACT_TOOL_DEFINITIONS);
+    tools.push(...COMPACT_TOOL_DEFINITIONS, ...BOARD_TOOL_DEFINITIONS);
     return tools;
   }
 
   private trimMessages(messages: AgentModelMessage[], config: BackendConfig): AgentModelMessage[] {
-    const budgetChars = this.contextBudgetChars(config);
+    // Reserve room for the task anchor below so re-anchoring cannot push the
+    // request past the budget it was just trimmed to fit.
+    const budgetChars = Math.max(4_000, this.contextBudgetChars(config) - TASK_ANCHOR_MAX_CHARS - 200);
     let total = 0;
     const kept: AgentModelMessage[] = [];
     for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -887,11 +996,30 @@ export class AgentRuntime {
     }
     // Tool results must never be sent without their assistant tool-call message.
     while (kept[0]?.role === 'tool') kept.shift();
+    // Trimming must not erase the task itself: when the oldest user message was
+    // dropped, re-anchor the original request at the top of the request.
+    const firstUser = messages.find((message) => message.role === 'user' && String(message.content ?? '').trim());
+    if (firstUser && kept[0] !== firstUser) {
+      const anchor = String(firstUser.content).trim().slice(0, TASK_ANCHOR_MAX_CHARS);
+      kept.unshift({ role: 'user', content: `[Earlier conversation elided to fit the context window. The original request was:]\n${anchor}` });
+    }
     return kept;
   }
 
+  /** Bound a tool result before it enters model context: one huge output must
+   * not evict the rest of the conversation, and the marker tells the model how
+   * to read the rest on purpose. */
+  private boundToolResult(output: string, config: BackendConfig): string {
+    const configured = Number(process.env.AGENT_TOOL_RESULT_MAX_CHARS ?? DEFAULT_TOOL_RESULT_MAX_CHARS);
+    const max = Number.isFinite(configured) && configured > 0 ? configured : DEFAULT_TOOL_RESULT_MAX_CHARS;
+    if (output.length <= max) return output;
+    const head = Math.floor(max * 0.6);
+    const tail = max - head;
+    return `${output.slice(0, head)}\n\n… [tool result truncated: ${output.length} characters total. Re-run the tool with a narrower scope (offset/limit/filters) to read the rest.]\n\n${output.slice(-tail)}`;
+  }
+
   private contextBudgetChars(config: BackendConfig): number {
-    return Math.max(16_000, Math.floor((config.contextWindow ?? 131_072) * 4 * 0.72));
+    return Math.max(16_000, Math.floor((config.contextWindow ?? 131_072) * CHARS_PER_TOKEN * CONTEXT_BUDGET_RATIO));
   }
 
   private shouldAutoCompact(messages: AgentModelMessage[], config: BackendConfig): boolean {
@@ -1055,23 +1183,27 @@ export class AgentRuntime {
     instance.activeTurnId = turnId;
     instance.status = 'running';
     instance.updatedAt = now();
-    this.failureCounts.delete(instance.instanceId);
     this.controllers.set(instance.instanceId, controller);
     this.absorbMailbox(instance);
     this.emit({ type: 'instance_updated', instance: cloneInstance(instance) });
     await this.persistSession(instance.sessionId);
 
+    // Declared outside the try so a failed turn still persists usage, partial
+    // output, and timing instead of discarding the work it already paid for.
+    const turnStartedAt = Date.now();
+    let finalOutput = '';
+    let turnUsage: ModelUsage | undefined;
+    let firstTokenMs: number | undefined;
+    let requestCount = 0;
     try {
       const config = { ...this.resolveModel(spec.model ?? session.defaultModel ?? this.defaultModel), sessionId: session.sessionId };
       if (!config.model) throw new Error('No model configured. Use /provider or /model first.');
       const tools = this.toolsFor(instance, spec);
-      let finalOutput = '';
-      const turnStartedAt = Date.now();
-      let turnUsage: ModelUsage | undefined;
-      let firstTokenMs: number | undefined;
-      let requestCount = 0;
-      const stepLimit = Math.max(1, this.maxSteps ?? (instance.parentInstanceId ? 48 : 64));
-      for (let step = 0; step < stepLimit; step += 1) {
+      const tracker = createStuckTracker();
+      let stuckReason: string | undefined;
+      // No step budget: the turn runs until the model stops calling tools, the
+      // user cancels, or stuck detection pauses it with a summary.
+      for (;;) {
         if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
         if (instance.pendingCompact || this.shouldAutoCompact(instance.messages, config)) {
           const reason = instance.pendingCompact?.reason ?? 'auto';
@@ -1084,28 +1216,41 @@ export class AgentRuntime {
           } catch { /* Compaction is best-effort; trimMessages remains the fallback. */ }
         }
         const messages = this.trimMessages(instance.messages, config);
-        requestCount += 1;
         let text = '';
         let thinking = '';
         const responseItems: Record<string, unknown>[] = [];
         const calls: NonNullable<AgentModelMessage['tool_calls']> = [];
-        for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), messages, tools, controller.signal)) {
-          if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
-          if (chunk.responseItems) responseItems.push(...chunk.responseItems);
-          if (chunk.thinking) {
-            thinking += chunk.thinking;
-            this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
-          }
-          if (chunk.content) {
-            if (firstTokenMs === undefined) firstTokenMs = Date.now() - turnStartedAt;
-            text += chunk.content;
-            finalOutput += chunk.content;
-            if (!instance.parentInstanceId) {
-              this.emit({ type: 'assistant_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.content });
+        // A stream that dies before emitting anything is safe to retry: the
+        // provider never saw a partial assistant turn, so nothing duplicates.
+        for (let attempt = 0; ; attempt += 1) {
+          requestCount += 1;
+          this.emit({ type: 'turn_progress', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, step: requestCount });
+          try {
+            for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), messages, tools, controller.signal)) {
+              if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
+              if (chunk.responseItems) responseItems.push(...chunk.responseItems);
+              if (chunk.thinking) {
+                thinking += chunk.thinking;
+                this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
+              }
+              if (chunk.content) {
+                if (firstTokenMs === undefined) firstTokenMs = Date.now() - turnStartedAt;
+                text += chunk.content;
+                finalOutput += chunk.content;
+                if (!instance.parentInstanceId) {
+                  this.emit({ type: 'assistant_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.content });
+                }
+              }
+              if (chunk.usage) turnUsage = mergeUsage(turnUsage, chunk.usage);
+              if (chunk.toolCalls?.length) calls.push(...chunk.toolCalls);
             }
+            break;
+          } catch (error) {
+            if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
+            const emitted = text.length > 0 || thinking.length > 0 || calls.length > 0 || responseItems.length > 0;
+            if (emitted || attempt >= STREAM_RETRY_LIMIT || !isRetriableStreamError(error)) throw error;
+            await waitMs(500 * (attempt + 1));
           }
-          if (chunk.usage) turnUsage = mergeUsage(turnUsage, chunk.usage);
-          if (chunk.toolCalls?.length) calls.push(...chunk.toolCalls);
         }
         instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });
         if (text.trim() && !instance.parentInstanceId) {
@@ -1121,7 +1266,7 @@ export class AgentRuntime {
           this.emit({ type: 'tool_started', instanceId: instance.instanceId, turnId, tool: call.function.name, input });
           const output = await this.executeAgentTool(instance, call.function.name, args, controller.signal);
           if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
-          instance.messages.push({ role: 'tool', content: output, tool_use_id: call.id });
+          instance.messages.push({ role: 'tool', content: this.boundToolResult(output, config), tool_use_id: call.id });
           this.emit({ type: 'tool_finished', instanceId: instance.instanceId, turnId, tool: call.function.name, output });
           const fingerprint = createHash('sha256')
             .update(call.function.name)
@@ -1135,19 +1280,24 @@ export class AgentRuntime {
             // Progress, not recency, resets the failure chain: counts are kept
             // per fingerprint, so interleaved successful reads (which prove
             // nothing changed) cannot launder a repeating failure.
-            const counts = this.failureCounts.get(instance.instanceId) ?? new Map<string, number>();
-            const repeats = (counts.get(fingerprint) ?? 0) + 1;
-            counts.set(fingerprint, repeats);
-            this.failureCounts.set(instance.instanceId, counts);
-            if (repeats >= 3) {
-              throw new Error(`Doom loop detected: ${call.function.name} produced the same failure ${repeats} times without progress. Change approach or inspect the diagnostic before retrying.`);
-            }
+            const entry = tracker.failures.get(fingerprint)
+              ?? { count: 0, label: stuckCallLabel(call.function.name, args, output.replace(/\s+/g, ' ').slice(0, STUCK_LABEL_LIMIT)) };
+            entry.count += 1;
+            tracker.failures.set(fingerprint, entry);
           } else if (PROGRESS_TOOLS.has(call.function.name)) {
             // Only a state-changing success (an actual write) counts as
-            // progress; read-only successes leave the failure chain intact.
-            this.failureCounts.delete(instance.instanceId);
+            // progress; read-only successes leave both chains intact.
+            tracker.actions.clear();
+            tracker.failures.clear();
+          } else {
+            const entry = tracker.actions.get(fingerprint)
+              ?? { count: 0, label: stuckCallLabel(call.function.name, args) };
+            entry.count += 1;
+            tracker.actions.set(fingerprint, entry);
           }
         }
+        stuckReason = describeStuck(tracker);
+        if (stuckReason) break;
         if (instance.pendingCompact && !controller.signal.aborted && instance.activeTurnId === turnId) {
           try {
             await this.compactInstanceMessages(instance, config, {
@@ -1157,7 +1307,33 @@ export class AgentRuntime {
             }, controller.signal);
           } catch { /* Compaction is best-effort. */ }
         }
-        if (step === stepLimit - 1) throw new Error(`Agent reached the ${stepLimit}-step safety limit. Review the activity and send a follow-up to continue.`);
+      }
+      if (stuckReason && !controller.signal.aborted && instance.activeTurnId === turnId) {
+        // A stuck loop is a pause, not a failure: give the model one tool-free
+        // request to summarize progress so the work can resume with context.
+        this.emit({
+          type: 'system_message',
+          sessionId: session.sessionId,
+          message: {
+            messageId: randomUUID(),
+            role: 'system',
+            content: `${instance.parentInstanceId ? `${instance.agentId} run paused` : 'Run paused'} to avoid a stuck loop: ${stuckReason}.`,
+            createdAt: now(),
+          },
+        });
+        requestCount += 1;
+        this.emit({ type: 'turn_progress', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, step: requestCount });
+        const wrapUp = await this.wrapUpStuckTurn(instance, spec, config, stuckReason, controller.signal, turnId);
+        if (wrapUp.text) {
+          finalOutput += wrapUp.text;
+          if (!instance.parentInstanceId) {
+            const visible: SessionMessage = { messageId: randomUUID(), role: 'assistant', content: wrapUp.text, createdAt: now(), turnId, ...(wrapUp.thinking ? { thinking: wrapUp.thinking } : {}) };
+            session.messages.push(visible);
+            session.updatedAt = visible.createdAt;
+            this.emit({ type: 'assistant_message', sessionId: session.sessionId, instanceId: instance.instanceId, message: { ...visible } });
+          }
+        }
+        if (wrapUp.usage) turnUsage = mergeUsage(turnUsage, wrapUp.usage);
       }
       if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
       instance.lastOutput = finalOutput.trim() || instance.lastOutput;
@@ -1177,6 +1353,11 @@ export class AgentRuntime {
       }
     } catch (error) {
       if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
+      // Preserve what the failed turn already produced: partial prose, usage,
+      // and timing are real work the user paid for and the next turn builds on.
+      if (finalOutput.trim()) instance.lastOutput = finalOutput.trim();
+      instance.usage = mergeAgentUsage(instance.usage, turnUsage, firstTokenMs, Date.now() - turnStartedAt, requestCount);
+      instance.lastTurn = { startedAt: new Date(turnStartedAt).toISOString(), endedAt: now(), durationMs: Date.now() - turnStartedAt, usage: turnUsage };
       instance.status = 'failed';
       instance.lastError = error instanceof Error ? error.message : String(error);
       instance.activeTurnId = undefined;
@@ -1208,6 +1389,49 @@ export class AgentRuntime {
     }
   }
 
+  /**
+   * Turn a stuck loop into a resumable pause instead of a failure. The model
+   * gets one tool-free request to summarize progress; whatever it produces (or
+   * a deterministic fallback when the request fails) ends the turn with status
+   * idle, so usage and lastOutput survive and a follow-up can continue.
+   */
+  private async wrapUpStuckTurn(
+    instance: AgentInstance,
+    spec: AgentSpec,
+    config: BackendConfig,
+    reason: string,
+    signal: AbortSignal,
+    turnId: string,
+  ): Promise<{ text: string; thinking?: string; usage?: ModelUsage }> {
+    instance.messages.push({
+      role: 'user',
+      content: [
+        `System notice: the run was paused to avoid a stuck loop: ${reason}.`,
+        'Do not call tools. In a short summary, state (1) what you completed, (2) what you verified, and (3) the exact next step so the work can resume.',
+      ].join('\n'),
+    });
+    let text = '';
+    let thinking = '';
+    let usage: ModelUsage | undefined;
+    try {
+      for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), this.trimMessages(instance.messages, config), [], signal)) {
+        if (signal.aborted || instance.activeTurnId !== turnId) return { text: '', usage };
+        if (chunk.thinking) {
+          thinking += chunk.thinking;
+          this.emit({ type: 'thinking_delta', sessionId: instance.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
+        }
+        if (chunk.content) text += chunk.content;
+        if (chunk.usage) usage = mergeUsage(usage, chunk.usage);
+      }
+    } catch {
+      // The pause must survive a failed summary request; the fallback below
+      // still tells the user why the turn stopped.
+    }
+    text = text.trim() || `Run paused: ${reason}. Send a follow-up to continue.`;
+    instance.messages.push({ role: 'assistant', content: text });
+    return { text, thinking: thinking || undefined, usage };
+  }
+
   private async executeAgentTool(instance: AgentInstance, name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<string> {
     try {
       if (name === 'spawn_agent') {
@@ -1226,6 +1450,9 @@ export class AgentRuntime {
       }
       if (name === 'compact_context') {
         return await this.handleCompactContextTool(instance, args);
+      }
+      if (name === 'board') {
+        return await this.handleBoardTool(instance, args);
       }
       if (name === 'search_history') {
         const targetId = typeof args.instance_id === 'string' && args.instance_id.trim() ? args.instance_id.trim() : instance.instanceId;
@@ -1278,6 +1505,131 @@ export class AgentRuntime {
     }
     const result = await this.compactInstanceMessages(target, this.resolveConfigFor(target), { focus, keepRecent, reason: 'manual' });
     return result.detail;
+  }
+
+  // ── Session board ─────────────────────────────────────────────────────────
+
+  /** Read (cloned) board entries; safe for UI display. */
+  async boardEntries(sessionId: string): Promise<AgentBoardEntry[]> {
+    await this.openSession(sessionId);
+    return (this.sessions.get(sessionId)?.board ?? []).map((entry) => ({ ...entry }));
+  }
+
+  /** Add an entry from outside an agent turn (TUI /board add). */
+  async addBoardEntry(sessionId: string, text: string, options: { kind?: AgentBoardEntry['kind']; status?: AgentBoardEntry['status'] } = {}): Promise<AgentBoardEntry> {
+    const trimmed = text.trim();
+    if (!trimmed) throw new Error('Board entry cannot be empty');
+    await this.requireSessionWrite(sessionId);
+    const session = this.sessions.get(sessionId)!;
+    const board = session.board ?? (session.board = []);
+    const entryText = trimmed.slice(0, BOARD_ENTRY_MAX_CHARS);
+    if (board.length >= BOARD_MAX_ENTRIES) {
+      throw new Error(`Board is full (${board.length}/${BOARD_MAX_ENTRIES} entries). Prune or clear it first.`);
+    }
+    if (board.reduce((sum, entry) => sum + entry.text.length, 0) + entryText.length > BOARD_MAX_CHARS) {
+      throw new Error(`Board is full (~${BOARD_MAX_CHARS} characters). Prune or clear it first.`);
+    }
+    const entry: AgentBoardEntry = {
+      id: randomUUID().slice(0, 8),
+      text: entryText,
+      ...(options.kind ? { kind: options.kind } : {}),
+      ...(options.status ? { status: options.status } : {}),
+      updatedAt: now(),
+    };
+    board.push(entry);
+    await this.persistBoard(session);
+    return { ...entry };
+  }
+
+  /** Clear the board (TUI /board clear). Returns how many entries were removed. */
+  async clearBoard(sessionId: string): Promise<number> {
+    await this.requireSessionWrite(sessionId);
+    const session = this.sessions.get(sessionId)!;
+    const count = session.board?.length ?? 0;
+    session.board = [];
+    await this.persistBoard(session);
+    return count;
+  }
+
+  private async handleBoardTool(instance: AgentInstance, args: Record<string, unknown>): Promise<string> {
+    const session = this.sessions.get(instance.sessionId)!;
+    const action = (typeof args.action === 'string' && args.action.trim() ? args.action.trim() : 'read').toLowerCase();
+    const id = typeof args.id === 'string' ? args.id.trim() : '';
+    const text = typeof args.text === 'string' ? args.text.trim() : '';
+    const kind = args.kind === 'note' || args.kind === 'todo' || args.kind === 'risk' || args.kind === 'decision' ? args.kind : undefined;
+    const status = args.status === 'done' ? 'done' as const : args.status === 'open' ? 'open' as const : undefined;
+    const board = session.board ?? (session.board = []);
+    const missing = (): string => `Error: no board entry with id ${id || '(missing)'}. Current ids: ${board.map((entry) => entry.id).join(', ') || '(none)'}.`;
+    const totalChars = (): number => board.reduce((sum, entry) => sum + entry.text.length, 0);
+    const full = (extra: number): string | undefined => {
+      if (board.length >= BOARD_MAX_ENTRIES) {
+        return `Board is full (${board.length}/${BOARD_MAX_ENTRIES} entries). Remove or prune finished entries, fold related notes together, or clear the board before adding more.`;
+      }
+      if (totalChars() + extra > BOARD_MAX_CHARS) {
+        return `Board is full (~${totalChars()} / ${BOARD_MAX_CHARS} characters). Prune done entries, tighten existing notes, or clear the board before adding more.`;
+      }
+      return undefined;
+    };
+    if (action === 'read') return formatBoard(board);
+    if (action === 'add') {
+      if (!text) return 'Error: board add requires text.';
+      const entryText = text.slice(0, BOARD_ENTRY_MAX_CHARS);
+      const blocked = full(entryText.length);
+      if (blocked) return blocked;
+      const resolvedStatus = status ?? (kind === 'todo' ? 'open' as const : undefined);
+      const entry: AgentBoardEntry = {
+        id: randomUUID().slice(0, 8),
+        text: entryText,
+        ...(kind ? { kind } : {}),
+        ...(resolvedStatus ? { status: resolvedStatus } : {}),
+        authorInstanceId: instance.instanceId,
+        updatedAt: now(),
+      };
+      board.push(entry);
+      await this.persistBoard(session);
+      return `Board entry ${entry.id} added.`;
+    }
+    if (action === 'update') {
+      const entry = board.find((item) => item.id === id);
+      if (!entry) return missing();
+      if (text) {
+        const entryText = text.slice(0, BOARD_ENTRY_MAX_CHARS);
+        const blocked = full(entryText.length - entry.text.length);
+        if (blocked) return blocked;
+        entry.text = entryText;
+      }
+      if (kind) entry.kind = kind;
+      if (status) entry.status = status;
+      entry.updatedAt = now();
+      await this.persistBoard(session);
+      return `Board entry ${entry.id} updated.`;
+    }
+    if (action === 'remove') {
+      const index = board.findIndex((item) => item.id === id);
+      if (index < 0) return missing();
+      board.splice(index, 1);
+      await this.persistBoard(session);
+      return `Board entry ${id} removed.`;
+    }
+    if (action === 'prune') {
+      const done = board.filter((entry) => entry.status === 'done');
+      if (!done.length) return 'No done entries to prune.';
+      session.board = board.filter((entry) => entry.status !== 'done');
+      await this.persistBoard(session);
+      return `Pruned ${done.length} done ${done.length === 1 ? 'entry' : 'entries'}: ${done.map((entry) => entry.id).join(', ')}.`;
+    }
+    if (action === 'clear') {
+      const count = board.length;
+      session.board = [];
+      await this.persistBoard(session);
+      return `Board cleared (${count} ${count === 1 ? 'entry' : 'entries'} removed).`;
+    }
+    return `Error: unknown board action "${action}". Use read, add, update, remove, prune, or clear.`;
+  }
+
+  private async persistBoard(session: AgentSession): Promise<void> {
+    session.updatedAt = now();
+    await this.persistSession(session.sessionId);
   }
 
   private async persistSession(sessionId: string): Promise<void> {

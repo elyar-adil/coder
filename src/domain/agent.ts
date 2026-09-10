@@ -91,6 +91,18 @@ export interface SessionMessage {
   turnId?: string;
 }
 
+/** One item on a session's shared scratchpad ("board"). Free-form text with
+ * optional todo semantics so plans, notes, risks, and decisions can live in
+ * one place that survives context compaction. */
+export interface AgentBoardEntry {
+  id: string;
+  text: string;
+  kind?: 'note' | 'todo' | 'risk' | 'decision';
+  status?: 'open' | 'done';
+  authorInstanceId?: string;
+  updatedAt: string;
+}
+
 export interface AgentSession {
   timeline?: SessionTimelineEntry[];
   sessionId: string;
@@ -98,6 +110,8 @@ export interface AgentSession {
   defaultModel?: string;
   /** Standing directive injected into every agent prompt of this session until cleared (/goal). */
   goal?: string;
+  /** Shared session scratchpad, injected into every agent prompt and persisted with the session. */
+  board?: AgentBoardEntry[];
   messages: SessionMessage[];
   instanceIds: string[];
   createdAt: string;
@@ -135,6 +149,8 @@ export type AgentEvent =
   | { type: 'user_message'; sessionId: string; message: SessionMessage }
   | { type: 'assistant_delta'; sessionId: string; instanceId: string; turnId: string; text: string }
   | { type: 'assistant_message'; sessionId: string; instanceId: string; message: SessionMessage }
+  /** Live model-request count for the running turn; informational only, there is no step budget. */
+  | { type: 'turn_progress'; sessionId: string; instanceId: string; turnId: string; step: number }
   | { type: 'system_message'; sessionId: string; message: SessionMessage }
   | { type: 'instance_created'; instance: AgentInstance }
   | { type: 'instance_updated'; instance: AgentInstance }

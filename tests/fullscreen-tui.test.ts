@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { PassThrough } from 'node:stream';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import blessed from 'blessed';
@@ -10,14 +10,21 @@ import { AgentRuntimeStore } from '../src/runtime/agent-store.js';
 import { runFullscreenTui } from '../src/ui/fullscreen-tui.js';
 import type { AgentConfig } from '../src/config.js';
 
-type TestStream = Generator<{ content: string | null; thinking?: string; done: boolean }> | AsyncGenerator<{ content: string | null; thinking?: string; done: boolean }>;
+type TestChunk = {
+  content: string | null;
+  thinking?: string | null;
+  done: boolean;
+  toolCalls?: Array<{ id: string; function: { name: string; arguments: Record<string, unknown> } }>;
+};
+type TestStream = Generator<TestChunk> | AsyncGenerator<TestChunk>;
 
 const tick = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 const wait = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function startTui(options: {
-  modelStream: () => TestStream;
+  modelStream: (...args: unknown[]) => TestStream;
   config?: AgentConfig;
+  workspaceRoot?: string;
 }): Promise<{
   screen: blessed.Widgets.Screen;
   input: PassThrough & { isTTY: boolean; setRawMode: () => void };
@@ -40,8 +47,9 @@ async function startTui(options: {
   }) as typeof blessed.screen;
   const runtime = new AgentRuntime({
     store: new AgentRuntimeStore(root),
+    ...(options.workspaceRoot ? { workspaceRoot: options.workspaceRoot } : {}),
     resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
-    modelStream: options.modelStream,
+    modelStream: options.modelStream as never,
   });
   let config = options.config ?? {};
   const savedConfigs: AgentConfig[] = [];
@@ -151,7 +159,7 @@ test('a pinned Thought header keeps its elapsed seconds ticking while the turn r
     await mouse(0, 3, thinkingRow);
     await mouse(0, 3, thinkingRow, true);
     // Scroll until the block header is pinned at the conversation top.
-    const pinnedRow = (): string | undefined => visibleRows()[0].includes('▼') ? visibleRows()[0] : undefined;
+    const pinnedRow = (): string | undefined => visibleRows()[0].includes('▾') ? visibleRows()[0] : undefined;
     for (let attempt = 0; attempt < 60 && !pinnedRow(); attempt++) await mouse(65, 3, 5);
     const pinned = pinnedRow();
     assert.ok(pinned, 'the active block header must pin at the conversation top');
@@ -226,7 +234,7 @@ test('a pinned header survives wrapped long lines and never pins a collapsed blo
     for (let attempt = 0; attempt < 200 && !(await answerVisible()); attempt++) {
       await mouse(65, 3, 5);
       assert.ok(
-        visibleRows().some((row) => row.includes('▼')),
+        visibleRows().some((row) => row.includes('▾')),
         `the block header or pinned row must stay visible at childBase=${conversation.childBase}`,
       );
     }
@@ -235,13 +243,13 @@ test('a pinned header survives wrapped long lines and never pins a collapsed blo
     // the viewport may never scroll past its tail; the pinned row legitimately
     // persists at the bottom limit and must still collapse the block on click.
     for (let attempt = 0; attempt < 30; attempt++) await mouse(65, 3, 5);
-    assert.ok(visibleRows()[0].includes('▼'), 'the pinned row persists while the expanded block still owns the viewport top');
+    assert.ok(visibleRows()[0].includes('▾'), 'the pinned row persists while the expanded block still owns the viewport top');
     await mouse(0, 3, 0);
     await mouse(0, 3, 0, true);
     assert.doesNotMatch(conversation.getContent(), /Long reasoning/, 'clicking the pinned row collapses the wrapped block');
     for (let attempt = 0; attempt < 20; attempt++) await wait(10);
     // The collapsed second block must never get a pinned header.
-    for (let attempt = 0; attempt < 200 && visibleRows().some((row) => row.includes('▶ Thought')); attempt++) await mouse(65, 3, 5);
+    for (let attempt = 0; attempt < 200 && visibleRows().some((row) => row.includes('▸ Thought')); attempt++) await mouse(65, 3, 5);
     assert.ok(!visibleRows()[0].includes('Thought'), 'a collapsed block must not produce a pinned header');
     assert.ok(visibleRows().some((row) => row.includes('Second answer')), `the second answer must remain reachable: ${JSON.stringify(visibleRows())}`);
   } finally {
@@ -870,11 +878,11 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
       await mouse(65, 3, 5);
     }
     assert.ok(await headerGone(), 'the scenario must scroll the block header off the top of the viewport');
-    assert.ok(visibleRows()[0].includes('▼'), 'the collapsed-state arrow must stay reachable at the conversation top');
+    assert.ok(visibleRows()[0].includes('▾'), 'the collapsed-state arrow must stay reachable at the conversation top');
     assert.ok(visibleRows()[0].includes('Thought'), 'the pinned row must identify the block');
     // A completed block's icon doubles as the toggle glyph; rendering both
-    // produced a double ▼ (or ▶) on the pinned row.
-    const pinnedArrows = (visibleRows()[0].match(/[▼▶]/g) ?? []).length;
+    // produced a double ▾ (or ▸) on the pinned row.
+    const pinnedArrows = (visibleRows()[0].match(/[▾▸]/g) ?? []).length;
     assert.equal(pinnedArrows, 1, `the pinned row must render exactly one toggle arrow, got: ${JSON.stringify(visibleRows()[0])}`);
     // The pinned row must still collapse the block; afterwards the sticky row
     // disappears because the header row is back inside the viewport.
@@ -882,12 +890,15 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
     await mouse(0, 3, 0, true);
     assert.doesNotMatch(conversation.getContent(), /Reasoning paragraph line 0/, 'clicking the pinned row collapses the block');
     for (let attempt = 0; attempt < 20; attempt++) await wait(10);
-    assert.ok(!visibleRows().some((row) => row.includes('Thought') && row.includes('▼')), 'the pinned row must vanish once the header is visible again');
+    assert.ok(!visibleRows().some((row) => row.includes('Thought') && row.includes('▾')), 'the pinned row must vanish once the header is visible again');
+    // The collapsed header must replace the pinned overlay at the viewport
+    // top instead of the viewport jumping to some other offset.
+    assert.match(visibleRows()[0], /▸\s*Thought/, `the collapsed header must land where the pinned row was, got: ${JSON.stringify(visibleRows().slice(0, 3))}`);
     // Once the real (in-stream) header is visible again it must not double the
     // glyph either: the completed block's status icon reuses the toggle shape.
     const realHeaderRow = visibleRows().find((row) => row.includes('Thought'));
     assert.ok(realHeaderRow, 'the collapsed Thought header must be visible after the pinned row clears');
-    const headerArrows = (realHeaderRow.match(/[▼▶]/g) ?? []).length;
+    const headerArrows = (realHeaderRow.match(/[▾▸]/g) ?? []).length;
     assert.equal(headerArrows, 1, `the real header row must render exactly one toggle arrow, got: ${JSON.stringify(realHeaderRow)}`);
     // Expanding again and scrolling the whole block (header + body) past the
     // viewport top hides the pinned row even though later content follows.
@@ -896,7 +907,7 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
     await mouse(0, 3, thoughtRow);
     await mouse(0, 3, thoughtRow, true);
     const answerVisible = (): boolean => visibleRows().some((row) => row.includes('Answer text.'));
-    const stickyVisible = (): boolean => visibleRows().some((row) => row.includes('Thought') && row.includes('▼'));
+    const stickyVisible = (): boolean => visibleRows().some((row) => row.includes('Thought') && row.includes('▾'));
     for (let attempt = 0; attempt < 120 && !(await answerVisible()); attempt++) await mouse(65, 3, 5);
     assert.ok(await answerVisible(), 'the scenario must scroll down to the answer');
     for (let attempt = 0; attempt < 120 && (await stickyVisible()); attempt++) await mouse(65, 3, 5);
@@ -907,8 +918,120 @@ test('an expanded Thought keeps a collapsible header pinned at the conversation 
   }
 });
 
-test('composer marks shell mode with a $ prompt and shell-colored text', async () => {
+test('an expanded Read/Run block pins its own header and collapses from the pinned row', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'coder-tui-workspace-'));
+  await writeFile(join(workspace, 'notes.txt'), Array.from({ length: 80 }, (_, index) => `Notes file line ${index}`).join('\n'));
+  let calls = 0;
   const tui = await startTui({
+    workspaceRoot: workspace,
+    modelStream: async function* () {
+      calls += 1;
+      if (calls === 1) {
+        yield { content: null, toolCalls: [{ id: 'read', function: { name: 'read_file', arguments: { path: 'notes.txt' } } }], done: false };
+      } else {
+        yield { content: ['Answer text.', ...Array.from({ length: 120 }, (_, index) => `Answer detail line ${index}`)].join('\n'), done: true };
+      }
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const mouse = async (button: number, x: number, y: number, release = false): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}${release ? 'm' : 'M'}`);
+      await tick();
+    };
+    const visibleRows = () => screen.lines.map((row) => row.map((cell) => cell[1]).join(''));
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Read') && attempt < 200; attempt++) await wait(10);
+    // Output-following lands at the bottom; scroll back up to the Read header.
+    const findReadRow = async (): Promise<number> => {
+      for (let attempt = 0; attempt < 200; attempt++) {
+        const row = visibleRows().findIndex((line) => line.includes('Read'));
+        if (row >= 0) return row;
+        await mouse(64, 3, 5);
+      }
+      return -1;
+    };
+    const readRow = await findReadRow();
+    assert.ok(readRow >= 0, 'the Read header must be reachable before it can be expanded');
+    await mouse(0, 3, readRow);
+    await mouse(0, 3, readRow, true);
+    // The read may still be running at expand time: wait for the output to
+    // stream in before asserting on it.
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Notes file line 0') && attempt < 200; attempt++) await wait(10);
+    assert.match(conversation.getContent(), /Notes file line 0/, 'expansion shows the tool output');
+    // Scroll so the real header leaves the viewport while the expanded body
+    // still fills it: the tool header must now pin like a Thought block.
+    const pinnedRow = (): string | undefined => visibleRows()[0].includes('▾') ? visibleRows()[0] : undefined;
+    for (let attempt = 0; attempt < 80 && !pinnedRow(); attempt++) await mouse(65, 3, 5);
+    const pinned = pinnedRow();
+    assert.ok(pinned, `the expanded Read header must pin at the conversation top, got: ${JSON.stringify(visibleRows().slice(0, 3))}`);
+    assert.ok(pinned.includes('Read'), `the pinned row must keep the tool label, got: ${JSON.stringify(pinned)}`);
+    // The pinned row must collapse the block and hand its position at the top
+    // to the real (collapsed) header.
+    await mouse(0, 3, 0);
+    await mouse(0, 3, 0, true);
+    for (let attempt = 0; attempt < 20; attempt++) await wait(10);
+    assert.doesNotMatch(conversation.getContent(), /Notes file line 0/, 'clicking the pinned Read row collapses the block');
+    assert.match(visibleRows()[0], /▸.*Read/, `the collapsed Read header must land at the viewport top, got: ${JSON.stringify(visibleRows().slice(0, 3))}`);
+  } finally {
+    await tui.cleanup();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('the status bar shows the live step count while the main turn runs and clears when it ends', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'coder-tui-workspace-'));
+  await writeFile(join(workspace, 'notes.txt'), 'notes\n');
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+  let releaseSecond!: () => void;
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let calls = 0;
+  const tui = await startTui({
+    workspaceRoot: workspace,
+    modelStream: async function* () {
+      calls += 1;
+      if (calls === 1) {
+        yield { content: 'Starting.', done: false };
+        await firstGate;
+        yield { content: null, toolCalls: [{ id: 'read', function: { name: 'read_file', arguments: { path: 'notes.txt' } } }], done: false };
+      } else if (calls === 2) {
+        await secondGate;
+        yield { content: 'Finished.', done: true };
+      } else {
+        yield { content: 'Finished.', done: true };
+      }
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const statusbar = screen.children[0] as blessed.Widgets.BoxElement;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const statusText = (): string => plainText(statusbar.getContent());
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !statusText().includes('step 1') && attempt < 100; attempt++) await wait(10);
+    assert.match(statusText(), /step 1/, `the running turn must show its live step, got: ${JSON.stringify(statusText())}`);
+    releaseFirst();
+    for (let attempt = 0; !statusText().includes('step 2') && attempt < 100; attempt++) await wait(10);
+    assert.match(statusText(), /step 2/, `the second model request must advance the step, got: ${JSON.stringify(statusText())}`);
+    releaseSecond();
+    for (let attempt = 0; statusText().includes('step ') && attempt < 100; attempt++) await wait(10);
+    assert.doesNotMatch(statusText(), /step \d/, `the step counter must clear when the turn ends, got: ${JSON.stringify(statusText())}`);
+  } finally {
+    releaseFirst();
+    releaseSecond();
+    await tui.cleanup();
+    await rm(workspace, { recursive: true, force: true });
+  }
+});
+
+test('composer marks shell mode with a $ prompt and shell-colored text', async () => {  const tui = await startTui({
     modelStream: async function* () {
       yield { content: 'noop', done: true };
     },
@@ -1064,6 +1187,151 @@ test('the welcome banner repaints on its own animation clock', async () => {
   }
 });
 
+test('clicks cannot kill an open modal: the picker and the input wizard survive outside clicks', async () => {
+  const tui = await startTui({
+    modelStream: async function* () { yield { content: 'ok', done: true }; },
+  });
+  try {
+    const { screen, input, savedConfigs } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    // Regression: a single mouse click (e.g. returning to the window after
+    // copying an API key) used to blur the wizard's textbox, fire `cancel`
+    // inside readInput, and silently abort the whole add-provider wizard.
+    const click = async (button: number, x: number, y: number): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}M`);
+      await tick();
+      input.write(`\x1b[<${button};${x + 1};${y + 1}m`);
+      await tick();
+    };
+    const centerModals = (): blessed.Widgets.BoxElement[] => screen.children.filter((child) =>
+      child.type === 'box' && (child as blessed.Widgets.BoxElement).options.top === 'center') as blessed.Widgets.BoxElement[];
+    const findList = (match: (content: string) => boolean): blessed.Widgets.ListElement | undefined => {
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'list') as blessed.Widgets.ListElement | undefined;
+        if (nested?.items?.some((item) => match(item.getContent()))) return nested;
+      }
+      return undefined;
+    };
+    const findTextbox = (): blessed.Widgets.TextboxElement | undefined => {
+      for (const child of screen.children) {
+        const nested = (child as blessed.Widgets.BoxElement).children?.find((grandchild) => grandchild.type === 'textbox') as blessed.Widgets.TextboxElement | undefined;
+        if (nested) return nested;
+      }
+      return undefined;
+    };
+    const waitUntil = async (ready: () => boolean): Promise<void> => {
+      for (let attempt = 0; !ready() && attempt < 100; attempt++) await wait(10);
+    };
+
+    // 1. The theme picker must survive clicks on the conversation below it,
+    // and stay keyboard-alive afterwards.
+    input.write('/theme');
+    await tick();
+    input.write('	');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    await waitUntil(() => Boolean(findList((content) => content.includes('midnight'))));
+    assert.ok(findList((content) => content.includes('midnight')), 'choosing /theme must open the theme picker');
+    await click(0, 3, 20); // conversation area, below the centered modal
+    await wait(50);
+    assert.ok(findList((content) => content.includes('midnight')), 'a click on the conversation must not dismiss the theme picker');
+    assert.ok(centerModals().length === 1, 'the picker modal must still be on screen after an outside click');
+    // `list.key()` handlers live on the element itself and fire on the
+    // focused-element 'key <full>' leg of blessed's key routing.
+    findList((content) => content.includes('midnight'))!.emit('key escape', '', { full: 'escape', name: 'escape' });
+    await tick();
+    assert.ok(!findList((content) => content.includes('midnight')) && centerModals().length === 0, 'Escape must still close the picker after the guarded click');
+
+    // 2. The /provider wizard (the exact spot where API keys are pasted)
+    // must survive clicks on its own surface and anywhere else on screen,
+    // store the connection once, and never re-ask for it afterwards.
+    input.write('/provider');
+    await tick();
+    input.write('	');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    // No providers configured yet: /provider opens the provider menu, whose
+    // only entry is "Add provider".
+    await waitUntil(() => Boolean(findList((content) => content.includes('Add provider'))));
+    const menu = findList((content) => content.includes('Add provider'))!;
+    await click(0, 3, 20); // conversation area, below the centered modal
+    await wait(50);
+    assert.ok(findList((content) => content.includes('Add provider')), 'the provider menu must survive an outside click');
+    menu.emit('keypress', '', { name: 'enter' });
+    // Committing it opens the built-in provider presets.
+    await waitUntil(() => Boolean(findList((content) => content.includes('Ollama'))));
+    const picker = findList((content) => content.includes('Ollama'))!;
+    assert.ok(picker.items.some((item) => item.getContent().includes('OpenAI')),
+      'the provider picker must list the built-in providers');
+    await click(0, 3, 20);
+    await wait(50);
+    assert.ok(findList((content) => content.includes('Ollama')), 'the provider picker must survive an outside click');
+    // Walk down to "Custom · OpenAI compatible" (empty Base URL, optional key)
+    // so the whole flow runs without touching the network or a real key.
+    for (let step = 0; step < 5; step++) { picker.emit('keypress', '', { name: 'down' }); await tick(); }
+    picker.emit('keypress', '', { name: 'enter' });
+    await waitUntil(() => Boolean(findTextbox()));
+    const urlBox = findTextbox()!;
+    assert.ok(urlBox, 'committing the preset must open the Base URL input dialog');
+    // Click the dialog's own surface and outside it: neither may blur the
+    // textbox and fire the readInput cancel path.
+    await click(0, 40, 10);
+    await click(0, 3, 20);
+    await wait(50);
+    assert.ok(findTextbox(), 'clicks must not abort the input dialog while typing');
+    // Keyboard must still reach the textbox: type a dead URL and confirm.
+    for (const ch of 'http://fakeollama:9') urlBox.emit('keypress', ch, { name: ch });
+    urlBox.emit('keypress', '', { name: 'enter' });
+    // The custom preset asks for an optional key; cancel it with Escape. The
+    // model fetch against the dead URL fails fast, and the connection — the
+    // URL alone — is stored once.
+    await waitUntil(() => Boolean(findTextbox()));
+    findTextbox()!.emit('key escape', '', { full: 'escape', name: 'escape' });
+    await waitUntil(() => savedConfigs.length === 1);
+    assert.deepEqual(savedConfigs[0]!.providers?.fakeollama, { baseUrl: 'http://fakeollama:9' },
+      'the connection must be stored once, without duplicating any key');
+    // The wizard lands back on the provider list, now showing the saved one.
+    await waitUntil(() => Boolean(findList((content) => content.includes('fakeollama'))));
+    await click(0, 3, 20);
+    await wait(50);
+    assert.ok(findList((content) => content.includes('fakeollama')), 'the provider list must survive an outside click');
+    // Opening the saved provider must NOT re-ask for its URL or key: it goes
+    // straight to that connection's model management.
+    findList((content) => content.includes('fakeollama'))!.emit('keypress', '', { name: 'enter' });
+    await waitUntil(() => Boolean(findList((content) => content.includes('Add model'))));
+    assert.ok(!findTextbox(), 'opening a saved provider must not re-ask for the stored URL or key');
+    await click(0, 3, 20);
+    await wait(50);
+    assert.ok(findList((content) => content.includes('Add model')), 'the model manager must survive an outside click');
+    // Add a model: the dead endpoint has no model list, so it falls back to
+    // typing the name; the alias confirm and the optional context follow.
+    findList((content) => content.includes('Add model'))!.emit('keypress', '', { name: 'enter' });
+    await waitUntil(() => Boolean(findTextbox()));
+    const nameBox = findTextbox()!;
+    for (const ch of 'testmodel') nameBox.emit('keypress', ch, { name: ch });
+    nameBox.emit('keypress', '', { name: 'enter' });
+    // "Local alias" pre-fills the suggested alias: confirm it as-is.
+    await waitUntil(() => Boolean(findTextbox()));
+    findTextbox()!.emit('keypress', '', { name: 'enter' });
+    // "Context window · optional": cancel it; the model is still saved.
+    await waitUntil(() => Boolean(findTextbox()));
+    findTextbox()!.emit('key escape', '', { full: 'escape', name: 'escape' });
+    await waitUntil(() => savedConfigs.length === 2);
+    assert.deepEqual(savedConfigs[1]!.models?.testmodel, { provider: 'fakeollama', model: 'testmodel' },
+      'the model must be saved through the stored provider, not a new connection');
+    // Escape twice back out: every modal closes, nothing else is persisted.
+    findList((content) => content.includes('testmodel'))!.emit('key escape', '', { full: 'escape', name: 'escape' });
+    await tick();
+    findList((content) => content.includes('fakeollama'))!.emit('key escape', '', { full: 'escape', name: 'escape' });
+    await tick();
+    await wait(50);
+    assert.equal(savedConfigs.length, 2, 'no extra provider must have been persisted');
+    assert.ok(centerModals().length === 0, 'Escape must close every modal');
+  } finally {
+    await tui.cleanup();
+  }
+});
+
 test('blur slows animation to a heartbeat and focus restores full speed', async () => {
   const tui = await startTui({
     modelStream: async function* () { yield { content: 'ok', done: true }; },
@@ -1123,5 +1391,96 @@ test('blur slows animation to a heartbeat and focus restores full speed', async 
     assert.equal(snapshot(), rebuilt, 'the refocus redraw must not produce further updates');
   } finally {
     await tui.cleanup();
+  }
+});
+
+test('every render flush is a balanced DEC 2026 sync bracket (flicker fix)', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'coder-tui-sync-'));
+  const input = new PassThrough() as PassThrough & { isTTY: boolean; setRawMode: () => void };
+  input.isTTY = true;
+  input.setRawMode = () => {};
+  const output = new PassThrough() as PassThrough & { columns: number; rows: number; isTTY: boolean };
+  output.columns = 80; output.rows = 24; output.isTTY = true;
+  // Capture each terminal write separately: the flicker fix guarantees every
+  // flush chunk carries exactly one \x1b[?2026h … \x1b[?2026l pair with the
+  // frame bytes in between, so the atomic frame arrives in one piece.
+  const chunks: string[] = [];
+  output.on('data', (chunk) => { chunks.push(chunk.toString()); });
+  output.resume();
+  const original = blessed.screen;
+  let screen: blessed.Widgets.Screen | undefined;
+  blessed.screen = ((options: blessed.Widgets.IScreenOptions) => {
+    screen = original({ ...options, input, output, terminal: 'windows-ansi' });
+    return screen;
+  }) as typeof blessed.screen;
+  const runtime = new AgentRuntime({
+    store: new AgentRuntimeStore(root),
+    resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+    modelStream: async function* () { yield { content: 'sync bracket probe', done: true }; },
+  });
+  let done: Promise<void> | undefined;
+  try {
+    await runtime.whenReady();
+    done = runFullscreenTui(runtime, {
+      modelName: 'test', resolveModel: () => ({ name: 'test', config: { type: 'ollama', baseUrl: 'http://test', model: 'test' } }),
+      configManager: { getConfig: () => ({}), saveConfig: async () => {} },
+    });
+    for (let attempt = 0; !screen && attempt < 100; attempt++) await wait(10);
+    assert.ok(screen);
+    // Wait past the welcome animation and force any pending buffered writes
+    // out, so what remains is steady-state frame traffic.
+    await wait(300);
+    screen.program.flush();
+    await wait(50);
+    screen.program.flush();
+    // Trigger a few more render paths: refresh (input-driven), pageup/pagedown
+    // and the modal filter row all funnel through renderScreen.
+    screen.emit('key pagedown', '', { full: 'pagedown', name: 'pagedown' });
+    await wait(50);
+    screen.program.flush();
+    await wait(50);
+    screen.program.flush();
+    chunks.forEach((c, i) => { if (c.length < 400) console.error(`CHUNK ${i} len=${c.length} ${JSON.stringify(c).slice(0, 300)}`); else console.error(`CHUNK ${i} len=${c.length} head=${JSON.stringify(c.slice(0, 80))} tail=${JSON.stringify(c.slice(-80))}`); });
+    // One-time setup traffic (terminal title, alternate screen, mouse modes)
+    // legitimately precedes the first bracket; everything after the very first
+    // \x1b[?2026h must be a well-formed bracket stream: h … l pairs with the
+    // frame bytes in between, nothing outside a pair, h/l counts balanced.
+    const SYNC_BEGIN = '\x1b[?2026h';
+    const SYNC_END = '\x1b[?2026l';
+    const stream = chunks.join('');
+    const firstBracket = stream.indexOf(SYNC_BEGIN);
+    assert.ok(firstBracket !== -1, `expected at least one sync bracket, chunks=${chunks.length}`);
+    let pos = firstBracket + SYNC_BEGIN.length;
+    let begin = 1, end = 0, escaped = 0;
+    while (pos < stream.length) {
+      const l = stream.indexOf(SYNC_END, pos);
+      const h = stream.indexOf(SYNC_BEGIN, pos);
+      if (h !== -1 && (l === -1 || h < l)) {
+        // A BEGIN where an END was expected: the previous frame never closed.
+        escaped += h - pos;
+        begin++;
+        pos = h + SYNC_BEGIN.length;
+        continue;
+      }
+      if (l === -1) {
+        // Unterminated final bracket: still-open frame bytes.
+        escaped += stream.length - pos;
+        break;
+      }
+      end++;
+      pos = l + SYNC_END.length;
+    }
+    assert.ok(begin > 0, `expected at least one sync bracket, chunks=${chunks.length} begin=${begin}`);
+    assert.equal(begin, end, 'every \x1b[?2026h must be closed by exactly one \x1b[?2026l');
+    assert.equal(escaped, 0, `no frame bytes may fall outside a 2026h…2026l bracket (${escaped}B) ` +
+      `— inspect chunks: ${chunks.map((c) => c.length).join(',')}`);
+  } finally {
+    screen?.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+    screen?.emit('key C-c', '', { full: 'C-c', name: 'c', ctrl: true });
+    await done;
+    blessed.screen = original;
+    await runtime.shutdown();
+    input.destroy(); output.destroy();
+    await rm(root, { recursive: true, force: true });
   }
 });

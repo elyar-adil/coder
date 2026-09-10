@@ -140,22 +140,45 @@ Provider and model configuration is stored in the user-level `~/.agentrc`. Proje
 ```json
 {
   "model": "fast",
-  "models": {
-    "fast": {
-      "backend": "openai",
-      "baseUrl": "https://api.openai.com/v1",
-      "model": "gpt-5-mini",
+  "providers": {
+    "openrouter": {
+      "baseUrl": "https://openrouter.ai/api/v1",
       "apiKey": "..."
     },
+    "local": {
+      "baseUrl": "http://localhost:11434",
+      "backend": "ollama"
+    }
+  },
+  "models": {
+    "fast": {
+      "provider": "openrouter",
+      "model": "openai/gpt-5-mini"
+    },
     "strong": {
-      "backend": "anthropic",
-      "baseUrl": "https://api.anthropic.com",
-      "model": "claude-sonnet-4-5",
-      "apiKey": "..."
+      "provider": "openrouter",
+      "model": "anthropic/claude-sonnet-4-5"
+    },
+    "local": {
+      "provider": "local",
+      "model": "qwen3:8b"
     }
   }
 }
 ```
+
+Each `providers` entry stores a connection once (base URL, optional API key, optional
+backend override); every model alias routes through one of them by name, so a key is
+never duplicated across aliases. `/provider` in the fullscreen TUI manages both layers
+interactively: add a provider (URL + key asked for once), then open it to add models
+from the endpoint's own model list, switch to them, or remove them — it never re-asks
+for a stored URL or key.
+
+Configs in the older flat shape (`baseUrl`/`apiKey`/`backend` inside each model alias,
+or only at the top level) keep working: on load they are migrated into the two-layer
+form, aliases sharing one endpoint are deduped onto a single synthesized provider, and
+the top-level `baseUrl`/`apiKey`/`backend` continue to serve as the default connection
+for bare model names.
 
 Agent-specific model choice belongs in its Markdown spec. The retired Reception/Brain/Worker role-model mapping is no longer supported.
 

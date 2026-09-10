@@ -36,7 +36,31 @@ describe('resolveModelConfig', () => {
     });
   });
 
-  it('falls back to top-level config when requested model is not an alias', () => {
+  it('routes a provider-referencing alias through its stored connection', () => {
+    const resolved = resolveModelConfig({
+      baseUrl: 'https://default.example/v1',
+      backend: 'openai',
+      apiKey: 'default-key',
+      model: 'fast',
+      providers: {
+        openrouter: { baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'or-key', backend: 'openai' },
+      },
+      models: {
+        fast: { provider: 'openrouter', model: 'meta/llama-3', contextWindow: 65536 },
+      },
+    });
+
+    assert.equal(resolved.name, 'fast');
+    assert.deepEqual(resolved.config, {
+      type: 'openai',
+      baseUrl: 'https://openrouter.ai/api/v1',
+      model: 'meta/llama-3',
+      apiKey: 'or-key',
+      contextWindow: 65536,
+    });
+  });
+
+  it('resolves a bare model name through the top-level default connection', () => {
     const resolved = resolveModelConfig({
       baseUrl: 'https://default.example',
       backend: 'openai',

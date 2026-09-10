@@ -1,9 +1,10 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { loadConfig, saveConfig, saveSelectedModel } from '../src/config.js';
+import type { AgentConfig } from '../src/config.js';
 
 describe('loadConfig', () => {
   it('returns empty config when no .agentrc exists', async () => {
@@ -73,6 +74,58 @@ describe('loadConfig', () => {
       process.chdir(cwd);
       if (previousConfigHome === undefined) delete process.env.CODER_CONFIG_HOME;
       else process.env.CODER_CONFIG_HOME = previousConfigHome;
+    }
+  });
+
+  it('round-trips providers and provider-referencing model aliases', async () => {
+    const cwd = process.cwd();
+    const dir = await mkdtemp(join(tmpdir(), 'coder-config-providers-'));
+    const path = join(dir, '.agentrc');
+    const previousConfigHome = process.env.CODER_CONFIG_HOME;
+    process.chdir(dir);
+    process.env.CODER_CONFIG_HOME = dir;
+    try {
+    await writeFile(path, JSON.stringify({
+      model: 'fast',
+      providers: {
+        openrouter: { baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'sk-or-test' },
+      },
+      models: {
+        fast: { provider: 'openrouter', model: 'meta/llama-3' },
+        slow: { provider: 'openrouter', model: 'anthropic/claude' },
+      },
+    }), 'utf8');
+    const config = await loadConfig();
+    assert.deepEqual(config.providers?.openrouter, { baseUrl: 'https://openrouter.ai/api/v1', apiKey: 'sk-or-test' });
+    assert.deepEqual(config.models?.fast, { provider: 'openrouter', model: 'meta/llama-3' });
+    // A legacy flat alias is migrated into a synthesized provider, and two
+    // aliases sharing one endpoint dedupe onto the same provider entry.
+    await writeFile(path, JSON.stringify({
+      baseUrl: 'https://gateway.example/v1',
+      apiKey: 'sk-gw',
+      backend: 'openai',
+      models: {
+        remote: { model: 'Kimi', baseUrl: 'https://gateway.example/v1', apiKey: 'sk-gw', backend: 'openai' },
+        other: { model: 'Qwen', baseUrl: 'https://gateway.example/v1', backend: 'openai' },
+      },
+    }), 'utf8');
+    const migrated = await loadConfig();
+    assert.equal(Object.keys(migrated.models ?? {}).length, 2);
+    for (const entry of Object.values(migrated.models ?? {})) {
+      assert.ok(entry.provider, 'a legacy alias must be repointed at a synthesized provider');
+      assert.equal(entry.baseUrl, undefined);
+      assert.equal(entry.apiKey, undefined);
+    }
+    const providerNames = new Set(Object.values(migrated.models ?? {}).map((entry) => entry.provider));
+    assert.equal(providerNames.size, 1, 'aliases sharing one endpoint must share one provider');
+    const provider = migrated.providers?.[[...providerNames][0]!];
+    assert.equal(provider?.baseUrl, 'https://gateway.example/v1');
+    assert.equal(provider?.apiKey, 'sk-gw');
+    } finally {
+      process.chdir(cwd);
+      if (previousConfigHome === undefined) delete process.env.CODER_CONFIG_HOME;
+      else process.env.CODER_CONFIG_HOME = previousConfigHome;
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

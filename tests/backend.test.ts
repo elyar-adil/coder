@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectBackend, normalizeOpenAIBaseUrl, openAIChatCompletionsUrl, type BackendType } from '../src/backend.js';
+import { chatStream, detectBackend, normalizeOpenAIBaseUrl, openAIChatCompletionsUrl, type BackendType } from '../src/backend.js';
 
 describe('detectBackend', () => {
   it('detects ollama for localhost:11434', () => {
@@ -43,5 +43,50 @@ describe('OpenAI URL helpers', () => {
 
   it('builds chat completions URL without duplicating /v1', () => {
     assert.equal(openAIChatCompletionsUrl('https://example.test/v1'), 'https://example.test/v1/chat/completions');
+  });
+});
+
+describe('Anthropic prompt caching', () => {
+  const config = { type: 'anthropic' as const, baseUrl: 'http://test', model: 'test', apiKey: 'test' };
+  const tool = {
+    type: 'function' as const,
+    function: { name: 'read_file', description: 'Read a file', parameters: { type: 'object', properties: {}, required: [] } },
+  };
+  const captureBody = async (t: { mock: { method: (object: object, key: string, value: unknown) => unknown } }): Promise<Record<string, unknown>> => {
+    let body: Record<string, unknown> | undefined;
+    t.mock.method(globalThis, 'fetch', async (_url: string, init: { body?: unknown }) => {
+      body = JSON.parse(String(init.body)) as Record<string, unknown>;
+      return new Response('event: message_stop\ndata: {}\n\n', { status: 200 });
+    });
+    for await (const _chunk of chatStream(config, 'System prompt', [{ role: 'user', content: 'hello' }], [tool])) { /* drain */ }
+    assert.ok(body, 'the request body must be captured');
+    return body;
+  };
+
+  it('marks tools, system, and the newest message with cache breakpoints', async (t) => {
+    const body = await captureBody(t);
+    const system = body.system as Array<Record<string, unknown>>;
+    assert.deepEqual(system[0]!.cache_control, { type: 'ephemeral' });
+    const tools = body.tools as Array<Record<string, unknown>>;
+    assert.deepEqual(tools.at(-1)!.cache_control, { type: 'ephemeral' });
+    const messages = body.messages as Array<Record<string, unknown>>;
+    const content = messages.at(-1)!.content as Array<Record<string, unknown>>;
+    assert.deepEqual(content.at(-1)!.cache_control, { type: 'ephemeral' });
+  });
+
+  it('ANTHROPIC_PROMPT_CACHE=0 disables the breakpoints', async (t) => {
+    const previous = process.env.ANTHROPIC_PROMPT_CACHE;
+    process.env.ANTHROPIC_PROMPT_CACHE = '0';
+    try {
+      const body = await captureBody(t);
+      assert.equal(typeof body.system, 'string');
+      const tools = body.tools as Array<Record<string, unknown>>;
+      assert.equal('cache_control' in tools.at(-1)!, false);
+      const messages = body.messages as Array<Record<string, unknown>>;
+      assert.equal(typeof messages.at(-1)!.content, 'string');
+    } finally {
+      if (previous === undefined) delete process.env.ANTHROPIC_PROMPT_CACHE;
+      else process.env.ANTHROPIC_PROMPT_CACHE = previous;
+    }
   });
 });

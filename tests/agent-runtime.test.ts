@@ -10,10 +10,10 @@ import { AgentRegistry } from '../src/runtime/agent-registry.js';
 import { AgentRuntime } from '../src/runtime/agent-runtime.js';
 import { AgentRuntimeStore } from '../src/runtime/agent-store.js';
 
-const document = (description: string, agents: string[] = []): string => `---
+const document = (description: string, agents: string[] = [], tools: string[] = []): string => `---
 description: ${description}
 model: inherit
-tools: []
+tools: [${tools.join(', ')}]
 agents: [${agents.join(', ')}]
 ---
 
@@ -22,7 +22,7 @@ Act according to this test spec.
 
 async function fixture(
   modelStream: ConstructorParameters<typeof AgentRuntime>[0]['modelStream'],
-  options: { maxConcurrentTurns?: number; maxChildrenPerTurn?: number } = {},
+  options: { maxConcurrentTurns?: number; maxChildrenPerTurn?: number; mainTools?: string[]; coordinatorTools?: string[]; contextWindow?: number } = {},
 ): Promise<{
   runtime: AgentRuntime;
   root: string;
@@ -33,8 +33,8 @@ async function fixture(
   const emptyUser = join(root, 'user');
   const emptyProject = join(root, 'project');
   await Promise.all([mkdir(agents), mkdir(emptyUser), mkdir(emptyProject)]);
-  await writeFile(join(agents, 'main.md'), document('Entry', ['coordinator']));
-  await writeFile(join(agents, 'coordinator.md'), document('Coordinator', ['worker']));
+  await writeFile(join(agents, 'main.md'), document('Entry', ['coordinator'], options.mainTools));
+  await writeFile(join(agents, 'coordinator.md'), document('Coordinator', ['worker'], options.coordinatorTools));
   await writeFile(join(agents, 'worker.md'), document('Worker'));
   const registry = new AgentRegistry({ builtinDir: agents, userDir: emptyUser, projectDir: emptyProject });
   const store = new AgentRuntimeStore(root);
@@ -43,7 +43,12 @@ async function fixture(
     store,
     workspaceRoot: root,
     defaultModel: 'test',
-    resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+    resolveModel: () => ({
+      type: 'ollama',
+      baseUrl: 'http://test',
+      model: 'test',
+      ...(options.contextWindow ? { contextWindow: options.contextWindow } : {}),
+    }),
     modelStream,
     maxConcurrentTurns: options.maxConcurrentTurns,
     maxChildrenPerTurn: options.maxChildrenPerTurn,
@@ -61,37 +66,50 @@ function textModel(): ConstructorParameters<typeof AgentRuntime>[0]['modelStream
 }
 
 describe('AgentRuntime', () => {
-  test('stops repeated identical tool failures as a doom loop', async () => {
+  test('pauses repeated identical tool failures instead of failing the turn', async () => {
     let call = 0;
-    const { runtime, root } = await fixture(async function* () {
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
       call += 1;
-      yield {
-        content: null,
-        toolCalls: [{ id: `failed-${call}`, function: { name: 'unknown_tool', arguments: { same: true } } }],
-        done: false,
-      };
+      if (!tools.length) {
+        yield { content: 'Paused after three identical failures; nothing changed.', done: false };
+      } else {
+        yield {
+          content: null,
+          toolCalls: [{ id: `failed-${call}`, function: { name: 'unknown_tool', arguments: { same: true } } }],
+          done: false,
+        };
+      }
       yield { content: null, done: true };
     });
     try {
+      const notices: string[] = [];
+      runtime.subscribe((event) => { if (event.type === 'system_message') notices.push(event.message.content); });
       const session = await runtime.openSession('doom-loop');
       await runtime.submitMessage('doom-loop', 'start');
       await runtime.waitForIdle('doom-loop');
       const main = runtime.getInstance(session.mainInstanceId)!;
-      assert.equal(main.status, 'failed');
-      assert.match(main.lastError ?? '', /Doom loop detected/);
-      assert.equal(call, 3);
+      assert.equal(main.status, 'idle');
+      assert.equal(main.lastError, undefined);
+      assert.match(main.lastOutput ?? '', /Paused after three identical failures/);
+      assert.ok(notices.some((content) => /stuck loop/i.test(content)), `a stuck pause must surface a system notice, got: ${JSON.stringify(notices)}`);
+      // Three failing calls plus one tool-free wrap-up request.
+      assert.equal(call, 4);
+      const visible = runtime.getSession('doom-loop')!.messages.filter((message) => message.role === 'assistant').map((message) => message.content);
+      assert.ok(visible.some((content) => content.includes('Paused after three identical failures')));
     } finally {
       await runtime.shutdown();
       await rm(root, { recursive: true, force: true });
     }
   });
 
-  test('interleaved read-only successes do not reset the doom-loop failure chain', async () => {
+  test('interleaved read-only successes do not reset the stuck failure chain', async () => {
     let call = 0;
     let editCalls = 0;
-    const { runtime, root } = await fixture(async function* () {
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
       call += 1;
-      if (call % 2 === 1) {
+      if (!tools.length) {
+        yield { content: 'Paused after repeated edit failures.', done: false };
+      } else if (call % 2 === 1) {
         editCalls += 1;
         yield {
           content: null,
@@ -113,9 +131,337 @@ describe('AgentRuntime', () => {
       await runtime.submitMessage('doom-loop-oscillation', 'start');
       await runtime.waitForIdle('doom-loop-oscillation');
       const main = runtime.getInstance(session.mainInstanceId)!;
-      assert.equal(main.status, 'failed');
-      assert.match(main.lastError ?? '', /Doom loop detected/);
+      assert.equal(main.status, 'idle');
+      assert.equal(main.lastError, undefined);
       assert.equal(editCalls, 3);
+      assert.match(main.lastOutput ?? '', /Paused after repeated edit failures/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('pauses a turn that repeats a successful action with the same observation', async () => {
+    let call = 0;
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
+      call += 1;
+      if (!tools.length) {
+        yield { content: 'Summary: re-read the same file four times; next step is to edit it.', done: false };
+      } else {
+        yield {
+          content: null,
+          toolCalls: [{ id: `read-${call}`, function: { name: 'read_file', arguments: { path: 'target.txt' } } }],
+          done: false,
+        };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file', 'write_file'] });
+    await writeFile(join(root, 'target.txt'), 'stable content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('stuck-read');
+      await runtime.submitMessage('stuck-read', 'start');
+      await runtime.waitForIdle('stuck-read');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'idle');
+      // Four identical reads plus one tool-free wrap-up request.
+      assert.equal(call, 5);
+      assert.match(main.lastOutput ?? '', /next step is to edit it/);
+      assert.equal(runtime.getSession('stuck-read')!.messages.at(-1)!.content, 'Summary: re-read the same file four times; next step is to edit it.');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a state-changing success resets the stuck repetition chain', async () => {
+    const actions = ['read', 'read', 'read', 'write', 'read', 'read', 'read', 'done'];
+    let call = 0;
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
+      const action = actions[call] ?? 'done';
+      call += 1;
+      if (!tools.length || action === 'done') {
+        yield { content: 'Work complete.', done: false };
+      } else if (action === 'write') {
+        yield {
+          content: null,
+          toolCalls: [{ id: `write-${call}`, function: { name: 'write_file', arguments: { path: 'target.txt', content: 'stable content\n' } } }],
+          done: false,
+        };
+      } else {
+        yield {
+          content: null,
+          toolCalls: [{ id: `read-${call}`, function: { name: 'read_file', arguments: { path: 'target.txt' } } }],
+          done: false,
+        };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file', 'write_file'] });
+    await writeFile(join(root, 'target.txt'), 'stable content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('progress-reset');
+      await runtime.submitMessage('progress-reset', 'start');
+      await runtime.waitForIdle('progress-reset');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'idle');
+      assert.equal(call, 8);
+      assert.match(main.lastOutput ?? '', /Work complete\./);
+      assert.doesNotMatch(main.lastOutput ?? '', /Run paused/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a stuck child agent reports a summary to its parent instead of failing', async () => {
+    let coordinatorCalls = 0;
+    const { runtime, root } = await fixture(async function* (_config, system, messages, tools) {
+      if (system.includes('agent "coordinator"')) {
+        if (!tools.length) {
+          yield { content: 'Coordinator summary: re-read the same file four times; next step is to edit it.', done: false };
+        } else {
+          coordinatorCalls += 1;
+          yield {
+            content: null,
+            toolCalls: [{ id: `read-${coordinatorCalls}`, function: { name: 'read_file', arguments: { path: 'target.txt' } } }],
+            done: false,
+          };
+        }
+      } else {
+        const latest = messages.at(-1);
+        if (latest?.role === 'tool') {
+          yield { content: 'Coordinator is working in the background.', done: false };
+        } else if (String(latest?.content).includes('finished this turn')) {
+          yield { content: 'Coordinator paused with a summary; continuing from it.', done: false };
+        } else {
+          yield {
+            content: null,
+            toolCalls: [{ id: 'spawn-1', function: { name: 'spawn_agent', arguments: { agent: 'coordinator', message: 'inspect target.txt' } } }],
+            done: false,
+          };
+        }
+      }
+      yield { content: null, done: true };
+    }, { coordinatorTools: ['read_file', 'write_file'] });
+    await writeFile(join(root, 'target.txt'), 'stable content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('child-stuck');
+      await runtime.submitMessage('child-stuck', 'start');
+      await runtime.waitForIdle('child-stuck');
+      const [main, coordinator] = runtime.listInstances('child-stuck');
+      assert.equal(coordinator!.status, 'idle');
+      assert.equal(coordinator!.lastError, undefined);
+      assert.match(coordinator!.lastOutput ?? '', /Coordinator summary/);
+      assert.equal(main!.status, 'idle');
+      assert.equal(main!.lastError, undefined);
+      const visible = runtime.getSession('child-stuck')!.messages.filter((message) => message.role === 'assistant').map((message) => message.content);
+      assert.ok(visible.includes('Coordinator paused with a summary; continuing from it.'));
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the session board persists, injects into prompts, and enforces capacity', async () => {
+    let call = 0;
+    let ids: string[] = [];
+    const prompts: string[] = [];
+    const toolResults: string[] = [];
+    const { runtime, root, store } = await fixture(async function* (_config, system, messages, tools) {
+      call += 1;
+      prompts.push(system);
+      for (const message of messages) if (message.role === 'tool') toolResults.push(String(message.content));
+      if (!tools.length) {
+        yield { content: 'paused summary', done: true };
+      } else if (call === 1) {
+        yield {
+          content: null,
+          toolCalls: [
+            { id: 'b1', function: { name: 'board', arguments: { action: 'add', text: 'Ship the migration', kind: 'todo' } } },
+            { id: 'b2', function: { name: 'board', arguments: { action: 'add', text: 'API returns 404 on empty query', kind: 'risk' } } },
+          ],
+          done: false,
+        };
+      } else if (call === 2) {
+        yield { content: 'board seeded', done: true };
+      } else if (call === 3) {
+        yield {
+          content: null,
+          toolCalls: [
+            { id: 'b3', function: { name: 'board', arguments: { action: 'update', id: ids[0], status: 'done' } } },
+            { id: 'b4', function: { name: 'board', arguments: { action: 'prune' } } },
+          ],
+          done: false,
+        };
+      } else if (call === 4) {
+        yield { content: 'board pruned', done: true };
+      } else if (call === 5) {
+        yield { content: null, toolCalls: [{ id: 'b5', function: { name: 'board', arguments: { action: 'add', text: 'should not fit' } } }], done: false };
+      } else {
+        yield { content: 'board full', done: true };
+      }
+      yield { content: null, done: true };
+    });
+    try {
+      await runtime.submitMessage('board-test', 'seed the board');
+      await runtime.waitForIdle('board-test');
+      const seeded = await runtime.boardEntries('board-test');
+      assert.equal(seeded.length, 2);
+      assert.equal(seeded[0]!.kind, 'todo');
+      assert.equal(seeded[0]!.status, 'open');
+      assert.equal(seeded[1]!.kind, 'risk');
+      assert.ok(prompts.at(-1)!.includes('Shared session board'), 'the board must be injected into prompts once populated');
+      assert.ok(prompts.at(-1)!.includes('Ship the migration'));
+      assert.ok(!prompts[0]!.includes('Shared session board'), 'an empty board adds nothing to the prompt');
+
+      ids = seeded.map((entry) => entry.id);
+      await runtime.submitMessage('board-test', 'finish the first item');
+      await runtime.waitForIdle('board-test');
+      const pruned = await runtime.boardEntries('board-test');
+      assert.equal(pruned.length, 1);
+      assert.match(pruned[0]!.text, /404/);
+
+      // Fill the board to its entry cap, then prove both the public API and
+      // the tool report guidance instead of silently dropping entries.
+      for (let index = 0; index < 49; index += 1) await runtime.addBoardEntry('board-test', 'small note');
+      assert.equal((await runtime.boardEntries('board-test')).length, 50);
+      await assert.rejects(runtime.addBoardEntry('board-test', 'over capacity'), /Board is full/);
+      await runtime.submitMessage('board-test', 'try to add one more');
+      await runtime.waitForIdle('board-test');
+      assert.ok(toolResults.some((result) => result.includes('Board is full')), 'the board tool must explain how to free capacity');
+
+      await runtime.shutdown();
+      const registry = new AgentRegistry({ builtinDir: join(root, 'agents'), userDir: join(root, 'user'), projectDir: join(root, 'project') });
+      const reopened = new AgentRuntime({
+        registry,
+        store,
+        workspaceRoot: root,
+        resolveModel: () => ({ type: 'ollama', baseUrl: 'http://test', model: 'test' }),
+        modelStream: textModel(),
+      });
+      await reopened.openSession('board-test');
+      const restored = await reopened.boardEntries('board-test');
+      assert.ok(restored.length > 1, 'board entries must survive a runtime restart');
+      assert.ok(restored.some((entry) => /404/.test(entry.text)), 'restored board must keep earlier notes');
+      await reopened.shutdown();
+    } finally {
+      await runtime.shutdown().catch(() => undefined);
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('the board rejects entries beyond its total character budget', async () => {
+    const { runtime, root } = await fixture(textModel());
+    try {
+      await runtime.openSession('board-chars');
+      for (let index = 0; index < 6; index += 1) await runtime.addBoardEntry('board-chars', 'x'.repeat(2000));
+      await assert.rejects(runtime.addBoardEntry('board-chars', 'x'), /Board is full/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('bounds huge tool results before they enter model context', async () => {
+    let call = 0;
+    const toolMessages: string[] = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, messages, tools) {
+      call += 1;
+      for (const message of messages) if (message.role === 'tool') toolMessages.push(String(message.content));
+      if (!tools.length) {
+        yield { content: 'done', done: true };
+      } else if (call === 1) {
+        yield { content: null, toolCalls: [{ id: 'read', function: { name: 'read_file', arguments: { path: 'big.txt' } } }], done: false };
+      } else {
+        yield { content: 'read it', done: true };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file'] });
+    await writeFile(join(root, 'big.txt'), 'z'.repeat(60_000), 'utf8');
+    try {
+      await runtime.submitMessage('bounded', 'read big file');
+      await runtime.waitForIdle('bounded');
+      const bounded = toolMessages.find((content) => content.includes('tool result truncated'));
+      assert.ok(bounded, 'the oversized tool result must be truncated before entering context');
+      assert.ok(bounded!.length < 60_000, 'the bounded copy must be smaller than the raw output');
+      assert.match(bounded!, /Re-run the tool with a narrower scope/);
+      assert.ok(bounded!.slice(0, 200).includes('z'.repeat(50)), 'the head of the result is preserved');
+      assert.ok(bounded!.slice(-200).includes('z'.repeat(50)), 'the tail of the result is preserved');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('trimming keeps the original request as an anchor', async () => {
+    const previous = process.env.AGENT_AUTO_COMPACT_RATIO;
+    process.env.AGENT_AUTO_COMPACT_RATIO = '100';
+    let call = 0;
+    const anchors: string[] = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, messages, tools) {
+      call += 1;
+      const anchor = messages.map((message) => String(message.content ?? '')).find((content) => content.includes('Earlier conversation elided'));
+      if (anchor) anchors.push(anchor);
+      if (!tools.length) {
+        yield { content: 'done', done: true };
+      } else if (call <= 12) {
+        yield { content: null, toolCalls: [{ id: `read-${call}`, function: { name: 'read_file', arguments: { path: 'data.txt', offset: call * 100, limit: 100 } } }], done: false };
+      } else {
+        yield { content: 'finished', done: true };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file'], contextWindow: 8000 });
+    await writeFile(join(root, 'data.txt'), Array.from({ length: 3000 }, (_, index) => `line ${index} ${'x'.repeat(80)}`).join('\n'), 'utf8');
+    try {
+      await runtime.submitMessage('anchor', 'THE ORIGINAL REQUEST');
+      await runtime.waitForIdle('anchor');
+      assert.ok(anchors.length > 0, 'once history is trimmed, the original request must be re-anchored');
+      assert.ok(anchors.some((anchor) => anchor.includes('THE ORIGINAL REQUEST')), 'the anchor must carry the original request text');
+    } finally {
+      if (previous === undefined) delete process.env.AGENT_AUTO_COMPACT_RATIO;
+      else process.env.AGENT_AUTO_COMPACT_RATIO = previous;
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('retries a model stream that fails before emitting anything', async () => {
+    let call = 0;
+    const { runtime, root } = await fixture(async function* () {
+      call += 1;
+      if (call === 1) throw new Error('fetch failed');
+      yield { content: 'recovered', done: true };
+    });
+    try {
+      const session = await runtime.openSession('retry');
+      await runtime.submitMessage('retry', 'start');
+      await runtime.waitForIdle('retry');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'idle');
+      assert.equal(call, 2, 'the failed stream must be retried once');
+      assert.equal(main.usage?.requests, 2);
+      assert.equal(main.lastError, undefined);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('a failed turn still persists usage and partial output', async () => {
+    const { runtime, root } = await fixture(async function* () {
+      yield { content: 'Partial analysis.', done: false, usage: { inputTokens: 7, outputTokens: 3 } };
+      throw new Error('model exploded');
+    });
+    try {
+      const session = await runtime.openSession('failed-usage');
+      await runtime.submitMessage('failed-usage', 'start');
+      await runtime.waitForIdle('failed-usage');
+      const main = runtime.getInstance(session.mainInstanceId)!;
+      assert.equal(main.status, 'failed');
+      assert.match(main.lastError ?? '', /model exploded/);
+      assert.equal(main.lastOutput, 'Partial analysis.');
+      assert.equal(main.usage?.requests, 1);
+      assert.equal(main.usage?.inputTokens, 7);
+      assert.equal(typeof main.lastTurn?.durationMs, 'number');
     } finally {
       await runtime.shutdown();
       await rm(root, { recursive: true, force: true });

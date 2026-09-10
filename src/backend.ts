@@ -429,13 +429,45 @@ interface AnthropicContentBlock {
   input?: Record<string, unknown>;
 }
 
+// ── Anthropic prompt caching ─────────────────────────────────────────────────
+//
+// Anthropic only caches prefixes with explicit cache_control breakpoints
+// (OpenAI caches automatically). Mark the tool list, the system prompt, and the
+// newest message so each request pays full price only for the unseen tail.
+// Set ANTHROPIC_PROMPT_CACHE=0 for gateways that reject cache_control.
+
+function anthropicCachingEnabled(): boolean {
+  return process.env.ANTHROPIC_PROMPT_CACHE !== '0';
+}
+
+function anthropicSystem(systemPrompt: string): unknown {
+  return anthropicCachingEnabled()
+    ? [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }]
+    : systemPrompt;
+}
+
 function convertToolsToAnthropic(tools?: OllamaToolDef[]): Array<Record<string, unknown>> | undefined {
   if (!tools?.length) return undefined;
-  return tools.map((tool) => ({
+  const converted: Array<Record<string, unknown>> = tools.map((tool) => ({
     name: tool.function.name,
     description: tool.function.description,
     input_schema: tool.function.parameters,
   }));
+  if (anthropicCachingEnabled()) converted[converted.length - 1]!.cache_control = { type: 'ephemeral' };
+  return converted;
+}
+
+function withAnthropicMessageCache(messages: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+  if (!anthropicCachingEnabled() || !messages.length) return messages;
+  const last = messages[messages.length - 1]!;
+  const content = last.content;
+  if (typeof content === 'string') {
+    last.content = [{ type: 'text', text: content, cache_control: { type: 'ephemeral' } }];
+  } else if (Array.isArray(content) && content.length) {
+    const block = content[content.length - 1];
+    if (block && typeof block === 'object') (block as Record<string, unknown>).cache_control = { type: 'ephemeral' };
+  }
+  return messages;
 }
 
 function convertToAnthropicMessages(messages: OllamaMsg[]): Array<Record<string, unknown>> {
@@ -535,8 +567,8 @@ async function* anthropicStream(
     model: config.model,
     max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
     stream: true,
-    system: systemPrompt,
-    messages: convertToAnthropicMessages(messages),
+    system: anthropicSystem(systemPrompt),
+    messages: withAnthropicMessageCache(convertToAnthropicMessages(messages)),
   };
   const anthropicTools = convertToolsToAnthropic(tools);
   if (anthropicTools) body.tools = anthropicTools;
@@ -664,8 +696,8 @@ async function anthropicNonStream(
     model: config.model,
     max_tokens: DEFAULT_ANTHROPIC_MAX_TOKENS,
     stream: false,
-    system: systemPrompt,
-    messages: convertToAnthropicMessages(messages),
+    system: anthropicSystem(systemPrompt),
+    messages: withAnthropicMessageCache(convertToAnthropicMessages(messages)),
   };
   const anthropicTools = convertToolsToAnthropic(tools);
   if (anthropicTools) body.tools = anthropicTools;
