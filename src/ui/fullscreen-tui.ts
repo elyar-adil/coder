@@ -1119,7 +1119,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (isWaitingForFirstToken({
       pendingTurns: pendingTurns.size,
       streamingEntries: streams.size,
-      runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running' && entry.kind !== 'tool' && entry.kind !== 'shell').length,
+      runningTimelineEntries: [...(session.timeline ?? [])].filter((entry) => entry.status === 'running').length,
       sessionHasTimeline: Boolean(session.timeline),
     })) {
       // Only a confirmed thinking delta switches the slot to Thinking; until
@@ -2334,6 +2334,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const parent = sideParentSessionId!;
       void switchSession(parent).then(() => {
         notice = 'Returned from /btw side conversation.';
+        refresh();
+      }).catch((error: unknown) => {
+        notice = `Could not return to parent session: ${error instanceof Error ? error.message : String(error)}`;
         refresh();
       });
       return;

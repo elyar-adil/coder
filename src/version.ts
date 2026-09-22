@@ -1,6 +1,13 @@
-import { createRequire } from 'node:module';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const require = createRequire(import.meta.url);
-const pkg = require('../package.json') as { version?: string };
+// Parsed by hand instead of createRequire(...)(...): tsx's require hook
+// transpiles package.json into JS on some platforms (observed on Windows),
+// which then fails JSON.parse inside Node's `.json` loader.
+const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
+export const PACKAGE_JSON = JSON.parse(readFileSync(pkgPath, 'utf8')) as {
+  name?: string;
+  version?: string;
+};
 
-export const CODER_VERSION = pkg.version ?? '0.0.0';
+export const CODER_VERSION = PACKAGE_JSON.version ?? '0.0.0';

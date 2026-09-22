@@ -29,7 +29,7 @@ describe('write_file snapshot', () => {
     assert.match(result, /overwrote existing file \(2 lines\)/);
     const match = result.match(/snapshot saved to (\S+)/);
     assert.ok(match, `result missing snapshot path: ${result}`);
-    const snapshotPath = match![1];
+    const snapshotPath = match![1].replace(/\\/g, '/');
     assert.match(snapshotPath, /\.coder\/snapshots\//);
     assert.equal(await readFile(snapshotPath, 'utf8'), 'old line 1\nold line 2');
     assert.equal(await readFile(path, 'utf8'), 'new content');
@@ -68,7 +68,9 @@ describe('write_file snapshot', () => {
     assert.equal(await readFile(join(snapshotsDir, files[0]), 'utf8'), 'v1');
   });
 
-  test('unwritable snapshot dir does not block the write and reports snapshot unavailable', async () => {
+  // POSIX-only: Windows ignores directory write-permission bits, so the
+  // snapshot always succeeds there and the "unavailable" path is unreachable.
+  test('unwritable snapshot dir does not block the write and reports snapshot unavailable', { skip: process.platform === 'win32' }, async () => {
     const ws = join(root, 'ws-d');
     await mkdir(join(ws, '.coder', 'snapshots'), { recursive: true });
     const path = join(ws, 'guarded.txt');

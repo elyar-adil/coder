@@ -232,7 +232,9 @@ function convertToOllamaToolCalls(openaiCalls: OpenAIToolCall[]): OllamaMsg['too
     try {
       args = JSON.parse(toolCall.function.arguments) as Record<string, string>;
     } catch {
-      // Keep empty args if malformed.
+      // Preserve the raw text so the tool's "requires X" error shows the
+      // model what it actually produced instead of a baffling empty call.
+      args = { _raw_arguments: toolCall.function.arguments };
     }
     return {
       id: toolCall.id,
@@ -609,6 +611,9 @@ async function* anthropicStream(
 
       if (event === 'ping') continue;
 
+      // A provider `error` event must fail the stream; the catch below is only
+      // for malformed frames, so the message rides out via this variable.
+      let providerError: string | undefined;
       try {
         const parsed = JSON.parse(data) as {
           index?: number;
@@ -621,7 +626,7 @@ async function* anthropicStream(
         };
 
         if (event === 'error') {
-          throw new Error(parsed.error?.message ?? 'Anthropic streaming error');
+          providerError = parsed.error?.message ?? 'Anthropic streaming error';
         }
 
         if (event === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
@@ -682,6 +687,7 @@ async function* anthropicStream(
       } catch {
         // Ignore malformed frames and keep streaming.
       }
+      if (providerError) throw new Error(providerError);
     }
   }
 }

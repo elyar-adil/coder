@@ -2,7 +2,7 @@ import { homedir } from 'node:os';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { link, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 const execFileAsync = promisify(execFile);
@@ -146,6 +146,8 @@ interface ReadLockResult {
   info?: LockHolderInfo;
   corrupt: boolean;
   missing: boolean;
+  /** File exists but is empty: a creator is between create and write. */
+  creating: boolean;
 }
 
 async function readLockFile(path: string): Promise<ReadLockResult> {
@@ -153,16 +155,57 @@ async function readLockFile(path: string): Promise<ReadLockResult> {
   try {
     raw = await readFile(path, 'utf8');
   } catch (error) {
-    return { corrupt: false, missing: (error as NodeJS.ErrnoException).code === 'ENOENT' };
+    return { corrupt: false, missing: (error as NodeJS.ErrnoException).code === 'ENOENT', creating: false };
+  }
+  if (raw.trim() === '') {
+    // An empty lock file is not corrupt garbage — it is the window between
+    // creating the file and writing the payload (fallback creation path, or a
+    // crashed creator). Stealing it outright would double-acquire against a
+    // live creator, so callers must treat it as "wait, then steal if it
+    // stays empty".
+    return { corrupt: false, missing: false, creating: true };
   }
   try {
     const parsed = JSON.parse(raw) as LockHolderInfo & { v?: number };
     if (parsed.v !== LOCK_FORMAT_VERSION || typeof parsed.pid !== 'number' || typeof parsed.nonce !== 'string') {
-      return { corrupt: true, missing: false };
+      return { corrupt: true, missing: false, creating: false };
     }
-    return { info: parsed, corrupt: false, missing: false };
+    return { info: parsed, corrupt: false, missing: false, creating: false };
   } catch {
-    return { corrupt: true, missing: false };
+    return { corrupt: true, missing: false, creating: false };
+  }
+}
+
+/** Create the lock file with its full payload in one atomic step: write a
+ * private temp file, then hard-link it into place. `link` fails with EEXIST
+ * when the target exists, so a competing acquirer can never observe a
+ * created-but-empty lock (the open('wx')→writeFile window that previously
+ * let two processes both believe they held the lock). */
+async function createLockFile(path: string, payload: string): Promise<void> {
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await writeFile(tmp, payload, 'utf8');
+    try {
+      await link(tmp, path);
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST') throw error;
+      // Filesystems without hard links (some network/FAT volumes): fall back
+      // to create-if-absent then write, which readLockFile's `creating`
+      // handling makes safe against double-steal.
+      if (code !== 'EPERM' && code !== 'ENOSYS' && code !== 'EXDEV' && code !== 'EOPNOTSUPP') throw error;
+      const handle = await open(path, 'wx');
+      try {
+        await handle.writeFile(payload, 'utf8');
+        await handle.close();
+      } catch (writeError) {
+        await handle.close().catch(() => undefined);
+        throw writeError;
+      }
+    }
+  } finally {
+    await rm(tmp, { force: true }).catch(() => undefined);
   }
 }
 
@@ -215,12 +258,23 @@ export class CrossProcessLockManager {
         );
       }
       const path = this.lockPath(key);
-      let handle: Awaited<ReturnType<typeof open>>;
       try {
-        handle = await open(path, 'wx');
+        await createLockFile(path, payload);
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
         const read = await readLockFile(path);
+        if (read.creating) {
+          // Half-created by a live creator (fallback creation path): never
+          // steal it right away. Only take it over if it is still empty at
+          // the deadline (creator died mid-acquire).
+          if (Date.now() >= deadline) {
+            stealAttempts += 1;
+            if (stealAttempts > 10) throw this.conflict(key, lastHolder);
+            await this.trySteal(path);
+          }
+          await sleep(POLL_INTERVAL_MS);
+          continue;
+        }
         if (read.info) {
           const sameProcessLeak = read.info.pid === process.pid && !processHolds(key);
           const live = sameProcessLeak ? false : await holderIsLive(read.info);
@@ -236,11 +290,12 @@ export class CrossProcessLockManager {
           // same process leaked an unreleased lock — steal it.
           stealAttempts += 1;
           if (stealAttempts > 10) throw this.conflict(key, lastHolder);
-          await rm(path, { force: true }).catch(() => undefined);
+          await this.trySteal(path, read.info);
           continue;
         }
         if (read.corrupt) {
-          // Unparseable lock file is stale by definition.
+          // Unparseable non-empty lock file is stale by definition (complete
+          // payloads are always written atomically; this is external damage).
           stealAttempts += 1;
           if (stealAttempts > 10) throw this.conflict(key, lastHolder);
           await rm(path, { force: true }).catch(() => undefined);
@@ -248,14 +303,6 @@ export class CrossProcessLockManager {
         }
         // missing: someone removed it between EEXIST and read — retry immediately.
         continue;
-      }
-      try {
-        await handle.writeFile(payload, 'utf8');
-        await handle.close();
-      } catch (error) {
-        await handle.close().catch(() => undefined);
-        await rm(path, { force: true }).catch(() => undefined);
-        throw error;
       }
       trackHeld(key, info.nonce);
       let released = false;
@@ -272,6 +319,39 @@ export class CrossProcessLockManager {
           }
         },
       };
+    }
+  }
+
+  /** Remove a stale lock without destroying a lock that was replaced in the
+   * meantime: rename it to a private name, verify the content still matches
+   * the stale record (or is still an empty creating-marker), and only then
+   * delete. Anything else is renamed back — stealing rm-in-place could
+   * otherwise delete a fresh, live holder's lock. */
+  private async trySteal(path: string, expected?: LockHolderInfo): Promise<boolean> {
+    const doomed = `${path}.${process.pid}.${randomUUID()}.steal`;
+    try {
+      await rename(path, doomed);
+    } catch (error) {
+      // Already gone or transiently unavailable — the acquire loop retries.
+      return (error as NodeJS.ErrnoException).code === 'ENOENT';
+    }
+    try {
+      const read = await readLockFile(doomed);
+      const stillStale = read.creating
+        ? expected === undefined // deadline steal of a never-completed creation
+        : read.info !== undefined && (expected === undefined || read.info.nonce === expected.nonce);
+      if (stillStale) {
+        await rm(doomed, { force: true }).catch(() => undefined);
+        return true;
+      }
+      // A new holder took over between our read and the rename — give the
+      // lock back (if the path is occupied again, the renamed copy is a
+      // stale duplicate and safe to discard).
+      await rename(doomed, path).catch(() => rm(doomed, { force: true }).catch(() => undefined));
+      return false;
+    } catch (error) {
+      await rm(doomed, { force: true }).catch(() => undefined);
+      throw error;
     }
   }
 

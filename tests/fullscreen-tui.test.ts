@@ -1394,6 +1394,53 @@ test('blur slows animation to a heartbeat and focus restores full speed', async 
   }
 });
 
+test('a running tool never renders as an active Thinking block', async () => {
+  let releaseSecond!: () => void;
+  const secondGate = new Promise<void>((resolve) => { releaseSecond = resolve; });
+  let request = 0;
+  const tui = await startTui({
+    modelStream: async function* () {
+      request += 1;
+      if (request === 1) {
+        yield { content: null, thinking: 'Choosing the command.', done: false };
+        yield { content: null, toolCalls: [{ id: 'slow', function: { name: 'bash', arguments: { command: 'node -e "setTimeout(()=>{},800)"' } } }], done: false };
+      } else {
+        await secondGate;
+        yield { content: 'Done.', done: true };
+      }
+    },
+  });
+  try {
+    const { screen, input } = tui;
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const visibleText = (): string => plainText(conversation.getContent()).replace(/\{[^}]*\}/g, '');
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    // While the tool executes, the transcript shows the running tool row. The
+    // waiting indicator must not paint the previous reasoning as a live
+    // Thinking block next to it — that reads as "executing while thinking".
+    let sawRunningTool = false;
+    for (let attempt = 0; attempt < 400 && !visibleText().includes('Done.'); attempt++) {
+      const content = visibleText();
+      if (/●\s*Run/.test(content)) {
+        sawRunningTool = true;
+        assert.doesNotMatch(content, /Thinking/, `a running tool must not render a Thinking header:\n${content}`);
+      } else if (sawRunningTool) {
+        break;
+      }
+      await wait(5);
+    }
+    assert.ok(sawRunningTool, `the tool must be observed in its running state, got: ${JSON.stringify(visibleText())}`);
+    releaseSecond();
+    for (let attempt = 0; !visibleText().includes('Done.') && attempt < 200; attempt++) await wait(10);
+  } finally {
+    releaseSecond();
+    await tui.cleanup();
+  }
+});
+
 test('every render flush is a balanced DEC 2026 sync bracket (flicker fix)', async () => {
   const root = await mkdtemp(join(tmpdir(), 'coder-tui-sync-'));
   const input = new PassThrough() as PassThrough & { isTTY: boolean; setRawMode: () => void };

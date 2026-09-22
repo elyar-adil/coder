@@ -111,6 +111,10 @@ export interface LoadedConfig {
   config: AgentConfig;
   /** User-scoped config path used by interactive provider/model management. */
   path?: string;
+  /** The user file's own slice, so interactive saves can stay user-scoped. */
+  userConfig: AgentConfig;
+  /** The project file's own slice ({} when CWD carries no config). */
+  projectConfig: AgentConfig;
 }
 
 function mergeConfig(project: AgentConfig, user: AgentConfig): AgentConfig {
@@ -124,6 +128,44 @@ function mergeConfig(project: AgentConfig, user: AgentConfig): AgentConfig {
       ? { ...(project.models ?? {}), ...(user.models ?? {}) }
       : undefined,
   };
+}
+
+const USER_SCOPED_SCALARS = ['baseUrl', 'model', 'backend', 'apiKey', 'policyLevel', 'artifactsDir', 'theme'] as const;
+
+/** Keep a provider/model record for the user file when the user's own config
+ * defines it or no project config does; project-owned records are defaults,
+ * not things an interactive save should copy into ~/.agentrc. */
+function scopedRecords<T>(next: Record<string, T> | undefined, project: Record<string, T> | undefined, user: Record<string, T> | undefined): Record<string, T> | undefined {
+  if (!next) return undefined;
+  const kept: Record<string, T> = {};
+  for (const [name, value] of Object.entries(next)) {
+    if (user?.[name] !== undefined || project?.[name] === undefined) kept[name] = value;
+  }
+  return Object.keys(kept).length ? kept : undefined;
+}
+
+/**
+ * Reduce a (possibly merged / interactively edited) config down to the slice
+ * that belongs in the user-scoped file: fields the user config already
+ * defines, plus fields introduced outside the project config this session.
+ * Without this, saving after a `/model` or theme change would persist the
+ * project's apiKey/providers into ~/.agentrc where they silently apply to
+ * every other project.
+ */
+export function scopeConfigToUser(next: AgentConfig, project: AgentConfig, user: AgentConfig): AgentConfig {
+  const out: AgentConfig = { ...user };
+  for (const key of USER_SCOPED_SCALARS) {
+    const value = next[key];
+    if (value === undefined) continue;
+    if (project[key] === undefined || user[key] !== undefined) {
+      (out as Record<string, unknown>)[key] = value;
+    }
+  }
+  const providers = scopedRecords(next.providers, project.providers, user.providers);
+  if (providers) out.providers = providers;
+  const models = scopedRecords(next.models, project.models, user.models);
+  if (models) out.models = models;
+  return out;
 }
 
 /**
@@ -290,7 +332,7 @@ function parseConfig(raw: string): AgentConfig {
   return parsed;
 }
 
-async function tryReadConfigWithPath(dir: string): Promise<LoadedConfig | null> {
+async function tryReadConfigWithPath(dir: string): Promise<{ config: AgentConfig; path: string } | null> {
   for (const name of CONFIG_FILES) {
     const path = join(dir, name);
     try {
@@ -320,20 +362,20 @@ export async function loadConfigWithPath(): Promise<LoadedConfig> {
   const sameDir = resolve(process.cwd()).toLowerCase() === resolve(userDir).toLowerCase();
   const projectConfig = sameDir ? null : await tryReadConfigWithPath(process.cwd());
   const userConfig = await tryReadConfigWithPath(userDir);
+  const project = projectConfig?.config ?? {};
+  const user = userConfig?.config ?? {};
   return {
-    config: mergeConfig(projectConfig?.config ?? {}, userConfig?.config ?? {}),
+    config: mergeConfig(project, user),
     path: userConfig?.path ?? join(userDir, '.agentrc'),
+    userConfig: user,
+    projectConfig: project,
   };
 }
 
 export async function saveSelectedModel(model: string): Promise<string> {
   const loaded = await loadConfigWithPath();
-  const nextConfig: AgentConfig = {
-    ...loaded.config,
-    model,
-  };
-
-  return saveConfig(nextConfig, loaded.path);
+  const scoped = scopeConfigToUser({ ...loaded.config, model }, loaded.projectConfig, loaded.userConfig);
+  return saveConfig(scoped, loaded.path);
 }
 
 export async function saveConfig(config: AgentConfig, existingPath?: string): Promise<string> {

@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { copyFile, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 
 const execFileAsync = promisify(execFile);
 
@@ -272,9 +272,15 @@ export class WorktreeManager {
 
   /** Identify the managed worktree containing `path`, if any. */
   async containing(path: string): Promise<WorktreeInfo | undefined> {
+    // resolve() yields backslashes on Windows, so compare against both
+    // separators (a naive `startsWith(path + '/')` never matches there).
     const resolved = resolve(path);
     const all = await this.list();
-    return all.find((info) => resolved === info.path || resolved.startsWith(info.path + '/'));
+    return all.find((info) => {
+      if (resolved === info.path) return true;
+      const prefix = info.path.endsWith(sep) ? info.path : info.path + sep;
+      return resolved.startsWith(prefix) || resolved.startsWith(info.path + '/');
+    });
   }
 
   async unlock(name: string): Promise<void> {

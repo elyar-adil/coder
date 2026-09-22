@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 
-import { loadConfig, saveConfig, saveSelectedModel, type AgentConfig } from './config.js';
+import { loadConfigWithPath, saveConfig, saveSelectedModel, scopeConfigToUser, type AgentConfig } from './config.js';
 import { setToolPolicy } from './infra/tools.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
@@ -14,6 +14,14 @@ import { checkForUpdate, formatUpdateNotice, offerSelfUpdate } from './update-ch
 import { CODER_VERSION } from './version.js';
 
 async function main(): Promise<void> {
+  // Last-resort guard: an unhandled rejection must not silently kill the TUI
+  // mid-session (the Node default is to crash). Individual subsystems handle
+  // their own errors; this only keeps a stray one from losing the session.
+  process.on('unhandledRejection', (reason) => {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    process.stderr.write(`[maw] unhandled error: ${message}\n`);
+  });
+
   const program = new Command();
   program.name('maw').description('Document-driven coding agent runtime').version(CODER_VERSION);
   program.allowExcessArguments(false).showSuggestionAfterError();
@@ -31,7 +39,11 @@ async function main(): Promise<void> {
     if (message) process.stderr.write(`\n${message}\n`);
   };
 
-  let config = await loadConfig();
+  const loadedConfig = await loadConfigWithPath();
+  let config = loadedConfig.config;
+  // Scope tracking for interactive saves: only user-owned fields (plus things
+  // introduced this session) may be persisted to ~/.agentrc.
+  const userScope = { project: loadedConfig.projectConfig, user: loadedConfig.userConfig };
   const selectedFromCli = (): string | undefined => program.opts<{ model?: string }>().model;
   setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
 
@@ -60,7 +72,11 @@ async function main(): Promise<void> {
   const configManager = {
     getConfig: (): AgentConfig => config,
     saveConfig: async (next: AgentConfig): Promise<void> => {
-      await saveConfig(next);
+      // Persist the user-scoped slice only, so a project .agentrc's
+      // baseUrl/apiKey/providers never leak into ~/.agentrc.
+      const scoped = scopeConfigToUser(next, userScope.project, userScope.user);
+      userScope.user = scoped;
+      await saveConfig(scoped);
       config = next;
       setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
     },
@@ -79,7 +95,9 @@ async function main(): Promise<void> {
         await runtime.openSession(sessionId);
         if (selectedFromCli()) await runtime.setSessionDefaultModel(sessionId, selectedFromCli());
         const turnId = await runtime.submitMessage(sessionId, options.prompt);
-        await runtime.waitForIdle(sessionId);
+        // Wait indefinitely: a non-interactive run must not be killed at an
+        // arbitrary 5-minute deadline while its task is still healthy.
+        await runtime.waitForIdle(sessionId, undefined);
         const session = runtime.getSession(sessionId)!;
         const failed = runtime.listInstances(sessionId).find((instance) => instance.status === 'failed');
         if (failed) throw new Error(failed.lastError ?? 'Agent failed');

@@ -229,7 +229,8 @@ describe('bash', () => {
 
   test('returns (no output) for silent command', async () => {
     const result = await executeTool('bash', { command: 'node -e ""' });
-    assert.equal(result, '(no output)');
+    // On Windows the tool appends a note that the shell is cmd.exe.
+    assert.equal(result.replace(/\n\(Note: shell is cmd\.exe[^]*\)$/, ''), '(no output)');
   });
 
   test('returns error when command is missing', async () => {
@@ -256,7 +257,7 @@ describe('bash', () => {
     }, {
       artifactDir,
     });
-    assert.equal(result, '(no output)');
+    assert.equal(result.replace(/\n\(Note: shell is cmd\.exe[^]*\)$/, ''), '(no output)');
     assert.equal(await readFile(join(artifactDir, 'artifact.txt'), 'utf8'), await realpath(artifactDir));
   });
 });

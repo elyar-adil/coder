@@ -809,7 +809,7 @@ export class AgentRuntime {
     })));
   }
 
-  async waitForIdle(sessionId: string, timeoutMs = 300_000): Promise<void> {
+  async waitForIdle(sessionId: string, timeoutMs: number | undefined = 300_000): Promise<void> {
     const idle = (): boolean => {
       const session = this.sessions.get(sessionId);
       return !session || session.instanceIds.every((id) => {
@@ -820,10 +820,12 @@ export class AgentRuntime {
     };
     if (idle()) return;
     await new Promise<void>((resolveWait, reject) => {
-      const timeout = setTimeout(() => { this.idleWaiters.delete(check); reject(new Error('Timed out waiting for agent runtime')); }, timeoutMs);
+      // timeoutMs === undefined waits indefinitely — a non-interactive run
+      // must not kill a healthy long-running task at an arbitrary deadline.
+      const timeout = timeoutMs === undefined ? undefined : setTimeout(() => { this.idleWaiters.delete(check); reject(new Error('Timed out waiting for agent runtime')); }, timeoutMs);
       const check = (): void => {
         if (!idle()) return;
-        clearTimeout(timeout);
+        if (timeout) clearTimeout(timeout);
         this.idleWaiters.delete(check);
         resolveWait();
       };
@@ -913,7 +915,18 @@ export class AgentRuntime {
       if (!instance || instance.status === 'cancelled' || this.activeTurns.has(id)) continue;
       this.activeTurns.add(id);
       this.running.add(id);
-      void this.runTurn(instance).finally(() => {
+      // runTurn handles its own turn errors; this catch is the safety net for
+      // bookkeeping failures (e.g. persistSession) so a rejection can never
+      // escape as an unhandledRejection and kill the whole process.
+      void this.runTurn(instance).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error);
+        if (instance.status === 'running') {
+          instance.status = 'failed';
+          instance.lastError = message;
+          instance.updatedAt = now();
+        }
+        this.emit({ type: 'runtime_error', sessionId: instance.sessionId, instanceId: id, error: message });
+      }).finally(() => {
         this.activeTurns.delete(id);
         this.running.delete(id);
         this.controllers.delete(id);

@@ -45,11 +45,17 @@ export async function* responsesStream(config: BackendConfig, instructions: stri
       for (const frame of frames) {
         const data = frame.split('\n').filter((line) => line.startsWith('data:')).map((line) => line.slice(5).trimStart()).join('\n');
         if (!data || data === '[DONE]') continue;
-        const event = JSON.parse(data) as {
+        let event: {
           type: string; delta?: string; message?: string;
           item?: Record<string, unknown> & { type?: string; call_id?: string; name?: string; arguments?: string };
           response?: { error?: { message?: string }; incomplete_details?: { reason?: string }; usage?: { input_tokens?: number; output_tokens?: number; input_tokens_details?: { cached_tokens?: number }; output_tokens_details?: { reasoning_tokens?: number } } };
         };
+        try {
+          event = JSON.parse(data);
+        } catch {
+          // Tolerate a malformed frame instead of killing the whole stream.
+          continue;
+        }
         if (event.type === 'response.output_text.delta' && event.delta) yield { content: event.delta, done: false };
         if (event.type === 'response.reasoning_summary_text.delta' && event.delta) yield { content: null, thinking: event.delta, done: false };
         if (event.type === 'response.output_item.done' && event.item?.type === 'reasoning') {
@@ -58,7 +64,15 @@ export async function* responsesStream(config: BackendConfig, instructions: stri
         if (event.type === 'response.output_item.done' && event.item?.type === 'function_call') {
           const item = event.item;
           if (!item.call_id || !item.name) throw new Error('Responses returned an incomplete tool call');
-          yield { content: null, toolCalls: [{ id: item.call_id, function: { name: item.name, arguments: JSON.parse(item.arguments ?? '{}') } }], done: false };
+          let args: Record<string, unknown> = {};
+          try {
+            args = JSON.parse(item.arguments ?? '{}') as Record<string, unknown>;
+          } catch {
+            // Let the tool report missing/invalid arguments instead of
+            // discarding the whole stream over model-produced JSON.
+            args = { _raw_arguments: item.arguments ?? '' };
+          }
+          yield { content: null, toolCalls: [{ id: item.call_id, function: { name: item.name, arguments: args as Record<string, string> } }], done: false };
         }
         if (['error', 'response.failed', 'response.incomplete'].includes(event.type)) {
           throw new Error(event.response?.error?.message ?? event.message ?? event.response?.incomplete_details?.reason ?? `Responses: ${event.type}`);

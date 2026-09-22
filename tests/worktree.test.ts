@@ -25,6 +25,11 @@ async function git(cwd: string, args: string[]): Promise<string> {
   return result.stdout;
 }
 
+/** Git checkout may translate LF to CRLF (core.autocrlf), so compare LF-normalized. */
+function readFileLf(path: string): Promise<string> {
+  return readFile(path, 'utf8').then((s) => s.replace(/\r\n/g, '\n'));
+}
+
 async function initRepo(name: string): Promise<string> {
   const dir = join(root, name);
   await mkdir(dir, { recursive: true });
@@ -49,7 +54,7 @@ describe('WorktreeManager', () => {
     assert.equal(info.locked, true);
     assert.equal(info.dirty, false);
     assert.match(info.path, /\.coder[/\\]worktrees[/\\]feature-auth$/);
-    assert.equal(await readFile(join(info.path, 'app.txt'), 'utf8'), 'v1\n');
+    assert.equal(await readFileLf(join(info.path, 'app.txt')), 'v1\n');
 
     // Listed with fresh status.
     const all = await manager.list();
@@ -71,7 +76,7 @@ describe('WorktreeManager', () => {
 
     const manager = new WorktreeManager(repo);
     const info = await manager.create('with-env');
-    assert.equal(await readFile(join(info.path, '.env'), 'utf8'), 'SECRET=1\n');
+    assert.equal(await readFileLf(join(info.path, '.env')), 'SECRET=1\n');
   });
 
   test('reopen is idempotent and dirty worktrees refuse removal', async () => {

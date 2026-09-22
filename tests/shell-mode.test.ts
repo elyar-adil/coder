@@ -32,7 +32,12 @@ test('runShellCommand reports nonzero exit codes without throwing', async () => 
 test('runShellCommand resolves relative commands against the workspace root', async () => {
   const dir = await mkdtemp(join(tmpdir(), 'maw-shell-cwd-'));
   try {
-    const result = await runShellCommand('pwd', {
+    // Windows runs cmd.exe, where `pwd` is whatever a POSIX pwd.exe happens to
+    // be on PATH (MSYS prints /tmp-style paths) — probe via node instead.
+    const command = process.platform === 'win32'
+      ? 'node -p process.cwd()'
+      : 'pwd';
+    const result = await runShellCommand(command, {
       workspaceRoot: dir,
       timeoutMs: 15_000,
     });
@@ -71,5 +76,11 @@ test('runShellCommand reports exit 127 for unknown commands', async () => {
     workspaceRoot: process.cwd(),
     timeoutMs: 15_000,
   });
-  assert.equal(result.exitCode, 127);
+  // POSIX shells standardize "command not found" as 127; cmd.exe does not
+  // (observed 1 or 9009 depending on Windows version), so just require nonzero.
+  if (process.platform === 'win32') {
+    assert.notEqual(result.exitCode, 0);
+  } else {
+    assert.equal(result.exitCode, 127);
+  }
 });

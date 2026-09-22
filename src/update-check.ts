@@ -21,16 +21,13 @@ import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, resolve, sep } from 'node:path';
-import { createRequire } from 'node:module';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 
 import { atomicReplaceFile } from './runtime/file-lock.js';
+import { PACKAGE_JSON } from './version.js';
 
-const require = createRequire(import.meta.url);
-const pkg = require('../package.json') as { name?: string; version?: string };
-
-const PKG_NAME = pkg.name ?? 'tokenmaw';
+const PKG_NAME = PACKAGE_JSON.name ?? 'tokenmaw';
 const REGISTRY_URL = 'https://registry.npmjs.org';
 const NPM_MIRROR_REGISTRY = 'https://registry.npmmirror.com';
 const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
@@ -239,7 +236,7 @@ async function registryReachable(packageName: string, registry: string, fetchImp
  * the result so callers can keep the session running.
  */
 export async function selfUpdate(options: SelfUpdateOptions = {}): Promise<SelfUpdateResult> {
-  const current = pkg.version ?? '0.0.0';
+  const current = PACKAGE_JSON.version ?? '0.0.0';
   const target = options.version ?? 'latest';
   const packageName = options.packageName ?? PKG_NAME;
   const npmCommand = options.npmCommand ?? 'npm';
@@ -366,7 +363,7 @@ async function fetchLatestVersion(registryUrl: string, fetchImpl: typeof fetch):
  * any error — update checks must never break the CLI.
  */
 export async function checkForUpdate(options: UpdateCheckOptions = {}): Promise<UpdateCheckResult | null> {
-  const current = pkg.version ?? '0.0.0';
+  const current = PACKAGE_JSON.version ?? '0.0.0';
   if (updateCheckDisabled()) return null;
   const path = options.cacheFile ?? cacheFilePath();
   const registryUrl = (options.registryUrl ?? REGISTRY_URL).replace(/\/$/, '');
