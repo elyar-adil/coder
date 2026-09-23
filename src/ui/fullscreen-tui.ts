@@ -13,7 +13,6 @@ import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
 import { runShellCommand } from '../infra/tools.js';
 import { diffPreview, elapsedLabel, isWaitingForFirstToken, spinnerGlyph, STATUS_PRESENTATION, toolPresentation, tuiLayout, visibleTimelineEntries, waitingIndicatorFrame } from './tui-design.js';
-import { attachPillScrollbar, type PillScrollbarHandle, type PillScrollbarTheme, pillScrollbarColors } from './scrollbar.js';
 import { recordTimeline, recordShellRun } from '../runtime/session-timeline.js';
 import { otherWorkspaceInstances, type WorkspaceInstanceInfo } from '../runtime/workspace-instances.js';
 import { activeTuiTheme, resolveTheme, setActiveTheme, themeNames } from './theme.js';
@@ -269,8 +268,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const conversation = blessed.box({
     parent: screen, top: 0, left: 0, width: '100%', bottom: 3,
     tags: true, scrollable: true, alwaysScroll: true, keys: true, vi: true, mouse: true, autoFocus: false,
+    scrollbar: { ch: ' ' },
     padding: { left: 2, right: 2 },
-    style: { bg: COLOR().background, fg: COLOR().text },
+    style: {
+      bg: COLOR().background, fg: COLOR().text,
+      scrollbar: { bg: COLOR().accent, fg: COLOR().accent },
+    },
   });
   // Full-width surface keeps the composer visually continuous at both edges;
   // the editable text box is inset on top of this backdrop.
@@ -281,9 +284,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   const activity = blessed.list({
     parent: screen, top: 3, right: 0, width: '28%', bottom: 2,
     tags: true, keys: true, vi: true, mouse: true,
-    scrollable: true, padding: { left: 1, right: 1 },
+    scrollable: true, scrollbar: { ch: ' ' },
+    padding: { left: 1, right: 1 },
     style: {
       bg: COLOR().activity, fg: COLOR().muted,
+      scrollbar: { bg: COLOR().accent, fg: COLOR().accent },
       selected: { bg: COLOR().elevated, fg: COLOR().accent, bold: true },
     },
   });
@@ -314,14 +319,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     parent: screen, top: 0, right: 0, width: '28%', height: 3, hidden: true, tags: true,
     padding: { left: 1, right: 1 }, style: { bg: COLOR().activity, fg: COLOR().text },
   });
-  const activityDetailScrollbar: { current?: PillScrollbarHandle } = {};
   let activityDetail: { instanceId: string; modal: blessed.Widgets.BoxElement; body: blessed.Widgets.BoxElement } | undefined;
-
-  // Pill scrollbars are screen-level overlay elements; they resolve theme
-  // colors on every sync, so a theme switch needs no extra patching.
-  const pillColors = (): PillScrollbarTheme => pillScrollbarColors(COLOR());
-  const conversationScrollbar = attachPillScrollbar(conversation, pillColors);
-  const activityScrollbar = attachPillScrollbar(activity, pillColors);
 
   // Persistent widgets capture style objects at creation time; a theme switch
   // must patch them in place so the repaint picks up the new palette.
@@ -350,6 +348,16 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     completions.style.selected = { bg: c.elevated, fg: c.accent, bold: true };
     activityHeader.style.bg = c.activity;
     activityHeader.style.fg = c.text;
+    conversation.style.scrollbar = { bg: c.accent, fg: c.accent };
+    activity.style.scrollbar = { bg: c.accent, fg: c.accent };
+    if ((conversation as unknown as { track?: { style: Record<string, unknown> } }).track) {
+      const track = (conversation as unknown as { track: { style: Record<string, unknown> } }).track;
+      track.style = { ...track.style, bg: c.background, fg: c.background };
+    }
+    if ((activity as unknown as { track?: { style: Record<string, unknown> } }).track) {
+      const track = (activity as unknown as { track: { style: Record<string, unknown> } }).track;
+      track.style = { ...track.style, bg: c.activity, fg: c.activity };
+    }
   };
   applyWidgetTheme();
 
@@ -1389,11 +1397,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const composerFocused = composerPinned;
     if (composerFocused && screen.focused !== composer) composer.focus();
     if (composerFocused) screen.program.hideCursor();
-    // Overlay scrollbars must be positioned before the render pass that
-    // paints them.
-    conversationScrollbar.sync();
-    activityScrollbar.sync();
-    activityDetailScrollbar.current?.sync();
     renderScreen(composerFocused ? syncComposerCursor : undefined);
   };
 
@@ -1571,7 +1574,11 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const body = blessed.box({
       parent: modal, top: 3, left: 2, right: 2, bottom: 2,
       tags: true, keys: true, vi: true, mouse: true, scrollable: true, alwaysScroll: true,
-      style: { bg: COLOR().modal, fg: COLOR().text },
+      scrollbar: { ch: ' ' },
+      style: {
+        bg: COLOR().modal, fg: COLOR().text,
+        scrollbar: { bg: COLOR().accent, fg: COLOR().accent },
+      },
       content: activityDetailContent(instance),
     });
     blessed.box({
@@ -1580,8 +1587,6 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     });
     const closeDetail = (): void => {
       if (activityDetail?.modal !== modal) return;
-      activityDetailScrollbar.current?.destroy();
-      activityDetailScrollbar.current = undefined;
       activityDetail = undefined;
       modal.destroy();
       requestFullRedraw();
@@ -1589,11 +1594,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     };
     body.key(['escape', 'q'], closeDetail);
     attachCloseButton(modal, closeDetail);
-    activityDetailScrollbar.current = attachPillScrollbar(body, pillColors);
     activityDetail = { instanceId: instance.instanceId, modal, body };
     body.focus();
     requestFullRedraw();
-    activityDetailScrollbar.current.sync();
     renderScreen();
   };
 
