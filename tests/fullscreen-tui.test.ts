@@ -29,6 +29,7 @@ async function startTui(options: {
   screen: blessed.Widgets.Screen;
   input: PassThrough & { isTTY: boolean; setRawMode: () => void };
   savedConfigs: AgentConfig[];
+  runtime: AgentRuntime;
   finish: () => void;
   cleanup: () => Promise<void>;
 }> {
@@ -68,6 +69,7 @@ async function startTui(options: {
       screen: lockedScreen,
       input,
       savedConfigs,
+      runtime,
       // Ctrl+C now quits only on a second press within 2s; emit twice so the
       // arm + quit land even when another handler consumed an earlier press.
       finish: () => {
@@ -1529,5 +1531,62 @@ test('every render flush is a balanced DEC 2026 sync bracket (flicker fix)', asy
     await runtime.shutdown();
     input.destroy(); output.destroy();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an expanded thinking fold shows reasoning only — tool activity stays in its own entries', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'coder-tui-ws-'));
+  await writeFile(join(workspace, 'note.txt'), 'steady content\n');
+  let releaseTurn!: () => void;
+  const turnGate = new Promise<void>((resolve) => { releaseTurn = resolve; });
+  let call = 0;
+  const tui = await startTui({
+    workspaceRoot: workspace,
+    modelStream: async function* () {
+      // Phase 0 streams reasoning and parks so the test can inject tool
+      // activity while the thinking block is live and rendered; phase 1 runs
+      // real tools so the transcript grows genuine per-tool entries.
+      if (call++ === 0) {
+        yield { content: null, thinking: 'Inspecting the note before answering. ', done: false };
+        await turnGate;
+        yield { content: null, toolCalls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'note.txt' } } }], done: false };
+        yield { content: 'All done.', done: true };
+        return;
+      }
+      yield { content: 'ok', done: true };
+    },
+  });
+  try {
+    const { screen, input, runtime } = tui;
+    const emit = (event: unknown) => (runtime as unknown as { emit: (e: unknown) => void }).emit(event);
+    const editor = screen.focused as blessed.Widgets.BoxElement;
+    const conversation = screen.children[1] as blessed.Widgets.BoxElement;
+    const mouse = async (button: number, x: number, y: number, release = false): Promise<void> => {
+      input.write(`\x1b[<${button};${x + 1};${y + 1}${release ? 'm' : 'M'}`);
+      await tick();
+    };
+    const visibleRows = () => screen.lines.map((row) => row.map((cell) => cell[1]).join(''));
+    input.write('hi');
+    await tick();
+    editor.emit('keypress', '', { name: 'enter' });
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('Inspecting the note') && attempt < 200; attempt++) await wait(10);
+    // Activity from a foreign turn (e.g. a subagent) must never leak into the
+    // rendered thinking fold: it may only flip the label, not add body lines.
+    emit({ type: 'tool_started', instanceId: 'foreign-instance', turnId: 'foreign-turn', tool: 'child_tool', input: '{}' });
+    emit({ type: 'tool_finished', instanceId: 'foreign-instance', turnId: 'foreign-turn', tool: 'child_tool', output: 'ok: true' });
+    releaseTurn();
+    for (let attempt = 0; !plainText(conversation.getContent()).includes('All done.') && attempt < 200; attempt++) await wait(10);
+    const thinkingRow = visibleRows().findIndex((row) => row.includes('Thought'));
+    assert.ok(thinkingRow >= 0, 'the completed Thought header must render before it can be expanded');
+    await mouse(0, 3, thinkingRow);
+    await mouse(0, 3, thinkingRow, true);
+    const transcript = plainText(conversation.getContent());
+    assert.match(transcript, /Inspecting the note/, 'expansion still shows the reasoning body');
+    const leaked = transcript.split('\n').filter((line) => /^\s+(?:→|✓) /.test(line));
+    assert.equal(leaked.length, 0, `tool activity lines must stay out of the thinking fold, got: ${JSON.stringify(leaked)}`);
+  } finally {
+    releaseTurn();
+    await tui.cleanup();
+    await rm(workspace, { recursive: true, force: true });
   }
 });

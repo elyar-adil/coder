@@ -119,7 +119,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     turnId: string;
     thinking?: string;
     expanded: boolean;
-    content: string[];
+    // Tool calls render as their own collapsible timeline entries; this
+    // counter only flips an active block's label to Working while tools run
+    // inside the turn, never into the fold's body.
+    activityCount: number;
     status: 'active' | 'completed';
     startedAt?: number;
     finishedAt?: number;
@@ -191,7 +194,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       if (message.thinking && message.turnId) restored.set(message.turnId, `${restored.get(message.turnId) ?? ''}${message.thinking}`);
     }
     for (const [turnId, thinking] of restored) {
-      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'completed', thinking });
+      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, activityCount: 0, status: 'completed', thinking });
     }
   };
   restoreThinking();
@@ -1050,7 +1053,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         }
         const expanded = thinkingBlocks.get(entry.id)?.expanded ?? false;
         const previous = thinkingBlocks.get(entry.id);
-        const block: ThinkingBlock = { turnId: entry.id, expanded, content: previous?.content ?? [],
+        const block: ThinkingBlock = { turnId: entry.id, expanded, activityCount: previous?.activityCount ?? 0,
           status: entry.status === 'running' ? 'active' : 'completed',
           thinking: entry.kind === 'thinking' ? entry.content : previous?.thinking,
           startedAt: previous?.startedAt ?? entry.startedAt ?? thinkingStartedAt.get(entry.turnId ?? '') ?? (entry.status === 'running' ? Date.now() : undefined),
@@ -1139,7 +1142,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     if (!session.timeline && pendingTurns.size > 0) {
       const turnId = [...pendingTurns][0];
       if (!thinkingBlocks.has(turnId)) {
-        thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+        thinkingBlocks.set(turnId, { turnId, expanded: false, activityCount: 0, status: 'active', startedAt: Date.now() });
         markThinkingStart(turnId);
       }
       if (!renderedBlocks.has(turnId)) {
@@ -1283,7 +1286,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     // An active block with nothing to show yet is the pre-first-token state:
     // the model is reasoning, so label it Thinking, not Working.
     const label = block.status === 'active'
-      ? (block.thinking || block.content.length === 0 ? 'Thinking' : 'Working')
+      ? (block.thinking || block.activityCount === 0 ? 'Thinking' : 'Working')
       : (block.thinking ? 'Thought' : 'Activity');
     const duration = elapsedLabel(block.startedAt, block.finishedAt);
     const durationText = duration ? `  ${duration}` : '';
@@ -1298,16 +1301,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     stickyHeaderLines.set(block.turnId, headerText);
     latestThinkingTurnId = block.turnId;
     if (block.expanded) {
+      // The fold shows reasoning text only; tool calls stay in their own
+      // timeline entries below, never duplicated inside the thinking body.
       if (block.thinking) {
         for (const line of safe(block.thinking).split('\n')) pushConversationLine(`  ${line}`);
         pushConversationLine('');
-      }
-      const content = block.content.length > 0 ? block.content : block.thinking ? [] : ['Waiting for activity…'];
-      for (const c of content) {
-        const rendered = c.includes('```diff\n')
-          ? renderTuiMarkdown(c, Math.max(10, Number(conversation.width) - 8))
-          : safe(c);
-        for (const line of rendered.split('\n')) pushConversationLine(`  ${line}`);
+      } else if (block.status === 'active') {
+        pushConversationLine('  Waiting for activity…');
       }
     }
     pushConversationLine('');
@@ -1917,7 +1917,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         const main = runtime.getInstance(session.mainInstanceId);
         if (main && ['running', 'queued', 'waiting'].includes(main.status)) pendingTurns.add(turnId);
         if (pendingTurns.has(turnId) && !thinkingBlocks.has(turnId)) {
-          thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+          thinkingBlocks.set(turnId, { turnId, expanded: false, activityCount: 0, status: 'active', startedAt: Date.now() });
           markThinkingStart(turnId);
         }
         startSpinner();
@@ -1974,21 +1974,10 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       const log = activityLog.get(event.instanceId) ?? [];
       log.push(`${event.tool}  ${oneLine(event.type === 'tool_started' ? event.input : event.output, 120)}`);
       activityLog.set(event.instanceId, log.slice(-100));
-    }
-    if (event.type === 'tool_started') {
-      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find(b => b.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
-      if (block) {
-        const agent = runtime.getInstance(event.instanceId)?.agentId;
-        block.content.push(`→ ${agent && agent !== 'main' ? `${agent} · ` : ''}${event.tool}  ${oneLine(event.input, 60)}`);
-      }
-    }
-    if (event.type === 'tool_finished') {
-      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find(b => b.status === 'active') ?? thinkingBlocks.get(latestThinkingTurnId ?? '');
-      if (block) {
-        block.content.push(`✓ ${event.tool}  ${oneLine(event.output, 60)}`);
-        const patch = toolDiff(event.tool, event.output);
-        if (patch) block.content.push(patch);
-      }
+      // The transcript draws each call as its own collapsible entry; the
+      // thinking fold only counts the activity so its label can read Working.
+      const block = thinkingBlocks.get(event.turnId) ?? [...thinkingBlocks.values()].reverse().find(item => item.status === 'active');
+      if (block) block.activityCount += 1;
     }
     if (event.type === 'context_compacted' && event.sessionId === sessionId) {
       conversationDirty = true;
@@ -2019,7 +2008,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       for (const [id, block] of thinkingBlocks) {
         if (id !== turnId) { block.status = 'completed'; block.finishedAt = Date.now(); streams.delete(id); }
       }
-      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, content: [], status: 'active', startedAt: Date.now() });
+      if (!thinkingBlocks.has(turnId)) thinkingBlocks.set(turnId, { turnId, expanded: false, activityCount: 0, status: 'active', startedAt: Date.now() });
       markThinkingStart(turnId);
       startSpinner();
       startStreamTimer();
