@@ -21,11 +21,11 @@
 9. **SWE-bench Lite eval** — harness 已有，repo 级 benchmark 还是 placeholder
 10. **成本护栏** — usage 有了，无 budget 预警/上限
 
-## 待修安全债（顺手做，不阻塞能力演进）
-- A1 原子写 EPERM 毁文件（`tools.ts:123`、`agent-store.ts:26`）
-- A3 symlink 逃逸（无 realpath）
-- B1 SSE error 被 catch 吞掉（`backend.ts:650`）
-- B3 重试忽略 Retry-After
+## 待修安全债（2026-09-26 更新：四项已全部修完）
+- ✅ A1 原子写（`src/infra/tools.ts` stagedWrite + atomicWrite）
+- ✅ A3 symlink 逃逸（`src/infra/tools.ts` executeBuiltinTool 出口处 realpath 包含检查，policy level off 时跳过）
+- ✅ B1 SSE error 被吞（provider error 事件现在使流失败）
+- ✅ B3 重试尊重 Retry-After（`src/fetch.ts` 解析头部并封顶 60s，FetchError 携带 retryAfterMs，agent-runtime 流重试取两者较大值）
 
 ## 已有优势
 - 多 agent mailbox 运行时完整（spawn/send/wait/cancel、深度扇出限制）

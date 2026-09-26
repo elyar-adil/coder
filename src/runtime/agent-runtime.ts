@@ -1262,7 +1262,9 @@ export class AgentRuntime {
             if (controller.signal.aborted || instance.activeTurnId !== turnId) return;
             const emitted = text.length > 0 || thinking.length > 0 || calls.length > 0 || responseItems.length > 0;
             if (emitted || attempt >= STREAM_RETRY_LIMIT || !isRetriableStreamError(error)) throw error;
-            await waitMs(500 * (attempt + 1));
+            // A rate-limit response may carry Retry-After; wait at least that long.
+            const advertised = error instanceof FetchError ? error.retryAfterMs : undefined;
+            await waitMs(Math.max(500 * (attempt + 1), advertised ?? 0));
           }
         }
         instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });

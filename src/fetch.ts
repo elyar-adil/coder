@@ -21,10 +21,27 @@ export class FetchError extends Error {
     message: string,
     public readonly status: number | null,
     public readonly retriable: boolean,
+    /** Server-advertised wait (Retry-After) in ms, when the failing response carried one. */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'FetchError';
   }
+}
+
+/** Retry-After can legitimately ask for minutes; retrying must stay responsive,
+ * so the advertised wait is capped and a still-failing provider eventually
+ * surfaces as an error instead of hanging the turn. */
+const RETRY_AFTER_CAP_MS = 60_000;
+
+function parseRetryAfter(response: Response): number | null {
+  const header = response.headers.get('retry-after');
+  if (!header) return null;
+  const seconds = Number(header);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.min(seconds * 1000, RETRY_AFTER_CAP_MS);
+  const date = Date.parse(header);
+  if (Number.isFinite(date)) return Math.min(Math.max(0, date - Date.now()), RETRY_AFTER_CAP_MS);
+  return null;
 }
 
 function isRetriable(status: number | null, error: unknown): boolean {
@@ -95,9 +112,11 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
 
       if (!response.ok) {
         const retriable = isRetriable(response.status, null);
+        // A server that sends Retry-After knows its backoff better than our
+        // exponential guess; honor it verbatim (capped) for the wait.
+        const advertised = retriable ? parseRetryAfter(response) : null;
         if (retriable && attempt < retries) {
-          const delay = retryDelay * Math.pow(2, attempt);
-          await sleep(delay);
+          await sleep(advertised ?? retryDelay * Math.pow(2, attempt));
           continue;
         }
         const body = await errorResponseBody(response);
@@ -105,6 +124,7 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
           getErrorMessage(response.status, null) + (body ? `: ${body}` : ''),
           response.status,
           false,
+          advertised ?? undefined,
         );
       }
 
