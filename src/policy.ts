@@ -48,7 +48,7 @@ export function readOnlyPolicy(base: ToolPolicy): ToolPolicy {
   return policy;
 }
 
-function withinRoots(target: string, roots: string[]): boolean {
+export function withinRoots(target: string, roots: string[]): boolean {
   const norm = resolve(target);
   return roots.some((r) => {
     const root = resolve(r);

@@ -1,4 +1,4 @@
-import { readFile, writeFile, readdir, mkdir, stat, rename, rm } from 'node:fs/promises';
+import { readFile, writeFile, readdir, mkdir, stat, rename, rm, lstat, realpath } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { exec, execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -13,6 +13,8 @@ import {
   clonePolicy,
   defaultPolicy,
   formatPolicyError,
+  withinRoots,
+  type PolicyDecision,
   type ToolPolicy,
 } from '../policy.js';
 
@@ -58,6 +60,94 @@ function authorizeWithResolvedPath(policy: ToolPolicy, name: string, path: strin
   const target = resolveWriteTarget(path, ctx);
   const decision = authorizeToolCall(policy, name, { path: target });
   return decision.ok ? undefined : formatPolicyError(name, decision);
+}
+
+const READ_PATH_TOOLS = new Set([
+  'read_file', 'read_files', 'file_info', 'list_dir', 'search_text', 'search_files',
+  'repo_map', 'git_diff', 'git_log',
+]);
+const WRITE_PATH_TOOLS = new Set(['write_file', 'edit_file']);
+
+/** Resolved forms of policy roots; roots are few and static per process. */
+const realRootCache = new Map<string, string>();
+async function realRoot(root: string): Promise<string> {
+  let real = realRootCache.get(root);
+  if (!real) {
+    real = await realpath(root).catch(() => root);
+    realRootCache.set(root, real);
+  }
+  return real;
+}
+
+/**
+ * Resolve a path through the filesystem for containment checks. The nearest
+ * existing ancestor is realpath'd — a write target may not exist yet — and
+ * any remaining component must not itself be a symlink: a link that cannot be
+ * resolved has no safe real location, so refusing is the only sound answer.
+ */
+async function realResolvePath(target: string): Promise<string | undefined> {
+  let existing = target;
+  const tail: string[] = [];
+  for (;;) {
+    try {
+      await stat(existing);
+      break;
+    } catch {
+      const parent = dirname(existing);
+      if (parent === existing) break;
+      tail.unshift(basename(existing));
+      existing = parent;
+    }
+  }
+  let resolved = await realpath(existing).catch(() => existing);
+  for (const part of tail) {
+    resolved = join(resolved, part);
+    if ((await lstat(resolved).catch(() => undefined))?.isSymbolicLink()) return undefined;
+  }
+  return resolved;
+}
+
+/**
+ * Lexical policy checks are escaped by a symlink inside an allowed root whose
+ * real target lies outside (or a link dangling mid-path). Re-check containment
+ * against the filesystem-resolved path and the resolved roots. No-op at policy
+ * level 'off', which by design allows absolute paths anywhere.
+ */
+async function symlinkEscapeDecision(
+  policy: ToolPolicy,
+  name: string,
+  args: Record<string, unknown>,
+  ctx?: BuiltinToolContext,
+): Promise<PolicyDecision | undefined> {
+  if (policy.level === 'off') return undefined;
+  let targets: string[] = [];
+  let roots: string[];
+  if (name === 'read_files') {
+    const paths = parseStringArray(args['paths']) ?? [];
+    targets = paths.map((path) => resolveToolPath(path, ctx));
+    roots = policy.allowedReadRoots;
+  } else if (READ_PATH_TOOLS.has(name) || WRITE_PATH_TOOLS.has(name)) {
+    const raw = name === 'repo_map' && typeof args['root'] === 'string' ? args['root']
+      : typeof args['path'] === 'string' ? args['path'] : '.';
+    targets = [WRITE_PATH_TOOLS.has(name) ? resolveWriteTarget(raw, ctx) : resolveToolPath(raw, ctx)];
+    roots = WRITE_PATH_TOOLS.has(name) ? policy.allowedWriteRoots : policy.allowedReadRoots;
+  } else if (name === 'bash') {
+    const cwdArg = typeof args['cwd'] === 'string' ? args['cwd'] : policy.workspaceRoot;
+    targets = [isAbsolute(cwdArg) ? cwdArg : resolve(policy.workspaceRoot, cwdArg)];
+    roots = policy.allowedReadRoots;
+  } else {
+    return undefined;
+  }
+  for (const target of targets) {
+    // A target the lexical gate already rejects needs no second opinion.
+    if (!withinRoots(target, roots)) continue;
+    const resolved = await realResolvePath(target);
+    const resolvedRoots = await Promise.all(roots.map(realRoot));
+    if (!resolved || !withinRoots(resolved, resolvedRoots)) {
+      return { ok: false, ruleId: 'path_symlink_escape', reason: `Path resolves outside the workspace through a symlink: ${target}` };
+    }
+  }
+  return undefined;
 }
 
 async function writeViaWorkspace(targetPath: string, content: string, ctx?: BuiltinToolContext): Promise<string> {
@@ -995,6 +1085,8 @@ async function executeBuiltinTool(
   const policy = ctx?.policy ?? getToolPolicy();
   const decision = authorizeToolCall(policy, name, args);
   if (!decision.ok) return formatPolicyError(name, decision);
+  const escape = await symlinkEscapeDecision(policy, name, args, ctx);
+  if (escape) return formatPolicyError(name, escape);
 
   switch (name) {
     case 'search_text': {
