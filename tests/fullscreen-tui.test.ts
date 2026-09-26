@@ -58,6 +58,7 @@ async function startTui(options: {
   try {
     await runtime.whenReady();
     done = runFullscreenTui(runtime, {
+      motion: 'full',
       modelName: 'test',
       resolveModel: () => ({ name: 'test', config: { type: 'ollama', baseUrl: 'http://test', model: 'test' } }),
       configManager: { getConfig: () => config, saveConfig: async (next) => { savedConfigs.push(next); config = next; } },
@@ -640,6 +641,7 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     await runtime.whenReady();
     done = runFullscreenTui(runtime, {
       copyToClipboard: async (text) => { copied.push(text); },
+      motion: 'full',
       modelName: 'test', resolveModel: () => ({ name: 'test', config: { type: 'ollama', baseUrl: 'http://test', model: 'test' } }),
       configManager: { getConfig: () => ({}), saveConfig: async () => {} },
     });
@@ -734,6 +736,14 @@ test('Windows terminal negotiates mouse reporting and handles raw wheel/click in
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(copied.at(-1), 'Inspecting', 'Ctrl+C copies the selected text instead of exiting');
     assert.equal(screen.focused, editor, 'expanding keeps keyboard focus in the editor');
+    // The same selection can be copied with a terminal right click without
+    // moving focus into the composer or opening a native context menu.
+    await mouse(0, 4, traceRow);
+    await mouse(32, 13, traceRow);
+    await mouse(0, 13, traceRow, true);
+    await mouse(2, 13, traceRow);
+    await mouse(2, 13, traceRow, true);
+    assert.equal(copied.at(-1), 'Inspecting', 'right click copies the selected text');
     input.write('next edit');
     await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(editor.getContent(), 'next edit', 'typing immediately after expansion edits the draft');
@@ -1471,6 +1481,7 @@ test('every render flush is a balanced DEC 2026 sync bracket (flicker fix)', asy
   try {
     await runtime.whenReady();
     done = runFullscreenTui(runtime, {
+      motion: 'full',
       modelName: 'test', resolveModel: () => ({ name: 'test', config: { type: 'ollama', baseUrl: 'http://test', model: 'test' } }),
       configManager: { getConfig: () => ({}), saveConfig: async () => {} },
     });

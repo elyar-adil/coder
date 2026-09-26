@@ -88,4 +88,21 @@ describe('resilientFetch', () => {
       always429.closeAllConnections?.();
     }
   });
+
+  it('cancels an in-flight Retry-After wait', async (t) => {
+    t.mock.method(globalThis, 'fetch', async () => new Response('', {
+      status: 429,
+      headers: { 'retry-after': '2' },
+    }));
+    const controller = new AbortController();
+    const startedAt = Date.now();
+    const pending = resilientFetch('http://example.test/retry', {
+      signal: controller.signal,
+      retries: 1,
+      retryDelay: 1,
+    });
+    setTimeout(() => controller.abort(), 20);
+    await assert.rejects(pending, (error: unknown) => error instanceof FetchError && error.message === 'Request aborted');
+    assert.ok(Date.now() - startedAt < 500, 'abort should interrupt Retry-After instead of waiting for the full delay');
+  });
 });

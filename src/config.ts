@@ -38,11 +38,11 @@
  * connection.
  */
 
-import { readFile, writeFile, mkdir, rename, rm } from 'node:fs/promises';
-import { dirname, join, resolve } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { homedir } from 'node:os';
-import { randomUUID } from 'node:crypto';
 import type { BackendType } from './backend.js';
+import { atomicWriteFile } from './infra/atomic-write.js';
 
 const BACKENDS = ['ollama', 'openai', 'anthropic'];
 
@@ -85,23 +85,6 @@ export interface AgentModelConfig {
 
 const CONFIG_FILES = ['.agentrc', '.agentrc.json'];
 const configWrites = new Map<string, Promise<void>>();
-
-async function replaceConfigFile(tempPath: string, path: string): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    try {
-      await rename(tempPath, path);
-      return;
-    } catch (error) {
-      lastError = error;
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code !== 'EPERM' && code !== 'EEXIST' && code !== 'EACCES') throw error;
-      await rm(path, { force: true }).catch(() => undefined);
-      await new Promise((resolveP) => setTimeout(resolveP, (attempt + 1) * 4));
-    }
-  }
-  throw lastError;
-}
 
 function configHome(): string {
   return process.env.CODER_CONFIG_HOME?.trim() || homedir();
@@ -383,15 +366,7 @@ export async function saveConfig(config: AgentConfig, existingPath?: string): Pr
   const payload = `${JSON.stringify(config, null, 2)}\n`;
   const previous = configWrites.get(path) ?? Promise.resolve();
   const next = previous.catch(() => undefined).then(async () => {
-    await mkdir(dirname(path), { recursive: true });
-    const tempPath = `${path}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await writeFile(tempPath, payload, 'utf8');
-      await replaceConfigFile(tempPath, path);
-    } catch (error) {
-      await rm(tempPath, { force: true }).catch(() => undefined);
-      throw error;
-    }
+    await atomicWriteFile(path, payload, { mode: 0o600 });
   });
   configWrites.set(path, next);
   try {

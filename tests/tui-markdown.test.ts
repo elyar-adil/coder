@@ -42,3 +42,12 @@ test('renders GFM pipe tables through the prose path with aligned columns', () =
   assert.ok(plain.includes('─────┼─────'));
   assert.ok(plain.includes('张三 │ 30'));
 });
+
+test('keeps braces and Markdown syntax visible inside code blocks', () => {
+  const rendered = renderTuiMarkdown('```typescript\nconst value = { ok: true };\n```', 48);
+  assert.match(rendered, /const/);
+  assert.match(rendered, /\{open\}/);
+  assert.match(rendered, /\{close\}/);
+  assert.match(rendered, /┌/);
+  assert.match(rendered, /└/);
+});

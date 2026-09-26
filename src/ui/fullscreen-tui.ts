@@ -8,7 +8,7 @@ import type { AgentEvent, AgentInstance, AgentSession } from '../domain/agent.js
 import { renderTuiMarkdown, toolDiff } from './markdown.js';
 import type { AgentRuntime } from '../runtime/agent-runtime.js';
 import { layoutComposer } from './composer-layout.js';
-import { renderWelcome } from './welcome.js';
+import { INTRO_DURATION, renderWelcome } from './welcome.js';
 import { copyText } from './clipboard.js';
 import { commandMatches } from './commands.js';
 import { runShellCommand } from '../infra/tools.js';
@@ -22,6 +22,7 @@ import { resetTuiMarkdownCache } from './markdown.js';
 import { BRACKETED_PASTE_DISABLE, BRACKETED_PASTE_ENABLE, enableBracketedPaste } from './bracketed-paste.js';
 import { WorktreeManager, type WorktreeInfo } from '../runtime/worktree.js';
 import { installBlessedEmojiWidthSupport } from './blessed-unicode.js';
+import { displayWidth, truncateToDisplayWidth } from './text-width.js';
 
 type ResolvedModel = { name: string; config: BackendConfig };
 
@@ -32,6 +33,8 @@ type ConfigManager = {
 
 export interface FullscreenTuiOptions {
   copyToClipboard?: (text: string) => Promise<void>;
+  /** Decorative motion is opt-in for the product; tests can exercise it explicitly. */
+  motion?: 'full' | 'reduced';
   modelName: string;
   modelAliases?: string[];
   resolveModel: (name?: string) => ResolvedModel;
@@ -45,7 +48,7 @@ const TONE_COLOR = (tone: Tone): string => COLOR()[tone];
 
 function oneLine(value: string | undefined, max = 72): string {
   const text = String(value ?? '').replace(/\s+/g, ' ').trim();
-  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+  return truncateToDisplayWidth(text, max);
 }
 
 function safe(value: string): string {
@@ -54,6 +57,10 @@ function safe(value: string): string {
 
 
 export async function runFullscreenTui(runtime: AgentRuntime, options: FullscreenTuiOptions): Promise<void> {
+  const motionSetting = (options.motion ?? process.env.MAW_MOTION ?? process.env.CODER_MOTION ?? '').trim().toLowerCase();
+  // Keep every terminal on the same quiet baseline. Full decoration is an
+  // explicit opt-in so local, Windows and SSH sessions do not drift apart.
+  const reducedMotion = motionSetting !== 'full' && motionSetting !== 'on';
   // Blessed's Unicode table treats modern emoji as one column even though the
   // terminal paints them as two. Fix its shared width table before creating
   // any widgets so incremental redraws do not leave a stale emoji tail cell.
@@ -72,7 +79,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   let spinnerFrame = 0;
   let spinnerTimer: NodeJS.Timeout | undefined;
   let welcomeTimer: NodeJS.Timeout | undefined;
-  let welcomeFrame = 0;
+  let welcomeFrame = reducedMotion ? INTRO_DURATION * 2 : 0;
   let welcomeStartedAt = 0;
   // Set between a committed theme change and the next renderConversation():
   // the welcome clock is then rebased so the mark replays its one-second
@@ -205,8 +212,19 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   // inside a paste insert literally instead of being read as Enter (which
   // used to submit the half-pasted draft).
   const pasteInput = enableBracketedPaste(process.stdin);
+  // Windows Terminal and ConEmu expose a full ANSI/256-color surface even
+  // when PowerShell leaves TERM=dumb. Without an explicit terminal profile,
+  // blessed falls back to eight colors and collapses the welcome gradient and
+  // other hex-colored UI into nearly invisible monochrome output. Keep the
+  // legacy Windows console on its native profile for compatibility.
+  const windowsColorTerminal = process.platform === 'win32'
+    && (!process.env.TERM || /^(?:dumb|windows-ansi)$/i.test(process.env.TERM))
+    && (Boolean(process.env.WT_SESSION) || /^on$/i.test(process.env.ConEmuANSI ?? ''))
+    ? 'xterm-256color'
+    : undefined;
   const screen = blessed.screen({
     input: pasteInput,
+    ...(windowsColorTerminal ? { terminal: windowsColorTerminal } : {}),
     smartCSR: true, fullUnicode: true, forceUnicode: true, title: 'TokenMaw',
     style: { bg: COLOR().background, fg: COLOR().text },
   });
@@ -323,8 +341,9 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   // Pill scrollbars are screen-level overlay elements; they resolve theme
   // colors on every sync, so a theme switch needs no extra patching.
   const pillColors = (): PillScrollbarTheme => pillScrollbarColors(COLOR());
-  const conversationScrollbar = attachPillScrollbar(conversation, pillColors);
-  const activityScrollbar = attachPillScrollbar(activity, pillColors);
+  const scrollbarOptions = { animated: !reducedMotion };
+  const conversationScrollbar = attachPillScrollbar(conversation, pillColors, scrollbarOptions);
+  const activityScrollbar = attachPillScrollbar(activity, pillColors, scrollbarOptions);
 
   // Persistent widgets capture style objects at creation time; a theme switch
   // must patch them in place so the repaint picks up the new palette.
@@ -376,7 +395,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
 
   const renderComposer = (): void => {
     const width = Math.max(2, Number(screen.width) - 5);
-    const result = layoutComposer(composerValue(), composerCursor, width, (text) => Number(composer.strWidth(text)));
+    const result = layoutComposer(composerValue(), composerCursor, width, displayWidth);
     const height = Math.min(Math.max(2, result.rows.length), Math.max(2, Math.min(6, Number(screen.height) - 7)));
     const start = Math.max(0, result.cursor.row - height + 1);
     // A draft starting with `!` is shell mode: the prompt becomes `$` and the
@@ -530,7 +549,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   // each tick onto an eased burst-and-pause rhythm (fast, then slow) so the
   // animation feels alive instead of metronome-slow.
   const startSpinner = (): void => {
-    if (spinnerTimer || pendingTurns.size === 0) return;
+    if (reducedMotion || spinnerTimer || pendingTurns.size === 0) return;
     spinnerTimer = setInterval(() => {
       if (pendingTurns.size === 0 || closed) {
         stopSpinner();
@@ -589,12 +608,12 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       } else {
         // The waiting ellipsis is decoration: frozen while blurred. A skipped
         // frame leaves the screen untouched, so it must not mark it stale.
-        if (!windowFocused) return;
+        if (!windowFocused || reducedMotion) return;
         waitingFrame = (waitingFrame + 1) % 24;
         conversationDirty = true;
       }
       scheduleRefresh();
-    }, 90);
+    }, reducedMotion ? 250 : 90);
     streamTimer.unref?.();
   };
 
@@ -967,13 +986,13 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
         // this moment, and the loop's own shine phase restarts seamlessly
         // because every intro lands on the settled frame-20 state.
         welcomeStartedAt = performance.now();
-        welcomeFrame = 0;
+        welcomeFrame = reducedMotion ? INTRO_DURATION * 2 : 0;
       }
       for (const line of renderWelcome(
         Number(conversation.width) - Number(conversation.iwidth) - 1,
         Number(conversation.height) - Number(conversation.iheight), Number(screen.height), welcomeFrame,
       )) pushConversationLine(line);
-      if (!welcomeTimer) {
+      if (!welcomeTimer && !reducedMotion) {
         welcomeStartedAt = performance.now();
         welcomeTimer = setInterval(() => {
           // Decoration only: frozen while blurred. A skipped frame leaves the
@@ -1589,7 +1608,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     };
     body.key(['escape', 'q'], closeDetail);
     attachCloseButton(modal, closeDetail);
-    activityDetailScrollbar.current = attachPillScrollbar(body, pillColors);
+    activityDetailScrollbar.current = attachPillScrollbar(body, pillColors, scrollbarOptions);
     activityDetail = { instanceId: instance.instanceId, modal, body };
     body.focus();
     requestFullRedraw();
@@ -2043,8 +2062,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     shellAbort = controller;
     // Long-running commands animate the header's ellipsis (same gradient
     // frames as the waiting indicator) so a live job is obvious at a glance.
-    const animation = setInterval(() => {
-      if (closed) { clearInterval(animation); return; }
+    const animation = reducedMotion ? undefined : setInterval(() => {
+      if (closed) { if (animation) clearInterval(animation); return; }
       // Decoration only: frozen while blurred. A skipped frame leaves the
       // screen untouched, so it must not mark the frame stale.
       if (!windowFocused) return;
@@ -2052,7 +2071,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       conversationDirty = true;
       scheduleRefresh();
     }, 60);
-    animation.unref?.();
+    animation?.unref?.();
     conversationDirty = true;
     refresh();
     try {
@@ -2072,7 +2091,7 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
       entry.status = result.exitCode === 0 ? 'completed' : result.exitCode === undefined ? 'cancelled' : 'failed';
       entry.endedAt = Date.now();
     } finally {
-      clearInterval(animation);
+      if (animation) clearInterval(animation);
       if (shellAbort === controller) shellAbort = undefined;
       conversationDirty = true;
       refresh();
@@ -2269,6 +2288,32 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     const { start, end } = selection;
     return start.y < end.y || (start.y === end.y && start.x <= end.x) ? [start, end] : [end, start];
   };
+  const selectedText = (): string | undefined => {
+    const range = orderedSelection();
+    if (!range || !selection) return;
+    const [start, end] = range;
+    const lines: string[] = [];
+    for (let y = start.y; y <= end.y; y++) {
+      const left = y === start.y ? start.x : selection.left;
+      const right = y === end.y ? end.x + 1 : selection.right;
+      lines.push((selection.rows[y] ?? []).slice(left, right).join('').replace(/[\x00\x03]/g, '').trimEnd());
+    }
+    return lines.join('\n');
+  };
+  const copySelection = (): void => {
+    const text = selectedText();
+    if (!text) return;
+    runAction(async () => {
+      try {
+        await (options.copyToClipboard ?? copyText)(text);
+        notice = `Copied ${text.length} characters.`;
+      } finally {
+        selection = undefined;
+      }
+      refresh();
+      focusComposer();
+    });
+  };
   conversation.on('render', () => {
     const range = orderedSelection();
     if (!range || !selection) return;
@@ -2289,9 +2334,17 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
   // misclassified as repeated presses by Blessed 0.1.x on some terminals.
   screen.program.prependListener('mouse', (data: { action: string; button?: string; x: number; y: number; raw?: unknown[] }) => {
     if (nativeSelection) return;
+    const rawButton = Number(data.raw?.[0]);
+    const rightButton = data.button === 'right' || (Number.isFinite(rawButton) && (rawButton & 3) === 2);
+    if (data.action === 'mousedown' && rightButton) {
+      // Consume the press so Blessed does not move focus; selected text is
+      // copied immediately and the terminal remains in the TUI.
+      data.action = 'noop';
+      copySelection();
+      return;
+    }
     const bounds = conversation.lpos;
     if (!bounds) return;
-    const rawButton = Number(data.raw?.[0]);
     const motion = data.action === 'mousemove' || (Number.isFinite(rawButton) && (rawButton & 32) !== 0 && (rawButton & 64) === 0);
     if (motion && selection?.dragging) {
       data.action = 'mousemove';
@@ -2359,21 +2412,8 @@ export async function runFullscreenTui(runtime: AgentRuntime, options: Fullscree
     close();
   };
   screen.key(['C-c'], () => {
-    const range = orderedSelection();
-    if (!range || !selection) { handleBareCtrlC(); return; }
-    const [start, end] = range;
-    const lines: string[] = [];
-    for (let y = start.y; y <= end.y; y++) {
-      const left = y === start.y ? start.x : selection.left;
-      const right = y === end.y ? end.x + 1 : selection.right;
-      lines.push((selection.rows[y] ?? []).slice(left, right).join('').replace(/[\x00\x03]/g, '').trimEnd());
-    }
-    runAction(async () => {
-      try { await (options.copyToClipboard ?? copyText)(lines.join('\n')); }
-      finally { selection = undefined; }
-      refresh();
-      focusComposer();
-    });
+    if (!orderedSelection()) { handleBareCtrlC(); return; }
+    copySelection();
   });
   composer.on('keypress', (_ch, key: { name?: string; ctrl?: boolean }) => {
     if (hasSelection() && !(key.ctrl && key.name === 'c')) { selection = undefined; refresh(); }

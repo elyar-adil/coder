@@ -7,6 +7,10 @@ import { join } from 'node:path';
 
 import { runShellCommand } from '../src/infra/tools.js';
 
+const longRunningCommand = process.platform === 'win32'
+  ? 'node -e "setTimeout(function(){}, 30000)"'
+  : 'sleep 30';
+
 test('runShellCommand streams output and reports the exit code', async () => {
   const chunks: string[] = [];
   const result = await runShellCommand('echo hello-stream && echo err-line >&2', {
@@ -51,7 +55,7 @@ test('runShellCommand resolves relative commands against the workspace root', as
 
 test('runShellCommand aborts a long-running process on signal', async () => {
   const controller = new AbortController();
-  const pending = runShellCommand('sleep 30', {
+  const pending = runShellCommand(longRunningCommand, {
     workspaceRoot: process.cwd(),
     signal: controller.signal,
     timeoutMs: 60_000,
@@ -63,7 +67,7 @@ test('runShellCommand aborts a long-running process on signal', async () => {
 });
 
 test('runShellCommand surfaces timeout as a note instead of throwing', async () => {
-  const result = await runShellCommand('sleep 30', {
+  const result = await runShellCommand(longRunningCommand, {
     workspaceRoot: process.cwd(),
     timeoutMs: 300,
   });

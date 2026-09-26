@@ -1,9 +1,9 @@
-import { mkdir, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
-import { randomUUID } from 'node:crypto';
+import { mkdir, readFile, readdir, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { resolve } from 'node:path';
 
 import type { PersistedAgentSession } from '../domain/agent.js';
+import { atomicWriteFile } from '../infra/atomic-write.js';
 
 const writes = new Map<string, Promise<void>>();
 
@@ -11,23 +11,6 @@ function validSessionId(sessionId: string): void {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(sessionId)) {
     throw new Error('Invalid session id. Use letters, numbers, dot, underscore, or dash.');
   }
-}
-
-async function replaceFile(temp: string, target: string): Promise<void> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt < 6; attempt += 1) {
-    try {
-      await rename(temp, target);
-      return;
-    } catch (error) {
-      lastError = error;
-      const code = (error as NodeJS.ErrnoException).code;
-      if (!['EPERM', 'EEXIST', 'EACCES'].includes(code ?? '')) throw error;
-      await rm(target, { force: true }).catch(() => undefined);
-      await new Promise((resolveWait) => setTimeout(resolveWait, (attempt + 1) * 5));
-    }
-  }
-  throw lastError;
 }
 
 /** First user message, flattened to one line and clipped for session-picker previews. */
@@ -85,15 +68,7 @@ export class AgentRuntimeStore {
     const key = path.toLowerCase();
     const previous = writes.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
-      await mkdir(this.dir, { recursive: true });
-      const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-      try {
-        await writeFile(temp, payload, 'utf8');
-        await replaceFile(temp, path);
-      } catch (error) {
-        await rm(temp, { force: true }).catch(() => undefined);
-        throw error;
-      }
+      await atomicWriteFile(path, payload, { mode: 0o600 });
     });
     writes.set(key, next);
     try { await next; } finally { if (writes.get(key) === next) writes.delete(key); }
@@ -102,12 +77,23 @@ export class AgentRuntimeStore {
   async load(sessionId: string): Promise<PersistedAgentSession | undefined> {
     const path = this.path(sessionId);
     await writes.get(path.toLowerCase())?.catch(() => undefined);
+    let raw: string;
     try {
-      const parsed = JSON.parse(await readFile(path, 'utf8')) as PersistedAgentSession;
-      return parsed.version === 1 ? parsed : undefined;
-    } catch {
-      return undefined;
+      raw = await readFile(path, 'utf8');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
     }
+    let parsed: PersistedAgentSession;
+    try {
+      parsed = JSON.parse(raw) as PersistedAgentSession;
+    } catch (error) {
+      throw new Error(`Session ${sessionId} is corrupt and was not overwritten: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (parsed.version !== 1 || !parsed.session || !Array.isArray(parsed.instances)) {
+      throw new Error(`Session ${sessionId} has an unsupported or incomplete format and was not overwritten.`);
+    }
+    return parsed;
   }
 
   /** Duplicate one persisted session file under a new session id (used by /fork). */
@@ -165,8 +151,7 @@ export class AgentRuntimeStore {
     const dir = this.archivesDir(sessionId);
     const path = resolve(dir, `${instanceId}.${String(seq).padStart(4, '0')}.json`);
     const payload = `${JSON.stringify({ version: 1, instanceId, seq, messages }, null, 2)}\n`;
-    await mkdir(dir, { recursive: true });
-    await writeFile(path, payload, 'utf8');
+    await atomicWriteFile(path, payload, { mode: 0o600 });
   }
 
   /** Load archived messages for one instance (or all instances of a session). */

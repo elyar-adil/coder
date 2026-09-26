@@ -2,6 +2,17 @@ import { spawn } from 'node:child_process';
 
 /** Clipboard payload travels over stdin, never through shell interpolation. */
 export function copyText(text: string): Promise<void> {
+  const remoteSession = Boolean(process.env.SSH_CONNECTION || process.env.SSH_CLIENT || process.env.SSH_TTY);
+  if (remoteSession) {
+    // OSC52 is understood by modern terminal clients and works through SSH;
+    // wrap it for tmux so the escape sequence reaches the outer terminal.
+    const encoded = Buffer.from(text, 'utf8').toString('base64');
+    const payload = process.env.TMUX
+      ? `\x1bPtmux;\x1b\x1b]52;c;${encoded}\x07\x1b\\`
+      : `\x1b]52;c;${encoded}\x07`;
+    process.stdout.write(payload);
+    return Promise.resolve();
+  }
   const command = process.platform === 'win32' ? 'powershell.exe' : process.platform === 'darwin' ? 'pbcopy' : process.env.WAYLAND_DISPLAY ? 'wl-copy' : 'xclip';
   const args = process.platform === 'win32'
     ? ['-NoProfile', '-NonInteractive', '-Command', '[Console]::InputEncoding = [System.Text.UTF8Encoding]::new(); Set-Clipboard -Value ([Console]::In.ReadToEnd())']

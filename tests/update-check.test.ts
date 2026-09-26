@@ -10,6 +10,7 @@ import {
   checkForUpdate,
   compareSemver,
   formatUpdateNotice,
+  isDevelopmentInstall,
   offerSelfUpdate,
   selfUpdate,
 } from '../src/update-check.js';
@@ -69,6 +70,21 @@ function spawnReturning(code: number | null): { spawnImpl: typeof spawn; command
 }
 
 describe('selfUpdate', () => {
+  it('detects the repository as a development install in ESM', () => {
+    const previousMaw = process.env.MAW_DEV_INSTALL;
+    const previousCoder = process.env.CODER_DEV_INSTALL;
+    delete process.env.MAW_DEV_INSTALL;
+    delete process.env.CODER_DEV_INSTALL;
+    try {
+      assert.equal(isDevelopmentInstall(), true);
+    } finally {
+      if (previousMaw === undefined) delete process.env.MAW_DEV_INSTALL;
+      else process.env.MAW_DEV_INSTALL = previousMaw;
+      if (previousCoder === undefined) delete process.env.CODER_DEV_INSTALL;
+      else process.env.CODER_DEV_INSTALL = previousCoder;
+    }
+  });
+
   it('installs from the China mirror first', async () => {
     const mock = spawnReturning(0);
     const result = await selfUpdate({

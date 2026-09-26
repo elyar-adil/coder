@@ -37,6 +37,8 @@ export interface AgentRuntimeOptions {
   registry?: AgentRegistry;
   store?: AgentRuntimeStore;
   workspaceRoot?: string;
+  /** Directory for relative artifact writes; resolved against the current workspace. */
+  artifactDir?: string;
   defaultModel?: string;
   resolveModel: (alias?: string) => BackendConfig;
   modelStream?: ModelStream;
@@ -279,6 +281,7 @@ export class AgentRuntime {
   readonly registry: AgentRegistry;
   private readonly store: AgentRuntimeStore;
   private workspaceRoot: string;
+  private readonly artifactDir?: string;
   private readonly resolveModel: (alias?: string) => BackendConfig;
   private readonly modelStream: ModelStream;
   private readonly maxConcurrentTurns: number;
@@ -305,6 +308,7 @@ export class AgentRuntime {
 
   constructor(options: AgentRuntimeOptions) {
     this.workspaceRoot = resolve(options.workspaceRoot ?? process.cwd());
+    this.artifactDir = options.artifactDir;
     this.registry = options.registry ?? new AgentRegistry({ workspaceRoot: this.workspaceRoot });
     this.store = options.store ?? new AgentRuntimeStore();
     // Locks live next to session state so tests (which pass a tmp store) and
@@ -1478,6 +1482,7 @@ export class AgentRuntime {
       if (!spec.tools.includes('*') && !spec.tools.includes(name)) return `Error: tool ${name} is not allowed by agent spec ${spec.id}`;
       return executeTool(name, args, {
         workspaceRoot: this.workspaceRoot,
+        ...(this.artifactDir ? { artifactDir: resolve(this.workspaceRoot, this.artifactDir) } : {}),
         taskId: instance.instanceId,
         signal,
         policy: getToolPolicy(),

@@ -116,32 +116,39 @@ async function* ollamaStream(
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-
-  while (true) {
-    const { done, value } = await reader.read();
-    buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = done ? '' : lines.pop() ?? '';
-    for (const line of lines) {
-      const obj = parseNdjsonLine(line);
-      if (!obj) continue;
-      if (obj.message?.thinking) yield { content: null, thinking: obj.message.thinking, done: false };
-      if (obj.message?.content) {
-        yield { content: obj.message.content, done: false };
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = done ? '' : lines.pop() ?? '';
+      for (const line of lines) {
+        const obj = parseNdjsonLine(line);
+        if (!obj) continue;
+        if (obj.message?.thinking) yield { content: null, thinking: obj.message.thinking, done: false };
+        if (obj.message?.content) {
+          yield { content: obj.message.content, done: false };
+        }
+        if (obj.message?.tool_calls?.length) {
+          yield { content: null, toolCalls: obj.message.tool_calls, done: false };
+        }
+        if (obj.done) {
+          const stats = obj as typeof obj & { prompt_eval_count?: number; eval_count?: number };
+          completed = true;
+          yield { content: null, done: true, usage: (stats.prompt_eval_count !== undefined || stats.eval_count !== undefined) ? {
+            inputTokens: stats.prompt_eval_count,
+            outputTokens: stats.eval_count,
+          } : undefined };
+          return;
+        }
       }
-      if (obj.message?.tool_calls?.length) {
-        yield { content: null, toolCalls: obj.message.tool_calls, done: false };
-      }
-      if (obj.done) {
-        const stats = obj as typeof obj & { prompt_eval_count?: number; eval_count?: number };
-        yield { content: null, done: true, usage: (stats.prompt_eval_count !== undefined || stats.eval_count !== undefined) ? {
-          inputTokens: stats.prompt_eval_count,
-          outputTokens: stats.eval_count,
-        } : undefined };
-        return;
-      }
+      if (done) break;
     }
-    if (done) break;
+    if (!completed) throw new Error('Ollama stream ended before completion');
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -264,6 +271,15 @@ function applyOpenAIRequestOptions(body: Record<string, unknown>, config: Backen
   if (options.extraBody) Object.assign(body, options.extraBody);
 }
 
+function applyAnthropicRequestOptions(body: Record<string, unknown>, config: BackendConfig): void {
+  const options = config.requestOptions;
+  if (!options) return;
+  if (typeof options.temperature === 'number') body.temperature = options.temperature;
+  if (typeof options.topP === 'number') body.top_p = options.topP;
+  if (typeof options.maxTokens === 'number') body.max_tokens = options.maxTokens;
+  if (options.extraBody) Object.assign(body, options.extraBody);
+}
+
 async function* openaiStream(
   config: BackendConfig,
   systemPrompt: string,
@@ -301,77 +317,86 @@ async function* openaiStream(
   let buffer = '';
   const pendingToolCalls = new Map<number, OpenAIToolCall>();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() ?? '';
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = done ? '' : lines.pop() ?? '';
 
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed === 'data: [DONE]') {
-        if (trimmed === 'data: [DONE]' && pendingToolCalls.size > 0) {
-          yield { content: null, toolCalls: convertToOllamaToolCalls([...pendingToolCalls.values()]), done: false };
-          pendingToolCalls.clear();
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed === 'data: [DONE]') {
+          if (trimmed === 'data: [DONE]' && pendingToolCalls.size > 0) {
+            yield { content: null, toolCalls: convertToOllamaToolCalls([...pendingToolCalls.values()]), done: false };
+            pendingToolCalls.clear();
+          }
+          if (trimmed === 'data: [DONE]') {
+            completed = true;
+            yield { content: null, done: true };
+            return;
+          }
+          continue;
         }
-        if (trimmed === 'data: [DONE]') {
-          yield { content: null, done: true };
-          return;
-        }
-        continue;
-      }
-      if (!trimmed.startsWith('data: ')) continue;
+        if (!trimmed.startsWith('data: ')) continue;
 
-      try {
-        const parsed = JSON.parse(trimmed.slice(6)) as { choices?: OpenAIChoice[]; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } } };
-        if (parsed.usage) yield { content: null, done: false, usage: {
-          inputTokens: parsed.usage.prompt_tokens,
-          outputTokens: parsed.usage.completion_tokens,
-          cachedInputTokens: parsed.usage.prompt_tokens_details?.cached_tokens,
-          reasoningTokens: parsed.usage.completion_tokens_details?.reasoning_tokens,
-        } };
-        const choice = parsed.choices?.[0];
-        if (!choice) continue;
+        try {
+          const parsed = JSON.parse(trimmed.slice(6)) as { choices?: OpenAIChoice[]; usage?: { prompt_tokens?: number; completion_tokens?: number; prompt_tokens_details?: { cached_tokens?: number }; completion_tokens_details?: { reasoning_tokens?: number } } };
+          if (parsed.usage) yield { content: null, done: false, usage: {
+            inputTokens: parsed.usage.prompt_tokens,
+            outputTokens: parsed.usage.completion_tokens,
+            cachedInputTokens: parsed.usage.prompt_tokens_details?.cached_tokens,
+            reasoningTokens: parsed.usage.completion_tokens_details?.reasoning_tokens,
+          } };
+          const choice = parsed.choices?.[0];
+          if (!choice) continue;
 
-        const thinking = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
-        if (thinking) yield { content: null, thinking, done: false };
-        if (choice.delta?.content) {
-          yield { content: choice.delta.content, done: false };
-        }
+          const thinking = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
+          if (thinking) yield { content: null, thinking, done: false };
+          if (choice.delta?.content) {
+            yield { content: choice.delta.content, done: false };
+          }
 
-        if (choice.delta?.tool_calls) {
-          for (const toolCall of choice.delta.tool_calls) {
-            if (toolCall.id) {
-              pendingToolCalls.set(toolCall.index, {
-                id: toolCall.id,
-                type: 'function',
-                function: {
-                  name: toolCall.function?.name ?? '',
-                  arguments: toolCall.function?.arguments ?? '',
-                },
-              });
-            } else if (pendingToolCalls.has(toolCall.index)) {
-              const existing = pendingToolCalls.get(toolCall.index)!;
-              if (toolCall.function?.name) existing.function.name += toolCall.function.name;
-              if (toolCall.function?.arguments) existing.function.arguments += toolCall.function.arguments;
+          if (choice.delta?.tool_calls) {
+            for (const toolCall of choice.delta.tool_calls) {
+              if (toolCall.id) {
+                pendingToolCalls.set(toolCall.index, {
+                  id: toolCall.id,
+                  type: 'function',
+                  function: {
+                    name: toolCall.function?.name ?? '',
+                    arguments: toolCall.function?.arguments ?? '',
+                  },
+                });
+              } else if (pendingToolCalls.has(toolCall.index)) {
+                const existing = pendingToolCalls.get(toolCall.index)!;
+                if (toolCall.function?.name) existing.function.name += toolCall.function.name;
+                if (toolCall.function?.arguments) existing.function.arguments += toolCall.function.arguments;
+              }
             }
           }
-        }
 
-        if (choice.finish_reason === 'tool_calls' && pendingToolCalls.size > 0) {
-          yield { content: null, toolCalls: convertToOllamaToolCalls([...pendingToolCalls.values()]), done: false };
-          pendingToolCalls.clear();
-        }
+          if (choice.finish_reason === 'tool_calls' && pendingToolCalls.size > 0) {
+            yield { content: null, toolCalls: convertToOllamaToolCalls([...pendingToolCalls.values()]), done: false };
+            pendingToolCalls.clear();
+          }
 
-        if (choice.finish_reason === 'stop') {
-          yield { content: null, done: true };
-          return;
+          if (choice.finish_reason === 'stop') {
+            completed = true;
+            yield { content: null, done: true };
+            return;
+          }
+        } catch {
+          // Skip malformed SSE chunks.
         }
-      } catch {
-        // Skip malformed SSE chunks.
       }
+      if (done) break;
     }
+    if (!completed) throw new Error('OpenAI-compatible stream ended before completion');
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -572,6 +597,7 @@ async function* anthropicStream(
     system: anthropicSystem(systemPrompt),
     messages: withAnthropicMessageCache(convertToAnthropicMessages(messages)),
   };
+  applyAnthropicRequestOptions(body, config);
   const anthropicTools = convertToolsToAnthropic(tools);
   if (anthropicTools) body.tools = anthropicTools;
 
@@ -592,103 +618,113 @@ async function* anthropicStream(
   let buffer = '';
   const pendingToolCalls = new Map<number, AnthropicToolCallState>();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const frames = buffer.split('\n\n');
-    buffer = frames.pop() ?? '';
+  let completed = false;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      buffer += done ? decoder.decode() : decoder.decode(value, { stream: true });
+      buffer = buffer.replace(/\r\n/g, '\n');
+      const frames = buffer.split('\n\n');
+      buffer = done ? '' : frames.pop() ?? '';
 
-    for (const frame of frames) {
-      const { event, data } = parseSseFrame(frame);
-      if (!data || data === '[DONE]') {
-        if (data === '[DONE]') {
-          yield { content: null, done: true };
-          return;
-        }
-        continue;
-      }
-
-      if (event === 'ping') continue;
-
-      // A provider `error` event must fail the stream; the catch below is only
-      // for malformed frames, so the message rides out via this variable.
-      let providerError: string | undefined;
-      try {
-        const parsed = JSON.parse(data) as {
-          index?: number;
-          delta?: { type?: string; text?: string; thinking?: string; partial_json?: string };
-          content_block?: AnthropicContentBlock;
-          error?: { message?: string };
-          type?: string;
-          message?: { usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } };
-          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-        };
-
-        if (event === 'error') {
-          providerError = parsed.error?.message ?? 'Anthropic streaming error';
-        }
-
-        if (event === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
-          pendingToolCalls.set(parsed.index ?? pendingToolCalls.size, {
-            id: parsed.content_block.id ?? toolCallId('toolu'),
-            name: parsed.content_block.name ?? '',
-            inputText: '',
-            initialInput: parsed.content_block.input,
-          });
+      for (const frame of frames) {
+        const { event, data } = parseSseFrame(frame);
+        if (!data || data === '[DONE]') {
+          if (data === '[DONE]') {
+            completed = true;
+            yield { content: null, done: true };
+            return;
+          }
           continue;
         }
 
-        if (event === 'content_block_delta') {
-          if (parsed.delta?.type === 'thinking_delta' && parsed.delta.thinking) {
-            yield { content: null, thinking: parsed.delta.thinking, done: false };
+        if (event === 'ping') continue;
+
+        // A provider `error` event must fail the stream; the catch below is only
+        // for malformed frames, so the message rides out via this variable.
+        let providerError: string | undefined;
+        try {
+          const parsed = JSON.parse(data) as {
+            index?: number;
+            delta?: { type?: string; text?: string; thinking?: string; partial_json?: string };
+            content_block?: AnthropicContentBlock;
+            error?: { message?: string };
+            type?: string;
+            message?: { usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } };
+            usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+          };
+
+          if (event === 'error') {
+            providerError = parsed.error?.message ?? 'Anthropic streaming error';
           }
-          if (parsed.delta?.type === 'text_delta' && parsed.delta.text) {
-            yield { content: parsed.delta.text, done: false };
+
+          if (event === 'content_block_start' && parsed.content_block?.type === 'tool_use') {
+            pendingToolCalls.set(parsed.index ?? pendingToolCalls.size, {
+              id: parsed.content_block.id ?? toolCallId('toolu'),
+              name: parsed.content_block.name ?? '',
+              inputText: '',
+              initialInput: parsed.content_block.input,
+            });
+            continue;
           }
-          if (parsed.delta?.type === 'input_json_delta' && typeof parsed.index === 'number') {
-            const existing = pendingToolCalls.get(parsed.index);
-            if (existing && parsed.delta.partial_json) {
-              existing.inputText += parsed.delta.partial_json;
+
+          if (event === 'content_block_delta') {
+            if (parsed.delta?.type === 'thinking_delta' && parsed.delta.thinking) {
+              yield { content: null, thinking: parsed.delta.thinking, done: false };
             }
+            if (parsed.delta?.type === 'text_delta' && parsed.delta.text) {
+              yield { content: parsed.delta.text, done: false };
+            }
+            if (parsed.delta?.type === 'input_json_delta' && typeof parsed.index === 'number') {
+              const existing = pendingToolCalls.get(parsed.index);
+              if (existing && parsed.delta.partial_json) {
+                existing.inputText += parsed.delta.partial_json;
+              }
+            }
+            continue;
           }
-          continue;
-        }
 
-        if (event === 'content_block_stop' && typeof parsed.index === 'number' && pendingToolCalls.has(parsed.index)) {
-          const toolCall = anthropicToolStateToCall(pendingToolCalls.get(parsed.index)!);
-          pendingToolCalls.delete(parsed.index);
-          yield { content: null, toolCalls: [toolCall], done: false };
-          continue;
-        }
+          if (event === 'content_block_stop' && typeof parsed.index === 'number' && pendingToolCalls.has(parsed.index)) {
+            const toolCall = anthropicToolStateToCall(pendingToolCalls.get(parsed.index)!);
+            pendingToolCalls.delete(parsed.index);
+            yield { content: null, toolCalls: [toolCall], done: false };
+            continue;
+          }
 
-        if (event === 'message_start' && (parsed.message?.usage?.input_tokens !== undefined)) {
-          const usage = parsed.message.usage;
-          yield { content: null, done: false, usage: {
-            inputTokens: usage.input_tokens,
-            cachedInputTokens: usage.cache_read_input_tokens,
-            cacheCreationInputTokens: usage.cache_creation_input_tokens,
-          } };
-        }
-        if (event === 'message_delta' && parsed.usage) {
-          const usage = parsed.usage;
-          if (usage.output_tokens !== undefined || usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined) {
+          if (event === 'message_start' && (parsed.message?.usage?.input_tokens !== undefined)) {
+            const usage = parsed.message.usage;
             yield { content: null, done: false, usage: {
-              outputTokens: usage.output_tokens,
+              inputTokens: usage.input_tokens,
               cachedInputTokens: usage.cache_read_input_tokens,
               cacheCreationInputTokens: usage.cache_creation_input_tokens,
             } };
           }
+          if (event === 'message_delta' && parsed.usage) {
+            const usage = parsed.usage;
+            if (usage.output_tokens !== undefined || usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined) {
+              yield { content: null, done: false, usage: {
+                outputTokens: usage.output_tokens,
+                cachedInputTokens: usage.cache_read_input_tokens,
+                cacheCreationInputTokens: usage.cache_creation_input_tokens,
+              } };
+            }
+          }
+          if (event === 'message_stop') {
+            completed = true;
+            yield { content: null, done: true };
+            return;
+          }
+        } catch {
+          // Ignore malformed frames and keep streaming.
         }
-        if (event === 'message_stop') {
-          yield { content: null, done: true };
-          return;
-        }
-      } catch {
-        // Ignore malformed frames and keep streaming.
+        if (providerError) throw new Error(providerError);
       }
-      if (providerError) throw new Error(providerError);
+      if (done) break;
     }
+    if (!completed) throw new Error('Anthropic stream ended before completion');
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
   }
 }
 
@@ -705,6 +741,7 @@ async function anthropicNonStream(
     system: anthropicSystem(systemPrompt),
     messages: withAnthropicMessageCache(convertToAnthropicMessages(messages)),
   };
+  applyAnthropicRequestOptions(body, config);
   const anthropicTools = convertToolsToAnthropic(tools);
   if (anthropicTools) body.tools = anthropicTools;
 

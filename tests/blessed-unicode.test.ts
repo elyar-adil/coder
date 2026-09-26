@@ -14,6 +14,9 @@ test('Blessed emoji width shim makes modern emoji occupy two columns', () => {
   assert.equal(unicode.charWidth('😀'), 2);
   assert.equal(unicode.charWidth('A'), 1);
   assert.equal(unicode.charWidth(0x1F680), 2);
+  assert.equal(unicode.charWidth('🇺🇸', 0), 2);
+  assert.equal(unicode.charWidth('🇺🇸', 2), 0, 'regional indicator pairs share one cell pair');
+  assert.equal(unicode.charWidth('👨‍👩‍👧‍👦', 3), 0, 'ZWJ glue does not consume a cell');
 });
 
 test('Blessed emoji width shim is safe to install for each TUI session', () => {

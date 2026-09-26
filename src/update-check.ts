@@ -20,12 +20,12 @@
 import { spawn } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { dirname, resolve, sep } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
 import type { Readable, Writable } from 'node:stream';
 
 import { atomicReplaceFile } from './runtime/file-lock.js';
-import { PACKAGE_JSON } from './version.js';
+import { PACKAGE_JSON, PACKAGE_JSON_PATH } from './version.js';
 
 const PKG_NAME = PACKAGE_JSON.name ?? 'tokenmaw';
 const REGISTRY_URL = 'https://registry.npmjs.org';
@@ -160,11 +160,11 @@ export interface SelfUpdateResult {
  */
 export function isDevelopmentInstall(): boolean {
   if (process.env.MAW_DEV_INSTALL === '1' || process.env.CODER_DEV_INSTALL === '1') return true;
-  try {
-    return !require.resolve('../package.json').split(sep).includes('node_modules');
-  } catch {
-    return false;
-  }
+  // This module is ESM, so `require.resolve` is unavailable at runtime. The
+  // package path is already resolved by version.ts and works for both tsx and
+  // the compiled CLI. A package under node_modules is a real installation;
+  // anything else is a checkout or npm link and must not self-update.
+  return !PACKAGE_JSON_PATH.split(/[\\/]+/).some((part) => part === 'node_modules');
 }
 
 function selfUpdateDisabled(): boolean {

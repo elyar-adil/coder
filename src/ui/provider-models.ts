@@ -14,7 +14,7 @@
  */
 
 import { resilientFetch } from '../fetch.js';
-import type { AgentConfig, AgentModelConfig, AgentProviderConfig } from '../config.js';
+import { modelConnection, type AgentConfig, type AgentModelConfig, type AgentProviderConfig } from '../config.js';
 
 export type ProviderBackend = 'ollama' | 'openai' | 'anthropic';
 
@@ -88,6 +88,12 @@ function uniqueConnectionName(config: AgentConfig, base: string): string {
   return name;
 }
 
+function hasConfiguredModel(config: AgentConfig, alias: string | undefined): boolean {
+  if (!alias) return false;
+  const entry = config.models?.[alias] ?? { model: alias };
+  return Boolean(modelConnection(config, entry)?.baseUrl);
+}
+
 export interface ProviderModelDeps {
   configManager: { getConfig: () => AgentConfig; saveConfig: (config: AgentConfig) => Promise<void> };
   choose: (title: string, items: readonly (string | { label: string; detail?: string })[], options?: { searchable?: boolean; initial?: number }) => Promise<number>;
@@ -114,9 +120,10 @@ export function createProviderFlows(deps: ProviderModelDeps): { openProvider: ()
     }
     const contextRaw = await deps.ask('Context window · optional');
     const contextWindow = Number.parseInt(contextRaw, 10);
+    const currentModelIsConfigured = hasConfiguredModel(config, config.model);
     await deps.configManager.saveConfig({
       ...config,
-      model: config.model || alias,
+      model: currentModelIsConfigured ? config.model : alias,
       models: {
         ...(config.models ?? {}),
         [alias]: {
@@ -127,7 +134,7 @@ export function createProviderFlows(deps: ProviderModelDeps): { openProvider: ()
       },
     });
     deps.notify(`Added model ${alias}.`);
-    if (!config.model) await deps.applyModel(alias);
+    if (!currentModelIsConfigured) await deps.applyModel(alias);
   };
 
   /** Repeatedly offers a model list; Escape (negative index) stops adding. */

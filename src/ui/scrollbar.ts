@@ -146,7 +146,15 @@ export function computePillScrollbarState(
   element: ScrollableElement,
   lpos: Lpos,
 ): PillState | null {
-  const viewportHeight = Math.max(1, lpos.yl - lpos.yi - Number(element.iheight));
+  // `lpos` is the outer box rectangle while `iheight` is Blessed's actual
+  // scrollable viewport. Subtracting the latter from the former (the old code)
+  // measured only border/padding rows, producing a tiny thumb at the wrong
+  // position after resize or when padding changed. Use the inner height and
+  // retain the rectangle as a fallback for lightweight test doubles.
+  const innerHeight = Number(element.iheight);
+  const viewportHeight = Math.max(1, Number.isFinite(innerHeight) && innerHeight > 0
+    ? innerHeight
+    : lpos.yl - lpos.yi);
   const scrollHeight = element.getScrollHeight();
   const maxOffset = scrollHeight - viewportHeight;
   if (maxOffset <= 0) return null;
@@ -163,13 +171,23 @@ export interface PillScrollbarHandle {
   destroy(): void;
 }
 
+export interface PillScrollbarOptions {
+  /** Keep the pill pinned to its target instead of running a spring timer. */
+  animated?: boolean;
+}
+
 /**
  * Attach a pill overlay to a scrollable element. blessed's own scrollbar is
  * not used — do NOT pass a `scrollbar` option to the element. The returned
  * handle must be `sync()`ed after layout/content changes (before
  * `screen.render()`) and `destroy()`ed with its owner.
  */
-export function attachPillScrollbar(element: ScrollableElement, colors: () => PillScrollbarTheme): PillScrollbarHandle {
+export function attachPillScrollbar(
+  element: ScrollableElement,
+  colors: () => PillScrollbarTheme,
+  options: PillScrollbarOptions = {},
+): PillScrollbarHandle {
+  const animated = options.animated !== false;
   const overlay = blessed.box({
     parent: element.screen, tags: true, width: 1, height: 1, hidden: true, mouse: true,
     style: {},
@@ -293,6 +311,10 @@ export function attachPillScrollbar(element: ScrollableElement, colors: () => Pi
   };
 
   const frame = (): void => {
+    if (!animated) {
+      stopTimer();
+      return;
+    }
     if (visual === null || overlay.hidden) {
       sleep();
       return;
@@ -323,6 +345,7 @@ export function attachPillScrollbar(element: ScrollableElement, colors: () => Pi
   };
 
   const wake = (): void => {
+    if (!animated) return;
     if (timer === null) timer = setInterval(frame, FRAME_MS);
   };
 
@@ -344,6 +367,15 @@ export function attachPillScrollbar(element: ScrollableElement, colors: () => Pi
     overlay.top = lpos.yi + Number(element.itop);
     overlay.width = 1;
     overlay.height = state.viewportHeight;
+    if (!animated) {
+      visual = targetOf(state);
+      velocity = 0;
+      trail = [];
+      residue = 0;
+      paint(state, visual);
+      stopTimer();
+      return;
+    }
     if (visual === null) {
       // First paint after a show snaps to the scroll position; only later
       // scroll deltas glide on the spring.

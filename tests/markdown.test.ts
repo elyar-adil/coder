@@ -9,7 +9,7 @@ process.env.FORCE_COLOR = '1';
 
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { diffKind, inlineMarkdown, renderMarkdown } from '../src/markdown.js';
+import { diffKind, displayWidth, inlineMarkdown, renderMarkdown } from '../src/markdown.js';
 
 describe('inlineMarkdown', () => {
   test('bold with **', () => {
@@ -145,6 +145,28 @@ describe('renderMarkdown', () => {
   test('uses custom column width', () => {
     const result = renderMarkdown('---', 40);
     assert.ok(result.includes('─'.repeat(40)));
+  });
+
+  test('accepts CRLF, indented fences, and non-word language names', () => {
+    const result = renderMarkdown('  ```c++  \r\nstd::vector<int> x;\r\n  ```  ', 40);
+    assert.match(result, /c\+\+/);
+    assert.match(result, /std::vector/);
+    assert.match(result, /┌/);
+    assert.match(result, /└/);
+  });
+
+  test('supports level 4-6 headings', () => {
+    const result = renderMarkdown('#### Detail\n##### More\n###### Fine', 40);
+    assert.match(result, /Detail/);
+    assert.match(result, /More/);
+    assert.match(result, /Fine/);
+  });
+
+  test('uses grapheme width for CJK, combining marks and emoji sequences', () => {
+    assert.equal(displayWidth('中文'), 4);
+    assert.equal(displayWidth('e\u0301'), 1);
+    assert.equal(displayWidth('👨‍👩‍👧‍👦'), 2);
+    assert.equal(displayWidth('{json}'), 6);
   });
 });
 

@@ -2,19 +2,23 @@ import blessed from 'blessed';
 import { diffKind, renderMarkdown } from '../markdown.js';
 import { highlightCode } from './syntax.js';
 import { activeTuiTheme } from './theme.js';
+import { displayWidth, truncateToDisplayWidth, wrapText } from './text-width.js';
 
-// Historical messages re-render on every frame; memoize the (expensive) result.
-// Entries are keyed by theme+width+content and evicted least-recently-used.
+// Bound bytes as well as entry count: streaming responses create a new key
+// on every chunk, and 600 large partial answers otherwise retain megabytes.
 const renderCache = new Map<string, string>();
 const RENDER_CACHE_LIMIT = 600;
+const RENDER_CACHE_CHARS = 2_000_000;
+let cacheChars = 0;
 
 export function resetTuiMarkdownCache(): void {
   renderCache.clear();
+  cacheChars = 0;
 }
 
-/** Blessed tags keep patch colors independent of Chalk's stdout/NO_COLOR detection. */
 export function renderTuiMarkdown(content: string, columns: number): string {
-  const cacheKey = `${activeTuiTheme().name}\u0000${columns}\u0000${content}`;
+  columns = Math.max(2, Math.floor(columns));
+  const cacheKey = activeTuiTheme().name + '\u0000' + columns + '\u0000' + content;
   const cached = renderCache.get(cacheKey);
   if (cached !== undefined) {
     renderCache.delete(cacheKey);
@@ -22,46 +26,47 @@ export function renderTuiMarkdown(content: string, columns: number): string {
     return cached;
   }
   const markdown = activeTuiTheme().markdown;
-  const out: string[] = [];
-  let prose: string[] = [];
-  let diff = false;
-  let otherCode = false;
-  const flush = () => {
-    if (prose.length) out.push(renderMarkdown(prose.join('\n'), columns));
-    prose = [];
-  };
-  for (const line of content.split('\n')) {
-    if (!diff && !otherCode && /^```(?:diff|patch)\s*$/.test(line)) {
-      flush(); diff = true;
-    } else if (diff && /^```\s*$/.test(line)) {
-      diff = false;
-    } else if (diff) {
-      const kind = diffKind(line);
-      if (kind === 'add' || kind === 'del') {
-        // Deep, near-black tinted backgrounds keep the code readable while
-        // still signaling added/removed lines.
-        const background = kind === 'add' ? markdown.diffAddBg : markdown.diffDelBg;
-        const base = kind === 'add' ? markdown.diffAddText : markdown.diffDelText;
-        const width = (blessed as unknown as { unicode: { strWidth(text: string): number } }).unicode.strWidth(line);
-        out.push(`{${background}-bg}{${base}-fg}${highlightCode(line, activeTuiTheme().syntax)}${' '.repeat(Math.max(0, columns - width))}{/${base}-fg}{/${background}-bg}`);
-      } else if (kind === 'hunk') {
-        out.push(`{${markdown.accent}-fg}${blessed.escape(line)}{/${markdown.accent}-fg}`);
-      } else if (kind === 'file') {
-        out.push(`{${markdown.text}-fg}${blessed.escape(line)}{/${markdown.text}-fg}`);
-      } else {
-        out.push(highlightCode(line, activeTuiTheme().syntax));
-      }
-    } else {
-      if (/^```/.test(line)) { flush(); otherCode = !otherCode; }
-      else if (otherCode) out.push(highlightCode(line, activeTuiTheme().syntax));
-      else prose.push(line);
+  // One fence parser for partial and completed replies, including longer
+  // fences enclosing Markdown examples, CRLF and tilde fences.
+  const rendered = renderMarkdown(content, columns, {
+    codeBlock: (lines, language, width) => {
+      const renderedLines = lines.flatMap((line) => {
+      const kind = /^(diff|patch)$/i.test(language) ? diffKind(line) : undefined;
+      return wrapText(line, Math.max(2, width - 2)).map((part) => {
+        if (kind === 'add' || kind === 'del') {
+          const background = kind === 'add' ? markdown.diffAddBg : markdown.diffDelBg;
+          const base = kind === 'add' ? markdown.diffAddText : markdown.diffDelText;
+          return '{' + background + '-bg}{' + base + '-fg}'
+            + highlightCode(part, activeTuiTheme().syntax)
+            + ' '.repeat(Math.max(0, width - 2 - displayWidth(part)))
+            + '{/' + base + '-fg}{/' + background + '-bg}';
+        }
+        if (kind === 'hunk' || kind === 'file') {
+          const color = kind === 'hunk' ? markdown.accent : markdown.text;
+          return '{' + color + '-fg}' + blessed.escape(part) + '{/' + color + '-fg}';
+        }
+        return highlightCode(part, activeTuiTheme().syntax);
+      });
+      });
+      const label = language ? ` ${truncateToDisplayWidth(language, Math.max(0, width - 3))} ` : '';
+      const top = '┌' + label + '─'.repeat(Math.max(0, width - displayWidth(label) - 1));
+      const bottom = '└' + '─'.repeat(Math.max(0, width - 1));
+      return [
+        `{${markdown.codeFence}-fg}${top}{/${markdown.codeFence}-fg}`,
+        ...renderedLines.map((line) => `{${markdown.codeFence}-fg}│ {/${markdown.codeFence}-fg}${line}`),
+        `{${markdown.codeFence}-fg}${bottom}{/${markdown.codeFence}-fg}`,
+      ];
+    },
+  });
+  const size = cacheKey.length + rendered.length;
+  if (size <= RENDER_CACHE_CHARS) {
+    renderCache.set(cacheKey, rendered);
+    cacheChars += size;
+    while (renderCache.size > RENDER_CACHE_LIMIT || cacheChars > RENDER_CACHE_CHARS) {
+      const key = renderCache.keys().next().value!;
+      cacheChars -= key.length + renderCache.get(key)!.length;
+      renderCache.delete(key);
     }
-  }
-  flush();
-  const rendered = out.join('\n');
-  renderCache.set(cacheKey, rendered);
-  if (renderCache.size > RENDER_CACHE_LIMIT) {
-    renderCache.delete(renderCache.keys().next().value!);
   }
   return rendered;
 }

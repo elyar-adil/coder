@@ -6,6 +6,10 @@
  * TUI share one definition. No external dependencies — pure string transform.
  */
 
+import { Lexer, type Token } from 'marked';
+import { displayWidth, styledWidth, truncateStyled, truncateToDisplayWidth, wrapText } from './ui/text-width.js';
+import { closesFence, openingFence, type MarkdownFence } from './ui/markdown-fence.js';
+
 export type DiffKind = 'add' | 'del' | 'hunk' | 'file' | 'context';
 
 export interface MarkdownTheme {
@@ -53,7 +57,7 @@ export function getMarkdownTheme(): MarkdownTheme {
 
 /** Blessed reserves braces for style tags; escape literal ones. */
 export function escapeTags(text: string): string {
-  return text.replace(/{/g, '{open}').replace(/}/g, '{close}');
+  return text.replace(/[{}]/g, (char) => char === '{' ? '{open}' : '{close}');
 }
 
 function fg(color: string, text: string): string {
@@ -113,32 +117,9 @@ export interface GfmTable {
   rows: string[][];
 }
 
-const ANSI_PATTERN = /\x1b\[[0-9;]*[A-Za-z]/g;
-const TAG_PATTERN = /\{[^{}]*\}/g;
-
-/** Display width ignoring ANSI escapes and style tags, counting East-Asian
- * wide chars as 2 columns. */
-export function displayWidth(text: string): number {
-  const clean = text.replace(ANSI_PATTERN, '').replace(TAG_PATTERN, '');
-  let width = 0;
-  for (const ch of clean) {
-    const code = ch.codePointAt(0)!;
-    const wide = (code >= 0x1100 && code <= 0x115F)
-      || (code >= 0x2E80 && code <= 0x303E)
-      || (code >= 0x3130 && code <= 0x4DBF)
-      || (code >= 0x4E00 && code <= 0x9FFF)
-      || (code >= 0xA000 && code <= 0xA4CF)
-      || (code >= 0xAC00 && code <= 0xD7A3)
-      || (code >= 0xF900 && code <= 0xFAFF)
-      || (code >= 0xFE30 && code <= 0xFE4F)
-      || (code >= 0xFF00 && code <= 0xFF60)
-      || (code >= 0xFFE0 && code <= 0xFFE6)
-      || (code >= 0x1F300 && code <= 0x1FAFF)
-      || (code >= 0x20000 && code <= 0x3FFFD);
-    width += wide ? 2 : 1;
-  }
-  return width;
-}
+// Keep the historical Markdown export while sharing the same width rules as
+// status bars, Activity rows, the composer and diff previews.
+export { displayWidth, truncateToDisplayWidth } from './ui/text-width.js';
 
 function splitCells(line: string): string[] {
   let trimmed = line.trim();
@@ -181,19 +162,6 @@ export function matchGfmTable(lines: string[], start: number): { table: GfmTable
   return { table: { header, aligns, rows }, end };
 }
 
-function truncateToWidth(text: string, maxWidth: number): string {
-  if (displayWidth(text) <= maxWidth) return text;
-  let out = '';
-  let width = 0;
-  for (const ch of text) {
-    const w = displayWidth(ch);
-    if (width + w > maxWidth - 1) break;
-    out += ch;
-    width += w;
-  }
-  return `${out}…`;
-}
-
 /** Render a parsed table as aligned monospace lines that fit within maxWidth columns. */
 export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
   const theme = getMarkdownTheme();
@@ -201,9 +169,19 @@ export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
   const gap = ' │ ';
   const gapWidth = displayWidth(gap);
   const minWidth = 4;
+  const renderedHeader = table.header.map(inlineMarkdown);
+  const renderedRows = table.rows.map((row) => row.map(inlineMarkdown));
+  // Narrow screens cannot fit many columns even at minimum width. Display
+  // labeled fields instead of letting wrapped separators destroy the table.
+  if (columns * minWidth + gapWidth * (columns - 1) > maxWidth) {
+    return [renderedHeader, ...renderedRows].flatMap((row, index) => [
+      ...(index > 0 ? [''] : []),
+      ...row.map((cell, column) => truncateStyled(index === 0 ? cell : renderedHeader[column] + ': ' + cell, maxWidth)),
+    ]);
+  }
   const widths = table.header.map((cell, index) => Math.max(
-    displayWidth(cell),
-    ...table.rows.map((row) => displayWidth(row[index] ?? '')),
+    styledWidth(renderedHeader[index]!),
+    ...renderedRows.map((row) => styledWidth(row[index] ?? '')),
     minWidth,
   ));
   const totalWidth = (): number => widths.reduce((sum, width) => sum + width, 0) + gapWidth * (columns - 1);
@@ -219,7 +197,7 @@ export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
     }
   }
   const padCell = (plain: string, width: number, align: TableAlign): string => {
-    const padding = Math.max(0, width - displayWidth(plain));
+    const padding = Math.max(0, width - styledWidth(plain));
     if (align === 'right') return ' '.repeat(padding) + plain;
     if (align === 'center') {
       const left = Math.floor(padding / 2);
@@ -231,67 +209,84 @@ export function renderGfmTable(table: GfmTable, maxWidth: number): string[] {
   const renderRow = (cells: string[], style: (plain: string) => string): string => cells
     .map((cell, index) => {
       const width = widths[index]!;
-      const plain = displayWidth(cell) > width ? truncateToWidth(cell, width) : cell;
+      const plain = truncateStyled(cell, width);
       return style(padCell(plain, width, table.aligns[index]!));
     })
     .join(fg(theme.muted, gap));
 
-  const header = renderRow(table.header, (plain) => fg(theme.accent, `{bold}${inlineMarkdown(plain)}{/bold}`));
+  const header = renderRow(renderedHeader, (plain) => fg(theme.accent, `{bold}${plain}{/bold}`));
   // One uniform border color for every structural character (│, ─, ┼).
   const separator = fg(theme.muted, widths.map((width) => '─'.repeat(width)).join('─┼─'));
-  const body = table.rows.map((row) => renderRow(row, (plain) => inlineMarkdown(plain)));
+  const body = renderedRows.map((row) => renderRow(row, (plain) => plain));
   return [header, separator, ...body];
 }
 
 export function inlineMarkdown(text: string): string {
   const theme = getMarkdownTheme();
-  return escapeTags(text)
-    .replace(/\*\*\*(.+?)\*\*\*/g, (_m, t: string) => `{bold}${italic(t)}{/bold}`)
-    .replace(/\*\*(.+?)\*\*/g,     (_m, t: string) => `{bold}${t}{/bold}`)
-    .replace(/__(.+?)__/g,         (_m, t: string) => `{bold}${t}{/bold}`)
-    .replace(/\*(.+?)\*/g,         (_m, t: string) => italic(t))
-    .replace(/_(.+?)_/g,           (_m, t: string) => italic(t))
-    .replace(/`([^`]+)`/g,         (_m, t: string) => `{${theme.codeBg}-bg}{${theme.codeText}-fg} ${t} {/${theme.codeText}-fg}{/${theme.codeBg}-bg}`)
-    .replace(/~~(.+?)~~/g,         (_m, t: string) => strike(t));
+  const renderTokens = (tokens: Token[]): string => tokens.map((token): string => {
+    switch (token.type) {
+      case 'strong': return '{bold}' + renderTokens(token.tokens ?? []) + '{/bold}';
+      case 'em': return italic(renderTokens(token.tokens ?? []));
+      case 'del': return strike(renderTokens(token.tokens ?? []));
+      case 'codespan': return '{' + theme.codeBg + '-bg}' + fg(theme.codeText, escapeTags(token.text)) + '{/' + theme.codeBg + '-bg}';
+      case 'link': {
+        const label = renderTokens(token.tokens ?? []);
+        return label + (token.text === token.href ? '' : ' (' + escapeTags(token.href) + ')');
+      }
+      case 'br': return '\n';
+      case 'escape': return escapeTags(token.text);
+      default: return escapeTags('text' in token ? String(token.text) : token.raw);
+    }
+  }).join('');
+  return renderTokens(Lexer.lexInline(text));
 }
 
-export function renderMarkdown(text: string, cols = 80): string {
+export interface MarkdownOptions {
+  codeBlock?: (lines: string[], language: string, columns: number) => string[];
+}
+
+function renderCodeBlock(lines: string[], language: string, columns: number): string[] {
   const theme = getMarkdownTheme();
-  const lines = text.split('\n');
+  const label = language ? ' ' + truncateToDisplayWidth(language, Math.max(0, columns - 3)) + ' ' : '';
+  const top = '┌' + label + '─'.repeat(Math.max(0, columns - displayWidth(label) - 1));
+  return [
+    fg(theme.codeFence, top),
+    ...lines.flatMap((line) => wrapText(line, Math.max(2, columns - 2))
+      .map((part) => fg(theme.codeFence, '│ ') + renderCodeLine(language, part))),
+    fg(theme.codeFence, '└' + '─'.repeat(Math.max(0, columns - 1))),
+  ];
+}
+
+export function renderMarkdown(text: string, cols = 80, options: MarkdownOptions = {}): string {
+  const theme = getMarkdownTheme();
+  const lines = text.replace(/\r\n?/g, '\n').split('\n');
   const out: string[] = [];
-  let inCodeBlock = false;
-  let codeLang = '';
+  let fence: MarkdownFence | undefined;
   let codeLines: string[] = [];
 
   for (let index = 0; index < lines.length; index += 1) {
     const raw = lines[index]!;
-    const fenceMatch = raw.match(/^```(\w*)$/);
-    if (fenceMatch) {
-      if (!inCodeBlock) {
-        inCodeBlock = true;
-        codeLang = fenceMatch[1] ?? '';
+    if (fence) {
+      if (closesFence(raw, fence)) {
+        out.push(...(options.codeBlock ?? renderCodeBlock)(codeLines, fence.language, cols));
+        fence = undefined;
         codeLines = [];
       } else {
-        inCodeBlock = false;
-        const langLabel = codeLang ? fg(theme.muted, italic(` ${escapeTags(codeLang)}`)) : '';
-        out.push(fg(theme.codeFence, '┌' + '─'.repeat(Math.max(2, cols - 2))) + langLabel);
-        for (const cl of codeLines) {
-          out.push(fg(theme.codeFence, '│ ') + renderCodeLine(codeLang, cl));
-        }
-        out.push(fg(theme.codeFence, '└' + '─'.repeat(Math.max(2, cols - 2))));
-        codeLang = '';
-        codeLines = [];
+        codeLines.push(raw);
       }
       continue;
     }
-    if (inCodeBlock) { codeLines.push(raw); continue; }
+    fence = openingFence(raw);
+    if (fence) continue;
 
-    const h1 = raw.match(/^# (.+)/);
-    const h2 = raw.match(/^## (.+)/);
-    const h3 = raw.match(/^### (.+)/);
-    if (h1) { out.push('\n' + fg(theme.heading, `{bold}${escapeTags(h1[1]!)}{/bold}`)); continue; }
-    if (h2) { out.push('\n' + fg(theme.headingStrong, `{bold}${escapeTags(h2[1]!)}{/bold}`)); continue; }
-    if (h3) { out.push(`{bold}${escapeTags(h3[1]!)}{/bold}`); continue; }
+    const heading = raw.match(/^\s*(#{1,6})\s+(.+)/);
+    if (heading) {
+      const level = heading[1]!.length;
+      const color = level === 2 ? theme.headingStrong : theme.heading;
+      const prefix = level <= 2 ? '\n' : '';
+      out.push(prefix + fg(color, `{bold}${escapeTags(heading[2]!)}{/bold}`));
+      continue;
+    }
 
     if (/^---+$/.test(raw) || /^\*\*\*+$/.test(raw)) {
       out.push(fg(theme.muted, '─'.repeat(cols)));
@@ -328,12 +323,8 @@ export function renderMarkdown(text: string, cols = 80): string {
     out.push(inlineMarkdown(raw));
   }
 
-  if (inCodeBlock && codeLines.length > 0) {
-    out.push(fg(theme.codeFence, '┌─'));
-    for (const cl of codeLines) {
-      out.push(fg(theme.codeFence, '│ ') + renderCodeLine(codeLang, cl));
-    }
-    out.push(fg(theme.codeFence, '└─'));
+  if (fence) {
+    out.push(...(options.codeBlock ?? renderCodeBlock)(codeLines, fence.language, cols));
   }
 
   return out.join('\n');

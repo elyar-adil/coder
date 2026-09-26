@@ -51,6 +51,7 @@ async function main(): Promise<void> {
   const runtime = new AgentRuntime({
     registry,
     workspaceRoot: process.cwd(),
+    artifactDir: config.artifactsDir,
     defaultModel: selectedFromCli() ?? config.model,
     resolveModel: (alias) => resolveModelConfig(config, alias).config,
   });
@@ -76,7 +77,7 @@ async function main(): Promise<void> {
       // baseUrl/apiKey/providers never leak into ~/.agentrc.
       const scoped = scopeConfigToUser(next, userScope.project, userScope.user);
       userScope.user = scoped;
-      await saveConfig(scoped);
+      await saveConfig(scoped, loadedConfig.path);
       config = next;
       setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
     },
@@ -139,7 +140,19 @@ async function main(): Promise<void> {
       process.stdout.write(`worktree ready: ${info.path} (${info.branch})\n`);
     }
     const requested = selectedFromCli();
-    const selected = resolveModelConfig(config, requested);
+    // Interactive mode must remain usable before the first provider/model is
+    // configured: /provider is the setup entry point. Non-interactive runs
+    // still fail later with the actionable missing-base-URL error.
+    let selected: ReturnType<typeof resolveModelConfig>;
+    try {
+      selected = resolveModelConfig(config, requested);
+    } catch (error) {
+      if (!(error instanceof Error) || !error.message.startsWith('No base URL specified.')) throw error;
+      selected = {
+        name: requested ?? config.model ?? '(unconfigured)',
+        config: { type: 'ollama', baseUrl: 'http://localhost:11434', model: '' },
+      };
+    }
     runtime.setDefaultModel(requested ?? config.model);
     await runFullscreenTui(runtime, {
       modelName: selected.name,

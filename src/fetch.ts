@@ -94,13 +94,14 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
   let lastError: FetchError | null = null;
 
   for (let attempt = 0; attempt <= retries; attempt++) {
+    if (fetchOpts.signal?.aborted) throw new FetchError('Request aborted', null, false);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeout);
+    const callerSignal = fetchOpts.signal;
+    const onCallerAbort = (): void => controller.abort(callerSignal?.reason);
 
     // Merge user-provided signal with our timeout signal
-    if (fetchOpts.signal) {
-      fetchOpts.signal.addEventListener('abort', () => controller.abort());
-    }
+    callerSignal?.addEventListener('abort', onCallerAbort, { once: true });
 
     try {
       const response = await fetch(url, {
@@ -116,7 +117,11 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
         // exponential guess; honor it verbatim (capped) for the wait.
         const advertised = retriable ? parseRetryAfter(response) : null;
         if (retriable && attempt < retries) {
-          await sleep(advertised ?? retryDelay * Math.pow(2, attempt));
+          // Release the failed response before waiting so repeated rate-limit
+          // or server-error retries do not retain sockets and body streams.
+          await response.body?.cancel().catch(() => undefined);
+          const resumed = await sleep(advertised ?? retryDelay * Math.pow(2, attempt), callerSignal);
+          if (!resumed) throw new FetchError('Request aborted', null, false);
           continue;
         }
         const body = await errorResponseBody(response);
@@ -152,13 +157,35 @@ export async function resilientFetch(url: string, opts: FetchOptions = {}): Prom
       }
 
       const delay = retryDelay * Math.pow(2, attempt);
-      await sleep(delay);
+      const resumed = await sleep(delay, callerSignal);
+      if (!resumed) throw new FetchError('Request aborted', null, false);
+    } finally {
+      clearTimeout(timer);
+      callerSignal?.removeEventListener('abort', onCallerAbort);
     }
   }
 
   throw lastError ?? new FetchError('Unknown fetch error', null, false);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number, signal?: AbortSignal | null): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onAbort = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve(false);
+    };
+    timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, Math.max(0, ms));
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }

@@ -1,6 +1,6 @@
 import { readFile, writeFile, readdir, mkdir, stat, rename, rm, lstat, realpath } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { exec, execFile, spawn } from 'node:child_process';
+import { exec, execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ToolRegistry } from '../tools/registry.js';
@@ -8,6 +8,7 @@ import type { ToolDefinition, ToolExecutionContext, ToolMetadata } from '../tool
 import { unifiedDiff } from '../diff.js';
 import { resilientFetch } from '../fetch.js';
 import { snapshotBeforeWrite } from './file-snapshot.js';
+import { atomicWriteFile } from './atomic-write.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -200,19 +201,7 @@ async function stagedWrite(
 }
 
 async function atomicWrite(path: string, content: string): Promise<void> {
-  const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
-  await writeFile(temp, content, 'utf8');
-  try {
-    await rename(temp, path);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (!['EPERM', 'EEXIST', 'EACCES'].includes(code ?? '')) {
-      await rm(temp, { force: true }).catch(() => undefined);
-      throw error;
-    }
-    await rm(path, { force: true });
-    await rename(temp, path);
-  }
+  await atomicWriteFile(path, content);
 }
 
 const SYMBOL_PATTERNS: Record<string, RegExp[]> = {
@@ -1596,11 +1585,16 @@ function shellSpawn(
     let spawnError: NodeJS.ErrnoException | undefined;
     const child = spawn(file, args, {
       cwd: options.cwd,
-      signal: options.signal,
+      // On POSIX this gives us a process group so cancellation can terminate
+      // descendants as well as the shell wrapper. Windows uses taskkill below.
+      detached: process.platform !== 'win32',
       windowsVerbatimArguments: options.windowsVerbatimArguments,
       env: process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
+    const stop = (): void => terminateProcessTree(child);
+    if (options.signal.aborted) stop();
+    else options.signal.addEventListener('abort', stop, { once: true });
     child.stdout?.on('data', (chunk: Buffer) => options.onStdout(chunk.toString('utf8')));
     child.stderr?.on('data', (chunk: Buffer) => options.onStderr(chunk.toString('utf8')));
     child.on('error', (error: NodeJS.ErrnoException) => {
@@ -1609,10 +1603,26 @@ function shellSpawn(
       settle(error.code === 'ENOENT' ? 127 : 1, undefined);
     });
     child.on('close', (code, signal) => {
+      options.signal.removeEventListener('abort', stop);
       if (spawnError) return;
       settle(code ?? undefined, signal ?? undefined);
     });
   });
+}
+
+function terminateProcessTree(child: ChildProcess): void {
+  if (child.pid === undefined) return;
+  if (process.platform === 'win32') {
+    // child.kill() only terminates cmd.exe on Windows; its node/python/etc.
+    // descendants otherwise keep running after the TUI says "stopped".
+    execFile('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true }, () => undefined);
+    return;
+  }
+  try {
+    process.kill(-child.pid, 'SIGTERM');
+  } catch {
+    child.kill('SIGTERM');
+  }
 }
 
 /** Run a user-typed `!command` directly in a shell, bypassing the agent loop
@@ -1637,9 +1647,10 @@ export function runShellCommand(
       ? { file: process.env.ComSpec ?? 'cmd.exe', args: ['/d', '/s', '/c', command], verbatim: true }
       : { file: '/bin/sh', args: ['-c', command], verbatim: false };
     const controller = new AbortController();
+    const onExternalAbort = (): void => controller.abort(options.signal?.reason);
     if (options.signal) {
       if (options.signal.aborted) controller.abort(options.signal.reason);
-      else options.signal.addEventListener('abort', () => controller.abort(), { once: true });
+      else options.signal.addEventListener('abort', onExternalAbort, { once: true });
     }
     let output = '';
     let truncated = false;
@@ -1649,14 +1660,16 @@ export function runShellCommand(
       if (!text) return;
       const room = maxChars - output.length;
       if (room <= 0) { truncated = true; return; }
-      output += text.length > room ? text.slice(0, room) : text;
+      const emitted = text.length > room ? text.slice(0, room) : text;
+      output += emitted;
       if (text.length > room) truncated = true;
-      options.onChunk?.(text);
+      options.onChunk?.(emitted);
     };
     const settle = (exitCode: number | undefined, note?: string): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      options.signal?.removeEventListener('abort', onExternalAbort);
       resolveShell({ output: `${output}${truncated ? `${nl}(output truncated)` : ''}${note ?? ''}`, exitCode });
     };
     const timer = setTimeout(() => {

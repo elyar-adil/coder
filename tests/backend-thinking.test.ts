@@ -59,3 +59,33 @@ test('anthropic reports input, output, and cache usage across SSE events', async
     { outputTokens: 9, cachedInputTokens: undefined, cacheCreationInputTokens: undefined },
   ]);
 });
+
+test('OpenAI and Anthropic flush a final SSE frame at EOF', async (t) => {
+  let entry: { type: 'openai' | 'anthropic'; body: string } = { type: 'openai', body: '' };
+  t.mock.method(globalThis, 'fetch', async () => new Response(entry.body, { status: 200 }));
+  for (const next of [
+    { type: 'openai' as const, body: 'data: [DONE]' },
+    { type: 'anthropic' as const, body: 'event: message_stop\ndata: {}' },
+  ]) {
+    entry = next;
+    const chunks = [];
+    for await (const chunk of chatStream({ type: next.type, baseUrl: 'http://test', model: 'test', apiKey: 'test' }, '', [])) chunks.push(chunk);
+    assert.equal(chunks.at(-1)?.done, true, next.type);
+  }
+});
+
+test('Anthropic applies request options to the wire body', async (t) => {
+  let body: Record<string, unknown> | undefined;
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: { body?: unknown }) => {
+    body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    return new Response('event: message_stop\ndata: {}\n\n', { status: 200 });
+  });
+  for await (const _chunk of chatStream({
+    type: 'anthropic', baseUrl: 'http://test', model: 'test', apiKey: 'test',
+    requestOptions: { maxTokens: 1234, temperature: 0.2, topP: 0.8, extraBody: { metadata: { user_id: 'test' } } },
+  }, '', [])) { /* drain */ }
+  assert.equal(body?.max_tokens, 1234);
+  assert.equal(body?.temperature, 0.2);
+  assert.equal(body?.top_p, 0.8);
+  assert.deepEqual(body?.metadata, { user_id: 'test' });
+});
