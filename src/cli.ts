@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
+import { join } from 'node:path';
 
 import { loadConfigWithPath, saveConfig, saveSelectedModel, scopeConfigToUser, type AgentConfig } from './config.js';
 import { setToolPolicy } from './infra/tools.js';
@@ -8,6 +9,8 @@ import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { AgentRegistry } from './runtime/agent-registry.js';
 import { AgentRuntime } from './runtime/agent-runtime.js';
+import { AgentRuntimeStore } from './runtime/agent-store.js';
+import { formatTraceSummary, listTraceSessions, loadTrace, summarizeTrace } from './runtime/trace-report.js';
 import { WorktreeManager } from './runtime/worktree.js';
 import { registerWorkspaceInstance } from './runtime/workspace-instances.js';
 import { runFullscreenTui } from './ui/fullscreen-tui.js';
@@ -125,6 +128,36 @@ async function main(): Promise<void> {
       }
       await showUpdateNotice();
       await runtime.shutdown();
+    });
+
+  program
+    .command('trace [session]')
+    .description('Summarize recorded run traces: tool errors, timings, requests and tokens per session')
+    .option('--json', 'machine-readable output')
+    .action(async (session: string | undefined, options: { json?: boolean }) => {
+      const dir = join(new AgentRuntimeStore().runtimeDir, 'traces');
+      if (session) {
+        const events = await loadTrace(dir, session);
+        if (!events) throw new Error(`No trace for session "${session}" in ${dir}`);
+        const summary = summarizeTrace(session, events);
+        process.stdout.write(`${options.json ? JSON.stringify(summary, null, 2) : formatTraceSummary(summary)}\n`);
+        return;
+      }
+      const ids = await listTraceSessions(dir);
+      if (!ids.length) {
+        process.stdout.write(`No traces yet in ${dir}. Every run records one (AGENT_TRACE=0 disables it).\n`);
+        return;
+      }
+      const summaries = await Promise.all(ids.map(async (id) => summarizeTrace(id, (await loadTrace(dir, id)) ?? [])));
+      if (options.json) {
+        process.stdout.write(`${JSON.stringify(summaries, null, 2)}\n`);
+        return;
+      }
+      for (const entry of summaries) {
+        const calls = entry.tools.reduce((sum, tool) => sum + tool.calls, 0);
+        const errors = entry.tools.reduce((sum, tool) => sum + tool.errors, 0);
+        process.stdout.write(`${entry.sessionId}\tturns=${entry.turns.count}\trequests=${entry.requests.total}\ttool_calls=${calls}\ttool_errors=${errors}\n`);
+      }
     });
 
   program.action(async () => {

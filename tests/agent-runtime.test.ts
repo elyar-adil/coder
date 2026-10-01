@@ -260,6 +260,39 @@ describe('AgentRuntime', () => {
     }
   });
 
+  test('writes a run trace of the turn: user message, steps, tool outcomes, turn totals, with secrets redacted', async () => {
+    const secret = 'sk-live-TRACED-1234567890abcdefgh';
+    let call = 0;
+    const { runtime, root, store } = await fixture(async function* (_config, _system, _messages, tools) {
+      call += 1;
+      if (call === 1 && tools.length) {
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: `node -e "console.error('token=${secret}'); process.exit(2)"` } } }], done: false };
+      } else {
+        yield { content: 'It failed.', done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['bash'] });
+    try {
+      runtime.registerSecrets([secret]);
+      await runtime.openSession('traced');
+      await runtime.submitMessage('traced', 'run the failing command');
+      await runtime.waitForIdle('traced');
+      await runtime.shutdown();
+      const text = await readFile(join(store.runtimeDir, 'traces', 'traced.jsonl'), 'utf8');
+      assert.doesNotMatch(text, /TRACED-1234567890abcdefgh/, 'secrets never reach the trace');
+      const events = text.trim().split('\n').map((line) => JSON.parse(line) as { ev: string; tool?: string; ok?: boolean; output?: string; step?: number });
+      assert.equal(events[0]!.ev, 'user');
+      assert.deepEqual(events.filter((event) => event.ev === 'step').map((event) => event.step), [1, 2]);
+      const bash = events.find((event) => event.ev === 'tool')!;
+      assert.equal(bash.tool, 'bash');
+      assert.equal(bash.ok, false);
+      assert.match(bash.output!, /^Error: command failed \(exit code 2\)/);
+      assert.ok(events.some((event) => event.ev === 'turn'), 'the finished turn is summarized');
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('a state-changing success resets the stuck repetition chain', async () => {
     const actions = ['read', 'read', 'read', 'write', 'read', 'read', 'read', 'done'];
     let call = 0;

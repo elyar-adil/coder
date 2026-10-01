@@ -147,6 +147,18 @@ Long-running agents keep their context bounded in three ways:
 
 Visible conversation history is never modified; compaction only affects what gets sent to the model.
 
+## Run traces
+
+Every run appends a compact trace to `~/.coder/runtime/traces/<session>.jsonl`: user messages, model-request steps, each tool call with its duration and outcome (inputs and outputs clipped), per-turn time and token usage, compactions, loop-pause notices, and runtime errors. Secrets are redacted the same way as saved sessions. `AGENT_TRACE=0` turns it off.
+
+```powershell
+maw trace            # one line per recorded session
+maw trace <session>  # tool calls/errors/timings, requests and tokens, most common tool errors
+maw trace <session> --json
+```
+
+Use it after an evaluation run to see where a task went wrong: which tools failed repeatedly, which calls were slow, how many model requests a turn needed.
+
 ## Model configuration
 
 Provider and model configuration is stored in the user-level `~/.agentrc`. Project configuration may provide defaults, while interactive changes remain user-scoped.

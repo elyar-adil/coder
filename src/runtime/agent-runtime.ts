@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { chatStream, type BackendConfig, type ChatChunk } from '../backend.js';
 import { FetchError } from '../fetch.js';
@@ -23,6 +23,7 @@ import { AgentRuntimeStore } from './agent-store.js';
 import { CrossProcessLockManager, LockConflictError, type CrossProcessLockHandle, type LiveLockHolder } from './file-lock.js';
 import { FileLockManager } from './locks.js';
 import { recordTimeline } from './session-timeline.js';
+import { TraceRecorder } from './trace.js';
 
 const WORKSPACE_CONTEXT_LABEL = 'AGENTS.md';
 
@@ -306,6 +307,8 @@ export class AgentRuntime {
   private readonly sessions = new Map<string, AgentSession>();
   private readonly instances = new Map<string, AgentInstance>();
   private readonly subscribers = new Set<(event: AgentEvent) => void>();
+  /** Append-only run trace (see trace.ts); AGENT_TRACE=0 turns it off. */
+  private readonly trace?: TraceRecorder;
   private readonly queue: string[] = [];
   private readonly queued = new Set<string>();
   private readonly activeTurns = new Set<string>();
@@ -329,6 +332,10 @@ export class AgentRuntime {
     const lockDir = resolve(this.store.runtimeDir, 'locks');
     this.fileLocks = new FileLockManager(lockDir);
     this.sessionLocks = new CrossProcessLockManager(lockDir);
+    if (process.env.AGENT_TRACE !== '0') {
+      this.trace = new TraceRecorder({ dir: join(this.store.runtimeDir, 'traces'), redact: (line) => this.store.redactor.redactJson(line) });
+      this.subscribers.add((event) => this.trace?.record(event));
+    }
     // Every API key that is actually used must never reach disk in a saved session.
     this.resolveModel = (alias) => {
       const resolved = options.resolveModel(alias);
@@ -869,6 +876,7 @@ export class AgentRuntime {
     for (const controller of this.controllers.values()) controller.abort('Runtime shutdown');
     for (const sessionId of this.sessions.keys()) await this.persistSession(sessionId);
     await this.store.flush();
+    await this.trace?.flush();
     for (const sessionId of [...this.sessionLockHandles.keys()]) {
       await this.releaseSessionLock(sessionId).catch(() => undefined);
     }
