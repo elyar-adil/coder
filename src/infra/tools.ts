@@ -1,6 +1,6 @@
 import { readFile, writeFile, readdir, mkdir, stat, rename, rm, lstat, realpath } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { exec, execFile, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ToolRegistry } from '../tools/registry.js';
@@ -9,6 +9,7 @@ import { unifiedDiff } from '../diff.js';
 import { resilientFetch } from '../fetch.js';
 import { snapshotBeforeWrite } from './file-snapshot.js';
 import { atomicWriteFile } from './atomic-write.js';
+import { formatShellResult, runShell } from './shell.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -19,7 +20,6 @@ import {
   type ToolPolicy,
 } from '../policy.js';
 
-const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 export type BuiltinToolContext = ToolExecutionContext<ToolPolicy>;
 
@@ -682,8 +682,8 @@ understand the codebase structure without reading every file. Returns a compact 
     function: {
       name: 'bash',
       description: process.platform === 'win32'
-        ? 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. NOTE: on Windows this runs cmd.exe — Unix tools like grep/sed/awk/ripgrep are unavailable; use the built-in search_text/read_file tools instead.'
-        : 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
+        ? 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. NOTE: on Windows this runs cmd.exe — Unix tools like grep/sed/awk/ripgrep are unavailable; use the built-in search_text/read_file tools instead. A non-zero exit is reported as \"Error: command failed (exit code N)\"; a timeout kills the whole process tree. stdin is closed, so commands cannot prompt for input: pass non-interactive flags (-y, --no-pager, -m). A command that ends with & is left running in the background.'
+        : 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. A non-zero exit is reported as \"Error: command failed (exit code N)\"; a timeout kills the whole process tree. stdin is closed, so commands cannot prompt for input: pass non-interactive flags (-y, --no-pager, -m). A command that ends with & is left running in the background.',
       parameters: {
         type: 'object',
         properties: {
@@ -1500,21 +1500,15 @@ async function executeBuiltinTool(
         if (ctx?.artifactDir && typeof args['cwd'] !== 'string') {
           await mkdir(cwd, { recursive: true });
         }
-        const { stdout, stderr } = await execAsync(command, {
-          cwd,
-          timeout,
-          maxBuffer: 1024 * 1024 * 4,
-          signal: ctx?.signal,
-        });
-        const output = [stdout, stderr].filter(Boolean).join('\n--- stderr ---\n');
-        const win32Note = process.platform === 'win32'
+        const shell = await runShell(command, { cwd, timeoutMs: timeout, signal: ctx?.signal });
+        const text = formatShellResult(shell, { cwd, timeoutMs: timeout });
+        // Only a clean run carries the cmd.exe hint; failures already explain themselves.
+        const win32Note = process.platform === 'win32' && text.indexOf('Error:') !== 0
           ? '\n(Note: shell is cmd.exe — grep/ripgrep-like Unix utilities are unavailable; use search_text/read_file instead.)'
           : '';
-        return boundedOutput(output || '(no output)') + win32Note;
+        return text + win32Note;
       } catch (error: unknown) {
-        const err = error as { stdout?: string; stderr?: string; message?: string };
-        const output = [err.stdout, err.stderr].filter(Boolean).join('\n');
-        return `Error: command failed${output ? `\n${output}` : `: ${err.message ?? String(error)}`}`;
+        return `Error: command failed: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
 
