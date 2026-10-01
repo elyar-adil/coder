@@ -17,7 +17,7 @@ export interface AgentToolCall {
   id?: string;
   function: {
     name: string;
-    arguments: Record<string, string>;
+    arguments: Record<string, unknown>;
   };
 }
 

@@ -243,9 +243,9 @@ function convertToOpenAIMessages(systemPrompt: string, messages: OllamaMsg[]): A
 
 function convertToOllamaToolCalls(openaiCalls: OpenAIToolCall[]): OllamaMsg['tool_calls'] {
   return openaiCalls.map((toolCall) => {
-    let args: Record<string, string> = {};
+    let args: Record<string, unknown> = {};
     try {
-      args = JSON.parse(toolCall.function.arguments) as Record<string, string>;
+      args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
     } catch {
       // Preserve the raw text so the tool's "requires X" error shows the
       // model what it actually produced instead of a baffling empty call.

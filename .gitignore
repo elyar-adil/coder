@@ -8,3 +8,7 @@ __pycache__/
 .workbuddy/
 .DS_Store
 .coder/
+
+# Benchmark runs write timestamped reports; only the *-latest.* summaries are tracked.
+tests/benchmarks/reports/*
+!tests/benchmarks/reports/*-latest.*

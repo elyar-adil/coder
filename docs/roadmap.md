@@ -9,7 +9,7 @@
 |---|---|---|---|
 | 0.1 | **DeepSeek `reasoning_content` 回传** | 已实现：流里的 `reasoning_content` 存到 assistant 消息上，之后每次请求原样带回（仅当模型返回过该字段，不会给其他网关凭空加字段），并计入上下文预算。后端和运行时各有测试，均已确认改动前失败、改动后通过。**尚未在真实 DeepSeek 接口上验证**：回传规则按保守版本实现（凡带该字段的 assistant 消息都回传），官方文档站被网络策略拦截，未能核对精确条件。Anthropic 路径未启用 thinking 参数，不涉及。 | 已实现，待真实接口验证 |
 | 0.2 | **评测基线** | 跑通现有 `tests/benchmarks` 的 HumanEval，得到第一个数字；评估扩展到仓库级评测（SWE-bench Lite 子集或 Terminal-Bench）；对失败任务做分类（找不到文件 / 编辑出错 / 验证不足 / 上下文丢失 / 其他）。 | 待做 |
-| 0.3 | **仓库卫生** | `tsconfig.json` 的 include 加入 `tests/**`；`tests/benchmarks/reports/` 只保留 `*-latest.*`，其余加入 `.gitignore`；`@types/blessed` 移到 devDependencies；补 `engines` 和 lint / format 脚本；统一品牌与 bin 别名（`maw` / `tokenmaw` / `coder` / `coding-agent`）。 | 待做 |
+| 0.3 | **仓库卫生** | 已完成：`package-lock.json` 里 99 处指向 `registry.npmmirror.com` 的下载地址改回官方源（受限网络下 `npm ci` 会无限卡住，现在默认参数 1.5 秒装完）；`@types/blessed` 移到 devDependencies；加 `engines.node >=22`（与 CI 矩阵一致）；benchmark 时间戳报告不再入库（只保留 `*-latest.*`，旧报告仍在 git 历史里）；`AgentToolCall.function.arguments` 的类型由 `Record<string, string>` 改为 `Record<string, unknown>`（与实际一致）。**未做（需要决定或留给本地）：** ① 测试纳入类型检查——目前有 90 个错误，其中 86 个在 `tests/fullscreen-tui.test.ts`（访问 blessed 内部属性 `lines` / `items` / `style`，类型包里没有），另有 `backend.test.ts`、`compact.test.ts`（含一个真 bug：`assert.ok(x.length, 1)` 的第二个参数只是失败消息，应为 `assert.equal`）、`session-timeline.test.ts` 各 1 至 2 个；② lint / format 脚本需要引入 eslint / prettier 等新依赖，待决定；③ 品牌与 bin 别名统一（`maw` / `tokenmaw` / `coder` / `coding-agent`），待决定。 | 部分完成 |
 | 0.4 | **文档合并** | `docs/` 有 5 份重叠的审计和计划；把仍有效的并入本文件，已完成的归档。修正 `hardening-backlog.md` 末尾"仅计划，未执行"的过期状态。 | 待做 |
 
 ## 阶段 1：数据基础（原则 7）
