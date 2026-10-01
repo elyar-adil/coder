@@ -10,7 +10,20 @@
 | 0.1 | **DeepSeek `reasoning_content` 回传** | 已实现：流里的 `reasoning_content` 存到 assistant 消息上，之后每次请求原样带回（仅当模型返回过该字段，不会给其他网关凭空加字段），并计入上下文预算。后端和运行时各有测试，均已确认改动前失败、改动后通过。**尚未在真实 DeepSeek 接口上验证**：回传规则按保守版本实现（凡带该字段的 assistant 消息都回传），官方文档站被网络策略拦截，未能核对精确条件。Anthropic 路径未启用 thinking 参数，不涉及。 | 已实现，待真实接口验证 |
 | 0.2 | **评测基线** | 跑通现有 `tests/benchmarks` 的 HumanEval，得到第一个数字；评估扩展到仓库级评测（SWE-bench Lite 子集或 Terminal-Bench）；对失败任务做分类（找不到文件 / 编辑出错 / 验证不足 / 上下文丢失 / 其他）。 | 待做 |
 | 0.3 | **仓库卫生** | 已完成：`package-lock.json` 里 99 处指向 `registry.npmmirror.com` 的下载地址改回官方源（受限网络下 `npm ci` 会无限卡住，现在默认参数 1.5 秒装完）；`@types/blessed` 移到 devDependencies；加 `engines.node >=22`（与 CI 矩阵一致）；benchmark 时间戳报告不再入库（只保留 `*-latest.*`，旧报告仍在 git 历史里）；`AgentToolCall.function.arguments` 的类型由 `Record<string, string>` 改为 `Record<string, unknown>`（与实际一致）。**未做（需要决定或留给本地）：** ① 测试纳入类型检查——目前有 90 个错误，其中 86 个在 `tests/fullscreen-tui.test.ts`（访问 blessed 内部属性 `lines` / `items` / `style`，类型包里没有），另有 `backend.test.ts`、`compact.test.ts`（含一个真 bug：`assert.ok(x.length, 1)` 的第二个参数只是失败消息，应为 `assert.equal`）、`session-timeline.test.ts` 各 1 至 2 个；② lint / format 脚本需要引入 eslint / prettier 等新依赖，待决定；③ 品牌与 bin 别名统一（`maw` / `tokenmaw` / `coder` / `coding-agent`），待决定。 | 部分完成 |
-| 0.4 | **文档合并** | `docs/` 有 5 份重叠的审计和计划；把仍有效的并入本文件，已完成的归档。修正 `hardening-backlog.md` 末尾"仅计划，未执行"的过期状态。 | 待做 |
+| 0.4 | **文档合并** | `hardening-backlog.md` 的过期状态已改为状态快照（见该文件顶部）；其余 4 份审计文档暂未合并，仍待做。 | 部分完成 |
+
+## 本轮已完成的能力改进（未经评测，需要你本地用真实模型验证）
+
+这些改动都是各大 agent 已普遍具备、且不依赖具体模型的能力。因为没有 API，**没有任何评测数据**证明它们提高了完成率，每一项都附了验证方法。单元测试均已通过（改动前失败、改动后通过）。
+
+| 改动 | 解决的问题 | 本地怎么验证 | 回退方式 |
+|---|---|---|---|
+| **bash 加固**（`src/infra/shell.ts`） | 失败只说 "command failed"，没有退出码，分不清失败与超时；超时只杀 shell，`npm test` 的子进程变成孤儿；stdin 开着，交互式提示会干等满 60 秒；`server &` 会卡住整个调用；ANSI 颜色码白占 token | 让 agent 跑一个会失败的测试命令，看结果是否带 `exit code N`；跑 `sleep 100`（`timeout_ms` 设小），确认超时后 `ps` 里没有残留进程 | 还原 `tools.ts` 里 `bash` 分支为 `exec` |
+| **编辑后语法诊断**（`src/infra/diagnostics.ts`） | 编辑把文件改坏，要等下一次运行才知道。现在 `write_file` / `edit_file` 成功后，对 JSON / Python / JS / TS(X) / shell 做纯语法检查，**有错才提示**，且写入从不被阻塞 | 让 agent 故意写一个语法错误的 `.ts` / `.py`，看工具结果里是否在 OK 行后出现 `⚠ Syntax check failed`；正常文件不应出现任何额外文字 | 环境变量 `AGENT_SYNTAX_CHECK=0` |
+| **skill 可发现 + 分层**（`src/infra/skills.ts`） | 模型不知道有哪些 skill，只有调用失败才在报错里看到名字；skill 只在 `<workspace>/skills` 里找，与 agent spec 三层不一致 | 在 `.coder/skills/` 放一个带 `description:` 的 skill，看 `load_skill` 的工具描述是否列出它，并让 agent 在合适任务里主动加载 | 无需回退，向后兼容 |
+| **`read_file` 防护**（`src/infra/text-file.ts`） | 二进制被当 UTF-8 解码成乱码；不传 `limit` 整份读入再被运行时从中间硬截断；压缩 JS 的超长单行冲掉上下文 | 让 agent 读一个 PNG、一个 3000 行文件、一个压缩过的 bundle，看输出是否分别是"二进制"提示、带续读范围的窗口、被截短的行 | 还原 `tools.ts` 里 `read_file` / `read_files` |
+| **`implement` 工作标准**（`agents/implement.md`） | 原来只有 94 个词。现在写明：先理解再改、能复现就先复现、最小改动、用项目自己的命令由窄到宽验证、不为通过检查而削弱测试、把工具反馈当证据 | 对比同一批任务在新旧 `implement.md` 下的表现（这是唯一一项需要真实评测才能判断好坏的文档改动） | `git revert` 该提交 |
+| **DeepSeek `reasoning_content` 回传** | 见 0.1 | 用 DeepSeek 开启 thinking，跑一次多轮工具调用，确认不再 400 | 见 0.1 |
 
 ## 阶段 1：数据基础（原则 7）
 
@@ -42,12 +55,11 @@
 | 3.6 | **OS 级沙箱** | 对 `run:` 外部进程用 bwrap / Landlock / Seatbelt，使权限声明真正可强制。 |
 | 3.7 | **其余**（来自 SOTA 差距分析） | Plan mode 的批准门、checkpoint 还原、跨会话记忆、reasoning effort 旋钮、成本护栏。 |
 
-## 低优先级（沿用 hardening-backlog）
+## 低优先级（沿用 hardening-backlog，已按代码核对状态）
 
-- B2 共享 SSE 读取器（`try/finally` + `reader.cancel()` + `\r\n` 规范化）
-- C1 timeline O(1) 追加
-- C2 TUI 帧内重复计算（`toolDiff` 缓存、`getSession()` 深拷贝）
-- C4 `x-opencode-session` 头仅对 opencode 发送
+- 已完成：A1 原子写、A2 会话文件 0600 且损坏会话拒绝覆盖、A3 symlink、A5 锁、B1 SSE 错误透出、B3 的 `Retry-After`。
+- A4 只完成一半：配置文件已 0600，**会话里的密钥脱敏未做**。
+- 未做：B2 共享 SSE 读取器、B3 的"POST 默认不重试"、C1 timeline O(1) 追加、C2 TUI 帧内重复计算、C3 持久化 debounce（阶段 1.1 的追加式日志会取代它）、C4 `x-opencode-session` 头仅对 opencode 发送。
 
 ## 待决定
 
