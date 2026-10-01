@@ -7,7 +7,7 @@
 
 | # | 事项 | 说明 | 状态 |
 |---|---|---|---|
-| 0.1 | **DeepSeek `reasoning_content` 回传** | 已在代码里确认：`src/backend.ts` 的 `convertToOpenAIMessages` 序列化带 `tool_calls` 的 assistant 消息时没有带回推理内容。据 DeepSeek 官方文档，thinking 模式 + `tools` 时，中间推理内容必须原样回传，直到出现新的 user 消息才可丢弃，否则 API 返回 400。**需要用真实 DeepSeek 接口验证是否真会报错。** Anthropic 的 thinking block 回传（含 signature）也要一并核对。 | 待验证 |
+| 0.1 | **DeepSeek `reasoning_content` 回传** | 已实现：流里的 `reasoning_content` 存到 assistant 消息上，之后每次请求原样带回（仅当模型返回过该字段，不会给其他网关凭空加字段），并计入上下文预算。后端和运行时各有测试，均已确认改动前失败、改动后通过。**尚未在真实 DeepSeek 接口上验证**：回传规则按保守版本实现（凡带该字段的 assistant 消息都回传），官方文档站被网络策略拦截，未能核对精确条件。Anthropic 路径未启用 thinking 参数，不涉及。 | 已实现，待真实接口验证 |
 | 0.2 | **评测基线** | 跑通现有 `tests/benchmarks` 的 HumanEval，得到第一个数字；评估扩展到仓库级评测（SWE-bench Lite 子集或 Terminal-Bench）；对失败任务做分类（找不到文件 / 编辑出错 / 验证不足 / 上下文丢失 / 其他）。 | 待做 |
 | 0.3 | **仓库卫生** | `tsconfig.json` 的 include 加入 `tests/**`；`tests/benchmarks/reports/` 只保留 `*-latest.*`，其余加入 `.gitignore`；`@types/blessed` 移到 devDependencies；补 `engines` 和 lint / format 脚本；统一品牌与 bin 别名（`maw` / `tokenmaw` / `coder` / `coding-agent`）。 | 待做 |
 | 0.4 | **文档合并** | `docs/` 有 5 份重叠的审计和计划；把仍有效的并入本文件，已完成的归档。修正 `hardening-backlog.md` 末尾"仅计划，未执行"的过期状态。 | 待做 |

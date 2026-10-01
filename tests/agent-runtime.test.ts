@@ -173,6 +173,39 @@ describe('AgentRuntime', () => {
     }
   });
 
+  test('keeps provider reasoning_content in model history so the next request can echo it back', async () => {
+    let call = 0;
+    let secondRequest: Array<{ role: string; reasoning_content?: string; tool_calls?: unknown[] }> = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, messages, tools) {
+      call += 1;
+      if (call === 1) {
+        yield { content: null, thinking: 'Need the file. ', reasoningContent: 'Need the file. ', done: false };
+        yield { content: null, thinking: 'Reading.', reasoningContent: 'Reading.', done: false };
+        yield { content: null, toolCalls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'target.txt' } } }], done: false };
+      } else {
+        secondRequest = messages.map((message) => ({ ...message }));
+        assert.ok(tools.length > 0);
+        yield { content: 'Done.', done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file'] });
+    await writeFile(join(root, 'target.txt'), 'content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('reasoning');
+      await runtime.submitMessage('reasoning', 'inspect target.txt');
+      await runtime.waitForIdle('reasoning');
+      assert.equal(call, 2);
+      const toolTurn = secondRequest.find((message) => message.role === 'assistant' && message.tool_calls?.length);
+      assert.equal(toolTurn?.reasoning_content, 'Need the file. Reading.');
+      const finalAnswer = runtime.getInstance(session.mainInstanceId)!.messages.at(-1)!;
+      assert.equal(finalAnswer.role, 'assistant');
+      assert.equal('reasoning_content' in finalAnswer, false, 'a turn without reasoning_content must not gain the field');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('a state-changing success resets the stuck repetition chain', async () => {
     const actions = ['read', 'read', 'read', 'write', 'read', 'read', 'read', 'done'];
     let call = 0;
