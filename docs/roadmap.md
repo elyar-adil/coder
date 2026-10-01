@@ -1,0 +1,58 @@
+# 路线图
+
+> 状态：草稿。依据 [philosophy.md](philosophy.md) 整理，取代 `hardening-backlog.md` 中仍有效的部分。
+> 排序原则：先拿到数据，再改结构，最后扩能力；任何"能力扩展"都要用评测证明有效。
+
+## 阶段 0：马上能做，风险低
+
+| # | 事项 | 说明 | 状态 |
+|---|---|---|---|
+| 0.1 | **DeepSeek `reasoning_content` 回传** | 已在代码里确认：`src/backend.ts` 的 `convertToOpenAIMessages` 序列化带 `tool_calls` 的 assistant 消息时没有带回推理内容。据 DeepSeek 官方文档，thinking 模式 + `tools` 时，中间推理内容必须原样回传，直到出现新的 user 消息才可丢弃，否则 API 返回 400。**需要用真实 DeepSeek 接口验证是否真会报错。** Anthropic 的 thinking block 回传（含 signature）也要一并核对。 | 待验证 |
+| 0.2 | **评测基线** | 跑通现有 `tests/benchmarks` 的 HumanEval，得到第一个数字；评估扩展到仓库级评测（SWE-bench Lite 子集或 Terminal-Bench）；对失败任务做分类（找不到文件 / 编辑出错 / 验证不足 / 上下文丢失 / 其他）。 | 待做 |
+| 0.3 | **仓库卫生** | `tsconfig.json` 的 include 加入 `tests/**`；`tests/benchmarks/reports/` 只保留 `*-latest.*`，其余加入 `.gitignore`；`@types/blessed` 移到 devDependencies；补 `engines` 和 lint / format 脚本；统一品牌与 bin 别名（`maw` / `tokenmaw` / `coder` / `coding-agent`）。 | 待做 |
+| 0.4 | **文档合并** | `docs/` 有 5 份重叠的审计和计划；把仍有效的并入本文件，已完成的归档。修正 `hardening-backlog.md` 末尾"仅计划，未执行"的过期状态。 | 待做 |
+
+## 阶段 1：数据基础（原则 7）
+
+| # | 事项 | 说明 |
+|---|---|---|
+| 1.1 | **追加式会话日志** | 会话改为只追加的事件日志，增加不变量"模型可见的内容都已记录，且每个模型请求都能从日志重建"。同时解决崩溃安全、回放和对比（取代 backlog 的 C3 debounce 方案）。借鉴自 DeepSeek Harness 的 session log。 |
+| 1.2 | **评测接入日常流程** | 每次改动能跑一组固定任务，结果入库可对比。没有这个，阶段 3 无法判断优先级。 |
+
+## 阶段 2：让代码贴合哲学
+
+| # | 事项 | 对应原则 | 说明 |
+|---|---|---|---|
+| 2.1 | **"读后才能改"移出核心** | 4 | `src/tools/types.ts` 的 `ToolExecutionContext` 里有 `requirePriorRead` / `getReadVersion` / `recordReadVersion` / `recordWriteVersion`，是 `read_file` 与 `edit_file` 的私有约定。改为核心提供按能力命名空间隔离的会话状态存储，由文件工具自己使用。 |
+| 2.2 | **拆分 `src/infra/tools.ts`** | 3 | 1692 行的 switch，工具声明和实现分离，表驱动注册，消除名字写错落到 `{effect:'read'}` 兜底的问题。原生文件工具作为一个整体包。 |
+| 2.3 | **拆分超大模块** | 2 | `src/ui/fullscreen-tui.ts`（2427 行）、`src/runtime/agent-runtime.ts`（1672 行）。 |
+| 2.4 | **数据安全遗留（A2 / A4）** | 8 | 会话文件权限与损坏文件隔离；apiKey 脱敏与配置文件 `chmod 600`。 |
+
+## 阶段 3：能力扩展（需要阶段 0.2 / 1.2 的数据支撑）
+
+每一项都要在评测里看到效果，没有提升的不保留。
+
+| # | 事项 | 说明 |
+|---|---|---|
+| 3.1 | **统一 capability 声明格式（试点）** | 先用一个现有只读工具（或 `load_skill`）按 Markdown + frontmatter 重新声明，看复杂度是降了还是升了，再决定是否推广。 |
+| 3.2 | **权限模型** | 能力声明所需权限；首次使用时展示清单、用户同意才生效；授权记录存在用户级文件（按能力 + 内容哈希）；清单变化需重新同意；先粗粒度。 |
+| 3.3 | **工具执行拦截点** | 工具执行前后的统一拦截（pre / post execute），权限检查和 Hooks 都作为其上的监听者。 |
+| 3.4 | **MCP** | 作为 `run:` 的一种后端接入。 |
+| 3.5 | **LSP 诊断** | 编辑后自动获取类型 / 语法错误反馈。 |
+| 3.6 | **OS 级沙箱** | 对 `run:` 外部进程用 bwrap / Landlock / Seatbelt，使权限声明真正可强制。 |
+| 3.7 | **其余**（来自 SOTA 差距分析） | Plan mode 的批准门、checkpoint 还原、跨会话记忆、reasoning effort 旋钮、成本护栏。 |
+
+## 低优先级（沿用 hardening-backlog）
+
+- B2 共享 SSE 读取器（`try/finally` + `reader.cancel()` + `\r\n` 规范化）
+- C1 timeline O(1) 追加
+- C2 TUI 帧内重复计算（`toolDiff` 缓存、`getSession()` 深拷贝）
+- C4 `x-opencode-session` 头仅对 opencode 发送
+
+## 待决定
+
+- **完成证据由谁来守**（哲学原则 6 的方案 A / B）。
+- 权限的具体类别与粒度。
+- "厚文档"假设怎么验证：用哪个场景、哪组任务。
+- 多 agent 编排在"能力第一"下是必须的还是按需的。
+- `run:` 外部进程的沙箱什么时候做。
