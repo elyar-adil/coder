@@ -206,6 +206,32 @@ describe('AgentRuntime', () => {
     }
   });
 
+  test('advertises the available skills in the load_skill tool description, and refreshes them on /cd', async () => {
+    const seen: string[] = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
+      seen.push(tools.find((tool) => tool.function.name === 'load_skill')?.function.description ?? '(no load_skill)');
+      yield { content: 'ok', done: false };
+      yield { content: null, done: true };
+    }, { mainTools: ['load_skill'] });
+    try {
+      await mkdir(join(root, 'proj', '.coder', 'skills'), { recursive: true });
+      await writeFile(join(root, 'proj', '.coder', 'skills', 'release-notes.md'), '---\ndescription: How this project writes release notes\n---\nBody.\n');
+      await runtime.openSession('skills');
+      await runtime.submitMessage('skills', 'one');
+      await runtime.waitForIdle('skills');
+      assert.doesNotMatch(seen.at(-1)!, /release-notes/, 'a project skill is not visible before switching to that project');
+      assert.match(seen.at(-1)!, /Available skills:/, 'built-in skills are advertised');
+
+      await runtime.changeWorkspace(join(root, 'proj'));
+      await runtime.submitMessage('skills', 'two');
+      await runtime.waitForIdle('skills');
+      assert.match(seen.at(-1)!, /- release-notes: How this project writes release notes/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   test('a state-changing success resets the stuck repetition chain', async () => {
     const actions = ['read', 'read', 'read', 'write', 'read', 'read', 'read', 'done'];
     let call = 0;

@@ -103,6 +103,16 @@ Fields:
 
 Specs can reduce capabilities but cannot bypass global tool policy, path boundaries, concurrency, timeout, or recursion limits.
 
+## Skills
+
+A skill is a short Markdown guideline an agent loads on demand with `load_skill`. Skills resolve in layers, the nearest wins:
+
+1. project `<workspace>/.coder/skills/*.md` (and `<workspace>/skills/*.md`)
+2. user `~/.coder/skills/*.md`
+3. built-in `skills/*.md`
+
+Agents that have `load_skill` see each skill's name and one-line description in the tool description (from a `description:` frontmatter field, or else the first prose line); the full text is read only when the skill is loaded. Switching workspaces with `/cd` refreshes the list.
+
 ## Runtime behavior
 
 - One persistent main instance per Session.

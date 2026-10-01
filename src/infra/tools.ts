@@ -11,6 +11,7 @@ import { snapshotBeforeWrite } from './file-snapshot.js';
 import { atomicWriteFile } from './atomic-write.js';
 import { formatShellResult, runShell } from './shell.js';
 import { appendSyntaxCheck } from './diagnostics.js';
+import { isValidSkillName, listSkills, readSkill, skillRoots } from './skills.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -700,7 +701,7 @@ understand the codebase structure without reading every file. Returns a compact 
     type: 'function',
     function: {
       name: 'load_skill',
-      description: 'Load a reusable skill definition by name. Skills provide domain-specific instructions, conventions, and project structure guidelines.',
+      description: 'Load a reusable skill definition by name. Skills provide domain-specific instructions, conventions, and project structure guidelines. Project skills live in .coder/skills, user skills in ~/.coder/skills.',
       parameters: {
         type: 'object',
         properties: {
@@ -1529,16 +1530,12 @@ async function executeBuiltinTool(
     case 'load_skill': {
       const name = typeof args['name'] === 'string' ? args['name'] : undefined;
       if (!name) return 'Error: load_skill requires "name"';
-      if (!/^[a-z0-9_-]+$/i.test(name)) return 'Error: invalid skill name';
-      const candidates = [resolve(workspaceRoot(ctx), 'skills'), resolve(import.meta.dirname, '..', '..', 'skills')];
-      for (const skillsDir of candidates) {
-        try { return await readFile(resolve(skillsDir, `${name}.md`), 'utf8'); } catch { /* try next root */ }
-      }
-      const available = new Set<string>();
-      for (const skillsDir of candidates) {
-        try { for (const file of await readdir(skillsDir)) if (file.endsWith('.md')) available.add(file.slice(0, -3)); } catch { /* ignore */ }
-      }
-      return `Error: skill "${name}" not found${available.size ? `. Available: ${[...available].sort().join(', ')}` : ''}`;
+      if (!isValidSkillName(name)) return 'Error: invalid skill name';
+      const roots = skillRoots(workspaceRoot(ctx));
+      const text = await readSkill(name, roots);
+      if (text !== undefined) return text;
+      const available = (await listSkills(roots)).map((skill) => skill.name);
+      return `Error: skill "${name}" not found${available.length ? `. Available: ${available.join(', ')}` : ''}`;
     }
 
     default:

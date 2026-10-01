@@ -16,6 +16,7 @@ import type {
   SessionMessage,
 } from '../domain/agent.js';
 import { executeTool, getToolPolicy, toolRegistry } from '../infra/tools.js';
+import { formatSkillCatalog, listSkills, skillRoots } from '../infra/skills.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { AgentRegistry, loadWorkspaceContext, matchesAgentSelector } from './agent-registry.js';
 import { AgentRuntimeStore } from './agent-store.js';
@@ -140,6 +141,15 @@ function isRetriableStreamError(error: unknown): boolean {
 }
 
 const waitMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Skill catalog text for the current workspace; a missing or unreadable skills directory is simply no catalog. */
+async function loadSkillCatalog(workspaceRoot: string): Promise<string> {
+  try {
+    return formatSkillCatalog(await listSkills(skillRoots(workspaceRoot)));
+  } catch {
+    return '';
+  }
+}
 
 function messageSize(message: AgentModelMessage): number {
   return String(message.content ?? '').length
@@ -289,6 +299,8 @@ export class AgentRuntime {
   private readonly maxAgentDepth: number;
   private readonly maxChildrenPerTurn: number;
   private projectContext?: string;
+  /** Names and one-line descriptions of loadable skills, appended to the load_skill tool description. */
+  private skillCatalog = '';
   private readonly readVersions = new Map<string, Map<string, string>>();
   private defaultModel?: string;
   private readonly sessions = new Map<string, AgentSession>();
@@ -328,8 +340,10 @@ export class AgentRuntime {
     const contextPromise = options.projectContext !== undefined
       ? Promise.resolve(options.projectContext)
       : loadWorkspaceContext(this.workspaceRoot);
-    this.ready = Promise.all([this.registry.load(), this.store.init(), contextPromise]).then(([, , context]) => {
+    const skillsPromise = loadSkillCatalog(this.workspaceRoot);
+    this.ready = Promise.all([this.registry.load(), this.store.init(), contextPromise, skillsPromise]).then(([, , context, catalog]) => {
       this.projectContext = context;
+      this.skillCatalog = catalog;
       this.validateSpecs();
     });
   }
@@ -398,6 +412,7 @@ export class AgentRuntime {
     this.workspaceRoot = target;
     this.registry.setProjectDir(target);
     this.projectContext = await loadWorkspaceContext(target);
+    this.skillCatalog = await loadSkillCatalog(target);
     this.readVersions.clear();
     try {
       await this.registry.load();
@@ -407,6 +422,7 @@ export class AgentRuntime {
       this.workspaceRoot = previousRoot;
       this.registry.setProjectDir(previousRoot);
       this.projectContext = await loadWorkspaceContext(previousRoot).catch(() => undefined);
+      this.skillCatalog = await loadSkillCatalog(previousRoot);
       throw error instanceof Error ? error : new Error(String(error));
     }
     this.emit({ type: 'workspace_changed', sessionId: options.sessionId, workspaceRoot: target, previousRoot });
@@ -991,7 +1007,10 @@ export class AgentRuntime {
       : spec.tools;
     const tools = requested
       .map((name) => toolRegistry.get(name)?.definition)
-      .filter((definition): definition is ToolDefinition => Boolean(definition));
+      .filter((definition): definition is ToolDefinition => Boolean(definition))
+      .map((definition) => (definition.function.name === 'load_skill' && this.skillCatalog
+        ? { ...definition, function: { ...definition.function, description: definition.function.description + this.skillCatalog } }
+        : definition));
     if (spec.agents.length > 0 && this.registry.allowedAgents(spec).length > 0) {
       tools.push(...AGENT_TOOL_DEFINITIONS);
     }
