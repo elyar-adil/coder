@@ -89,3 +89,46 @@ test('Anthropic applies request options to the wire body', async (t) => {
   assert.equal(body?.top_p, 0.8);
   assert.deepEqual(body?.metadata, { user_id: 'test' });
 });
+
+test('openai chat exposes streamed reasoning_content separately for echo-back', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'data: {"choices":[{"delta":{"reasoning_content":"Plan. "}}]}',
+    'data: {"choices":[{"delta":{"reasoning_content":"Call."}}]}',
+    'data: [DONE]', '',
+  ].join('\n\n'), { status: 200 }));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'openai', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
+  assert.equal(chunks.map((chunk) => chunk.reasoningContent ?? '').join(''), 'Plan. Call.');
+});
+
+test('openai chat does not mistake the alternate `reasoning` field for reasoning_content', async (t) => {
+  t.mock.method(globalThis, 'fetch', async () => new Response([
+    'data: {"choices":[{"delta":{"reasoning":"Hmm."}}]}',
+    'data: [DONE]', '',
+  ].join('\n\n'), { status: 200 }));
+  const chunks = [];
+  for await (const chunk of chatStream({ type: 'openai', baseUrl: 'http://test', model: 'test' }, '', [])) chunks.push(chunk);
+  assert.equal(chunks.map((chunk) => chunk.thinking ?? '').join(''), 'Hmm.');
+  assert.equal(chunks.some((chunk) => chunk.reasoningContent), false);
+});
+
+test('openai chat sends reasoning_content back on assistant messages that carry it', async (t) => {
+  let body: { messages?: Array<Record<string, unknown>> } | undefined;
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: { body?: unknown }) => {
+    body = JSON.parse(String(init.body)) as typeof body;
+    return new Response('data: [DONE]\n\n', { status: 200 });
+  });
+  const call = { id: 'call_1', function: { name: 'read_file', arguments: { path: 'a.ts' } } };
+  for await (const _chunk of chatStream({ type: 'openai', baseUrl: 'http://test', model: 'test' }, '', [
+    { role: 'user', content: 'go' },
+    { role: 'assistant', content: null, tool_calls: [call], reasoning_content: 'Need to read a.ts first.' },
+    { role: 'tool', content: 'file body', tool_use_id: 'call_1' },
+    { role: 'assistant', content: 'Done.', reasoning_content: 'All good.' },
+    { role: 'user', content: 'again' },
+    { role: 'assistant', content: 'No reasoning provider.' },
+  ])) { /* drain */ }
+  const assistants = (body?.messages ?? []).filter((message) => message.role === 'assistant');
+  assert.equal(assistants[0]?.reasoning_content, 'Need to read a.ts first.');
+  assert.equal(assistants[1]?.reasoning_content, 'All good.');
+  assert.equal('reasoning_content' in (assistants[2] ?? {}), false, 'never invent the field for providers that did not return it');
+});

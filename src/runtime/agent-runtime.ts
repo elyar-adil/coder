@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import { chatStream, type BackendConfig, type ChatChunk } from '../backend.js';
 import { FetchError } from '../fetch.js';
@@ -16,12 +16,14 @@ import type {
   SessionMessage,
 } from '../domain/agent.js';
 import { executeTool, getToolPolicy, toolRegistry } from '../infra/tools.js';
+import { formatSkillCatalog, listSkills, skillRoots } from '../infra/skills.js';
 import type { ToolDefinition } from '../tools/types.js';
 import { AgentRegistry, loadWorkspaceContext, matchesAgentSelector } from './agent-registry.js';
 import { AgentRuntimeStore } from './agent-store.js';
 import { CrossProcessLockManager, LockConflictError, type CrossProcessLockHandle, type LiveLockHolder } from './file-lock.js';
 import { FileLockManager } from './locks.js';
 import { recordTimeline } from './session-timeline.js';
+import { TraceRecorder } from './trace.js';
 
 const WORKSPACE_CONTEXT_LABEL = 'AGENTS.md';
 
@@ -141,10 +143,20 @@ function isRetriableStreamError(error: unknown): boolean {
 
 const waitMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Skill catalog text for the current workspace; a missing or unreadable skills directory is simply no catalog. */
+async function loadSkillCatalog(workspaceRoot: string): Promise<string> {
+  try {
+    return formatSkillCatalog(await listSkills(skillRoots(workspaceRoot)));
+  } catch {
+    return '';
+  }
+}
+
 function messageSize(message: AgentModelMessage): number {
   return String(message.content ?? '').length
     + JSON.stringify(message.tool_calls ?? []).length
-    + JSON.stringify(message.responseItems ?? []).length;
+    + JSON.stringify(message.responseItems ?? []).length
+    + (message.reasoning_content?.length ?? 0);
 }
 
 function formatMessageForSummary(index: number, message: AgentModelMessage): string {
@@ -288,11 +300,15 @@ export class AgentRuntime {
   private readonly maxAgentDepth: number;
   private readonly maxChildrenPerTurn: number;
   private projectContext?: string;
+  /** Names and one-line descriptions of loadable skills, appended to the load_skill tool description. */
+  private skillCatalog = '';
   private readonly readVersions = new Map<string, Map<string, string>>();
   private defaultModel?: string;
   private readonly sessions = new Map<string, AgentSession>();
   private readonly instances = new Map<string, AgentInstance>();
   private readonly subscribers = new Set<(event: AgentEvent) => void>();
+  /** Append-only run trace (see trace.ts); AGENT_TRACE=0 turns it off. */
+  private readonly trace?: TraceRecorder;
   private readonly queue: string[] = [];
   private readonly queued = new Set<string>();
   private readonly activeTurns = new Set<string>();
@@ -316,7 +332,16 @@ export class AgentRuntime {
     const lockDir = resolve(this.store.runtimeDir, 'locks');
     this.fileLocks = new FileLockManager(lockDir);
     this.sessionLocks = new CrossProcessLockManager(lockDir);
-    this.resolveModel = options.resolveModel;
+    if (process.env.AGENT_TRACE !== '0') {
+      this.trace = new TraceRecorder({ dir: join(this.store.runtimeDir, 'traces'), redact: (line) => this.store.redactor.redactJson(line) });
+      this.subscribers.add((event) => this.trace?.record(event));
+    }
+    // Every API key that is actually used must never reach disk in a saved session.
+    this.resolveModel = (alias) => {
+      const resolved = options.resolveModel(alias);
+      this.store.redactor.add(resolved.apiKey);
+      return resolved;
+    };
     this.defaultModel = options.defaultModel;
     this.modelStream = options.modelStream ?? ((config, system, messages, tools, signal) => (
       chatStream(config, system, messages, tools, signal)
@@ -327,14 +352,21 @@ export class AgentRuntime {
     const contextPromise = options.projectContext !== undefined
       ? Promise.resolve(options.projectContext)
       : loadWorkspaceContext(this.workspaceRoot);
-    this.ready = Promise.all([this.registry.load(), this.store.init(), contextPromise]).then(([, , context]) => {
+    const skillsPromise = loadSkillCatalog(this.workspaceRoot);
+    this.ready = Promise.all([this.registry.load(), this.store.init(), contextPromise, skillsPromise]).then(([, , context, catalog]) => {
       this.projectContext = context;
+      this.skillCatalog = catalog;
       this.validateSpecs();
     });
   }
 
   whenReady(): Promise<void> {
     return this.ready;
+  }
+
+  /** Register secrets (configured API keys) to be stripped from persisted sessions and archives. */
+  registerSecrets(values: Array<string | undefined>): void {
+    this.store.redactor.add(...values);
   }
 
   subscribe(listener: (event: AgentEvent) => void): () => void {
@@ -397,6 +429,7 @@ export class AgentRuntime {
     this.workspaceRoot = target;
     this.registry.setProjectDir(target);
     this.projectContext = await loadWorkspaceContext(target);
+    this.skillCatalog = await loadSkillCatalog(target);
     this.readVersions.clear();
     try {
       await this.registry.load();
@@ -406,6 +439,7 @@ export class AgentRuntime {
       this.workspaceRoot = previousRoot;
       this.registry.setProjectDir(previousRoot);
       this.projectContext = await loadWorkspaceContext(previousRoot).catch(() => undefined);
+      this.skillCatalog = await loadSkillCatalog(previousRoot);
       throw error instanceof Error ? error : new Error(String(error));
     }
     this.emit({ type: 'workspace_changed', sessionId: options.sessionId, workspaceRoot: target, previousRoot });
@@ -842,6 +876,7 @@ export class AgentRuntime {
     for (const controller of this.controllers.values()) controller.abort('Runtime shutdown');
     for (const sessionId of this.sessions.keys()) await this.persistSession(sessionId);
     await this.store.flush();
+    await this.trace?.flush();
     for (const sessionId of [...this.sessionLockHandles.keys()]) {
       await this.releaseSessionLock(sessionId).catch(() => undefined);
     }
@@ -990,7 +1025,10 @@ export class AgentRuntime {
       : spec.tools;
     const tools = requested
       .map((name) => toolRegistry.get(name)?.definition)
-      .filter((definition): definition is ToolDefinition => Boolean(definition));
+      .filter((definition): definition is ToolDefinition => Boolean(definition))
+      .map((definition) => (definition.function.name === 'load_skill' && this.skillCatalog
+        ? { ...definition, function: { ...definition.function, description: definition.function.description + this.skillCatalog } }
+        : definition));
     if (spec.agents.length > 0 && this.registry.allowedAgents(spec).length > 0) {
       tools.push(...AGENT_TOOL_DEFINITIONS);
     }
@@ -1235,6 +1273,7 @@ export class AgentRuntime {
         const messages = this.trimMessages(instance.messages, config);
         let text = '';
         let thinking = '';
+        let reasoningContent = '';
         const responseItems: Record<string, unknown>[] = [];
         const calls: NonNullable<AgentModelMessage['tool_calls']> = [];
         // A stream that dies before emitting anything is safe to retry: the
@@ -1250,6 +1289,7 @@ export class AgentRuntime {
                 thinking += chunk.thinking;
                 this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
               }
+              if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent;
               if (chunk.content) {
                 if (firstTokenMs === undefined) firstTokenMs = Date.now() - turnStartedAt;
                 text += chunk.content;
@@ -1271,7 +1311,7 @@ export class AgentRuntime {
             await waitMs(Math.max(500 * (attempt + 1), advertised ?? 0));
           }
         }
-        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });
+        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}), ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
         if (text.trim() && !instance.parentInstanceId) {
           const visible: SessionMessage = { messageId: randomUUID(), role: 'assistant', content: text.trim(), createdAt: now(), turnId, ...(thinking ? { thinking } : {}) };
           session.messages.push(visible);
@@ -1431,6 +1471,7 @@ export class AgentRuntime {
     });
     let text = '';
     let thinking = '';
+    let reasoningContent = '';
     let usage: ModelUsage | undefined;
     try {
       for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), this.trimMessages(instance.messages, config), [], signal)) {
@@ -1439,6 +1480,7 @@ export class AgentRuntime {
           thinking += chunk.thinking;
           this.emit({ type: 'thinking_delta', sessionId: instance.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
         }
+        if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent;
         if (chunk.content) text += chunk.content;
         if (chunk.usage) usage = mergeUsage(usage, chunk.usage);
       }
@@ -1447,7 +1489,7 @@ export class AgentRuntime {
       // still tells the user why the turn stopped.
     }
     text = text.trim() || `Run paused: ${reason}. Send a follow-up to continue.`;
-    instance.messages.push({ role: 'assistant', content: text });
+    instance.messages.push({ role: 'assistant', content: text, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
     return { text, thinking: thinking || undefined, usage };
   }
 

@@ -103,6 +103,16 @@ Fields:
 
 Specs can reduce capabilities but cannot bypass global tool policy, path boundaries, concurrency, timeout, or recursion limits.
 
+## Skills
+
+A skill is a short Markdown guideline an agent loads on demand with `load_skill`. Skills resolve in layers, the nearest wins:
+
+1. project `<workspace>/.coder/skills/*.md` (and `<workspace>/skills/*.md`)
+2. user `~/.coder/skills/*.md`
+3. built-in `skills/*.md`
+
+Agents that have `load_skill` see each skill's name and one-line description in the tool description (from a `description:` frontmatter field, or else the first prose line); the full text is read only when the skill is loaded. Switching workspaces with `/cd` refreshes the list.
+
 ## Runtime behavior
 
 - One persistent main instance per Session.
@@ -136,6 +146,18 @@ Long-running agents keep their context bounded in three ways:
 - **Auto-compact** — when an instance's context exceeds ~75% of its character budget (override with `AGENT_AUTO_COMPACT_RATIO`), it compacts automatically before the next model call; hard tail truncation remains the last-resort fallback.
 
 Visible conversation history is never modified; compaction only affects what gets sent to the model.
+
+## Run traces
+
+Every run appends a compact trace to `~/.coder/runtime/traces/<session>.jsonl`: user messages, model-request steps, each tool call with its duration and outcome (inputs and outputs clipped), per-turn time and token usage, compactions, loop-pause notices, and runtime errors. Secrets are redacted the same way as saved sessions. `AGENT_TRACE=0` turns it off.
+
+```powershell
+maw trace            # one line per recorded session
+maw trace <session>  # tool calls/errors/timings, requests and tokens, most common tool errors
+maw trace <session> --json
+```
+
+Use it after an evaluation run to see where a task went wrong: which tools failed repeatedly, which calls were slow, how many model requests a turn needed.
 
 ## Model configuration
 

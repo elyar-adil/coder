@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -169,6 +169,126 @@ describe('AgentRuntime', () => {
       assert.equal(runtime.getSession('stuck-read')!.messages.at(-1)!.content, 'Summary: re-read the same file four times; next step is to edit it.');
     } finally {
       await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps provider reasoning_content in model history so the next request can echo it back', async () => {
+    let call = 0;
+    let secondRequest: Array<{ role: string; reasoning_content?: string; tool_calls?: unknown[] }> = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, messages, tools) {
+      call += 1;
+      if (call === 1) {
+        yield { content: null, thinking: 'Need the file. ', reasoningContent: 'Need the file. ', done: false };
+        yield { content: null, thinking: 'Reading.', reasoningContent: 'Reading.', done: false };
+        yield { content: null, toolCalls: [{ id: 'read-1', function: { name: 'read_file', arguments: { path: 'target.txt' } } }], done: false };
+      } else {
+        secondRequest = messages.map((message) => ({ ...message }));
+        assert.ok(tools.length > 0);
+        yield { content: 'Done.', done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['read_file'] });
+    await writeFile(join(root, 'target.txt'), 'content\n', 'utf8');
+    try {
+      const session = await runtime.openSession('reasoning');
+      await runtime.submitMessage('reasoning', 'inspect target.txt');
+      await runtime.waitForIdle('reasoning');
+      assert.equal(call, 2);
+      const toolTurn = secondRequest.find((message) => message.role === 'assistant' && message.tool_calls?.length);
+      assert.equal(toolTurn?.reasoning_content, 'Need the file. Reading.');
+      const finalAnswer = runtime.getInstance(session.mainInstanceId)!.messages.at(-1)!;
+      assert.equal(finalAnswer.role, 'assistant');
+      assert.equal('reasoning_content' in finalAnswer, false, 'a turn without reasoning_content must not gain the field');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('advertises the available skills in the load_skill tool description, and refreshes them on /cd', async () => {
+    const seen: string[] = [];
+    const { runtime, root } = await fixture(async function* (_config, _system, _messages, tools) {
+      seen.push(tools.find((tool) => tool.function.name === 'load_skill')?.function.description ?? '(no load_skill)');
+      yield { content: 'ok', done: false };
+      yield { content: null, done: true };
+    }, { mainTools: ['load_skill'] });
+    try {
+      await mkdir(join(root, 'proj', '.coder', 'skills'), { recursive: true });
+      await writeFile(join(root, 'proj', '.coder', 'skills', 'release-notes.md'), '---\ndescription: How this project writes release notes\n---\nBody.\n');
+      await runtime.openSession('skills');
+      await runtime.submitMessage('skills', 'one');
+      await runtime.waitForIdle('skills');
+      assert.doesNotMatch(seen.at(-1)!, /release-notes/, 'a project skill is not visible before switching to that project');
+      assert.match(seen.at(-1)!, /Available skills:/, 'built-in skills are advertised');
+
+      await runtime.changeWorkspace(join(root, 'proj'));
+      await runtime.submitMessage('skills', 'two');
+      await runtime.waitForIdle('skills');
+      assert.match(seen.at(-1)!, /- release-notes: How this project writes release notes/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps registered API keys out of the persisted session while leaving the live conversation intact', async () => {
+    const secret = 'sk-live-REGISTERED-1234567890abcdef';
+    let call = 0;
+    const { runtime, root, store } = await fixture(async function* (_config, _system, _messages, tools) {
+      call += 1;
+      if (call === 1 && tools.length) {
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: `node -e "process.stdout.write('apiKey=${secret}')"` } } }], done: false };
+      } else {
+        yield { content: `I saw apiKey=${secret} in the output.`, done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['bash'] });
+    try {
+      runtime.registerSecrets([secret]);
+      const session = await runtime.openSession('secrets');
+      await runtime.submitMessage('secrets', 'show the config');
+      await runtime.waitForIdle('secrets');
+      const onDisk = await readFile(store.sessionPath('secrets'), 'utf8');
+      assert.doesNotMatch(onDisk, /REGISTERED-1234567890abcdef/, 'the key must not reach the session file');
+      assert.match(onDisk, /\[REDACTED\]/);
+      const live = runtime.getInstance(session.mainInstanceId)!.messages.map((message) => String(message.content ?? '')).join('\n');
+      assert.match(live, /REGISTERED-1234567890abcdef/, 'redaction applies at write time only');
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('writes a run trace of the turn: user message, steps, tool outcomes, turn totals, with secrets redacted', async () => {
+    const secret = 'sk-live-TRACED-1234567890abcdefgh';
+    let call = 0;
+    const { runtime, root, store } = await fixture(async function* (_config, _system, _messages, tools) {
+      call += 1;
+      if (call === 1 && tools.length) {
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: `node -e "console.error('token=${secret}'); process.exit(2)"` } } }], done: false };
+      } else {
+        yield { content: 'It failed.', done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['bash'] });
+    try {
+      runtime.registerSecrets([secret]);
+      await runtime.openSession('traced');
+      await runtime.submitMessage('traced', 'run the failing command');
+      await runtime.waitForIdle('traced');
+      await runtime.shutdown();
+      const text = await readFile(join(store.runtimeDir, 'traces', 'traced.jsonl'), 'utf8');
+      assert.doesNotMatch(text, /TRACED-1234567890abcdefgh/, 'secrets never reach the trace');
+      const events = text.trim().split('\n').map((line) => JSON.parse(line) as { ev: string; tool?: string; ok?: boolean; output?: string; step?: number });
+      assert.equal(events[0]!.ev, 'user');
+      assert.deepEqual(events.filter((event) => event.ev === 'step').map((event) => event.step), [1, 2]);
+      const bash = events.find((event) => event.ev === 'tool')!;
+      assert.equal(bash.tool, 'bash');
+      assert.equal(bash.ok, false);
+      assert.match(bash.output!, /^Error: command failed \(exit code 2\)/);
+      assert.ok(events.some((event) => event.ev === 'turn'), 'the finished turn is summarized');
+    } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
@@ -370,13 +490,13 @@ describe('AgentRuntime', () => {
       if (!tools.length) {
         yield { content: 'done', done: true };
       } else if (call === 1) {
-        yield { content: null, toolCalls: [{ id: 'read', function: { name: 'read_file', arguments: { path: 'big.txt' } } }], done: false };
+        // bash, not read_file: read_file bounds its own window, so only a shell command can emit an oversized result.
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: 'node -e "process.stdout.write(\'z\'.repeat(60000))"' } } }], done: false };
       } else {
         yield { content: 'read it', done: true };
       }
       yield { content: null, done: true };
-    }, { mainTools: ['read_file'] });
-    await writeFile(join(root, 'big.txt'), 'z'.repeat(60_000), 'utf8');
+    }, { mainTools: ['bash'] });
     try {
       await runtime.submitMessage('bounded', 'read big file');
       await runtime.waitForIdle('bounded');

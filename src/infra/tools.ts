@@ -1,6 +1,6 @@
 import { readFile, writeFile, readdir, mkdir, stat, rename, rm, lstat, realpath } from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
-import { exec, execFile, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import { promisify } from 'node:util';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import { ToolRegistry } from '../tools/registry.js';
@@ -9,6 +9,10 @@ import { unifiedDiff } from '../diff.js';
 import { resilientFetch } from '../fetch.js';
 import { snapshotBeforeWrite } from './file-snapshot.js';
 import { atomicWriteFile } from './atomic-write.js';
+import { formatShellResult, runShell } from './shell.js';
+import { appendSyntaxCheck } from './diagnostics.js';
+import { isValidSkillName, listSkills, readSkill, skillRoots } from './skills.js';
+import { formatLineWindow, readTextFile } from './text-file.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -19,7 +23,6 @@ import {
   type ToolPolicy,
 } from '../policy.js';
 
-const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 export type BuiltinToolContext = ToolExecutionContext<ToolPolicy>;
 
@@ -477,7 +480,7 @@ export const TOOLS: OllamaToolDef[] = [
     type: 'function',
     function: {
       name: 'read_file',
-      description: 'Read file content from disk. Returns line-numbered output (5-digit padded line numbers). Always call this before writing to an existing file. Use offset/limit to read large files in sections.',
+      description: 'Read file content from disk. Returns line-numbered output (5-digit padded line numbers). Always call this before writing to an existing file. A long file is returned in a window (about 2000 lines or 20k characters) that ends with the range shown; pass offset to continue, or limit to read a specific number of lines. Binary files and files over 10 MB are refused; use search_text or a shell command for those.',
       parameters: {
         type: 'object',
         properties: {
@@ -682,8 +685,8 @@ understand the codebase structure without reading every file. Returns a compact 
     function: {
       name: 'bash',
       description: process.platform === 'win32'
-        ? 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. NOTE: on Windows this runs cmd.exe — Unix tools like grep/sed/awk/ripgrep are unavailable; use the built-in search_text/read_file tools instead.'
-        : 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc.',
+        ? 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. NOTE: on Windows this runs cmd.exe — Unix tools like grep/sed/awk/ripgrep are unavailable; use the built-in search_text/read_file tools instead. A non-zero exit is reported as \"Error: command failed (exit code N)\"; a timeout kills the whole process tree. stdin is closed, so commands cannot prompt for input: pass non-interactive flags (-y, --no-pager, -m). A command that ends with & is left running in the background.'
+        : 'Execute a shell command and return stdout + stderr. Use for builds, tests, git, installs, etc. A non-zero exit is reported as \"Error: command failed (exit code N)\"; a timeout kills the whole process tree. stdin is closed, so commands cannot prompt for input: pass non-interactive flags (-y, --no-pager, -m). A command that ends with & is left running in the background.',
       parameters: {
         type: 'object',
         properties: {
@@ -699,7 +702,7 @@ understand the codebase structure without reading every file. Returns a compact 
     type: 'function',
     function: {
       name: 'load_skill',
-      description: 'Load a reusable skill definition by name. Skills provide domain-specific instructions, conventions, and project structure guidelines.',
+      description: 'Load a reusable skill definition by name. Skills provide domain-specific instructions, conventions, and project structure guidelines. Project skills live in .coder/skills, user skills in ~/.coder/skills.',
       parameters: {
         type: 'object',
         properties: {
@@ -740,24 +743,6 @@ function parseStringArray(value: unknown): string[] | undefined {
   } catch {
     return undefined;
   }
-}
-
-function formatLineRange(raw: string, offset = 1, limit?: number): string {
-  if (raw === '') return '';
-  const allLines = raw.split('\n');
-  const totalLines = allLines.length;
-  const startLine = Math.max(1, Math.min(offset, totalLines));
-  const endLine = limit !== undefined ? Math.min(startLine + Math.max(1, limit) - 1, totalLines) : totalLines;
-  const numbered = allLines.slice(startLine - 1, endLine).map((line, index) => (
-    `${String(startLine + index).padStart(5, '0')}|${line}`
-  )).join('\n');
-  return endLine < totalLines
-    ? `${numbered}\n... (showing lines ${startLine}-${endLine} of ${totalLines}; use offset/limit to read more)`
-    : numbered;
-}
-
-async function readLineRange(filePath: string, offset = 1, limit?: number): Promise<string> {
-  return formatLineRange(await readFile(filePath, 'utf8'), offset, limit);
 }
 
 function boundedOutput(value: string, maxChars = 4 * 1024 * 1024): string {
@@ -1161,9 +1146,10 @@ async function executeBuiltinTool(
       const limitArg = typeof args['limit'] === 'number' ? args['limit'] : undefined;
       try {
         const targetPath = resolveToolPath(path, ctx);
-        const content = await readFile(targetPath, 'utf8');
-        ctx?.recordReadVersion?.(targetPath, contentVersion(content));
-        return formatLineRange(content, offsetArg, limitArg);
+        const read = await readTextFile(targetPath, path);
+        if (!read.ok) return `Error: ${read.message}`;
+        ctx?.recordReadVersion?.(targetPath, contentVersion(read.content));
+        return formatLineWindow(read.content, { offset: offsetArg, limit: limitArg });
       } catch (error) {
         return `Error reading file: ${String(error)}`;
       }
@@ -1183,9 +1169,13 @@ async function executeBuiltinTool(
         }
         try {
           const targetPath = resolveToolPath(path, ctx);
-          const content = await readFile(targetPath, 'utf8');
-          ctx?.recordReadVersion?.(targetPath, contentVersion(content));
-          sections.push(`===== ${path} =====\n${formatLineRange(content, 1, maxLines)}`);
+          const read = await readTextFile(targetPath, path);
+          if (!read.ok) {
+            sections.push(`===== ${path} =====\nError: ${read.message}`);
+            continue;
+          }
+          ctx?.recordReadVersion?.(targetPath, contentVersion(read.content));
+          sections.push(`===== ${path} =====\n${formatLineWindow(read.content, { limit: maxLines })}`);
         } catch (error) {
           sections.push(`===== ${path} =====\nError reading file: ${String(error)}`);
         }
@@ -1224,7 +1214,9 @@ async function executeBuiltinTool(
       const writeDecision = authorizeToolCall(policy, 'edit_file', { path: targetPath });
       if (!writeDecision.ok) return formatPolicyError('edit_file', writeDecision);
 
-      return withWriteLock(ctx, targetPath, async () => {
+      // Syntax diagnostics run after the cross-process lock is released.
+      const saved: { path?: string; content?: string } = {};
+      const result = await withWriteLock(ctx, targetPath, async () => {
         let src: string;
         try {
           src = await readFile(targetPath, 'utf8');
@@ -1379,12 +1371,17 @@ async function executeBuiltinTool(
           ctx?.recordWriteVersion?.(targetPath, contentVersion(content));
           const linesBefore = src.split('\n').length;
           const linesAfter = content.split('\n').length;
+          saved.path = writtenPath;
+          saved.content = content;
           return [`OK: ${log.join('; ')} (${writtenPath}); ${linesBefore} → ${linesAfter} lines; sha256:${sha256}`, diagnostics.join('\n\n'), diff].filter(Boolean).join('\n\n');
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return `Error writing edited file: ${message} (target left unchanged)`;
         }
       });
+      return saved.path !== undefined && saved.content !== undefined
+        ? appendSyntaxCheck(result, saved.path, saved.content, workspaceRoot(ctx))
+        : result;
     }
 
     case 'repo_map': {
@@ -1417,7 +1414,8 @@ async function executeBuiltinTool(
       if (policyError) return policyError;
       const targetPath = resolveWriteTarget(path, ctx);
 
-      return withWriteLock(ctx, targetPath, async () => {
+      const saved: { path?: string; content?: string } = {};
+      const result = await withWriteLock(ctx, targetPath, async () => {
         try {
           let previous = '';
           let existed = false;
@@ -1447,11 +1445,16 @@ async function executeBuiltinTool(
               ? `overwrote existing file (${lineCount} lines); snapshot saved to ${snapshot.path}`
               : `overwrote existing file (${lineCount} lines); snapshot unavailable (${snapshot.reason ?? 'unknown'})`;
           }
+          saved.path = writtenPath;
+          saved.content = content;
           return [`OK: wrote ${writtenPath} (${content.length} chars); ${note}`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing file: ${String(error)}`;
         }
       });
+      return saved.path !== undefined && saved.content !== undefined
+        ? appendSyntaxCheck(result, saved.path, saved.content, workspaceRoot(ctx))
+        : result;
     }
 
     case 'list_dir': {
@@ -1500,37 +1503,27 @@ async function executeBuiltinTool(
         if (ctx?.artifactDir && typeof args['cwd'] !== 'string') {
           await mkdir(cwd, { recursive: true });
         }
-        const { stdout, stderr } = await execAsync(command, {
-          cwd,
-          timeout,
-          maxBuffer: 1024 * 1024 * 4,
-          signal: ctx?.signal,
-        });
-        const output = [stdout, stderr].filter(Boolean).join('\n--- stderr ---\n');
-        const win32Note = process.platform === 'win32'
+        const shell = await runShell(command, { cwd, timeoutMs: timeout, signal: ctx?.signal });
+        const text = formatShellResult(shell, { cwd, timeoutMs: timeout });
+        // Only a clean run carries the cmd.exe hint; failures already explain themselves.
+        const win32Note = process.platform === 'win32' && text.indexOf('Error:') !== 0
           ? '\n(Note: shell is cmd.exe — grep/ripgrep-like Unix utilities are unavailable; use search_text/read_file instead.)'
           : '';
-        return boundedOutput(output || '(no output)') + win32Note;
+        return text + win32Note;
       } catch (error: unknown) {
-        const err = error as { stdout?: string; stderr?: string; message?: string };
-        const output = [err.stdout, err.stderr].filter(Boolean).join('\n');
-        return `Error: command failed${output ? `\n${output}` : `: ${err.message ?? String(error)}`}`;
+        return `Error: command failed: ${error instanceof Error ? error.message : String(error)}`;
       }
     }
 
     case 'load_skill': {
       const name = typeof args['name'] === 'string' ? args['name'] : undefined;
       if (!name) return 'Error: load_skill requires "name"';
-      if (!/^[a-z0-9_-]+$/i.test(name)) return 'Error: invalid skill name';
-      const candidates = [resolve(workspaceRoot(ctx), 'skills'), resolve(import.meta.dirname, '..', '..', 'skills')];
-      for (const skillsDir of candidates) {
-        try { return await readFile(resolve(skillsDir, `${name}.md`), 'utf8'); } catch { /* try next root */ }
-      }
-      const available = new Set<string>();
-      for (const skillsDir of candidates) {
-        try { for (const file of await readdir(skillsDir)) if (file.endsWith('.md')) available.add(file.slice(0, -3)); } catch { /* ignore */ }
-      }
-      return `Error: skill "${name}" not found${available.size ? `. Available: ${[...available].sort().join(', ')}` : ''}`;
+      if (!isValidSkillName(name)) return 'Error: invalid skill name';
+      const roots = skillRoots(workspaceRoot(ctx));
+      const text = await readSkill(name, roots);
+      if (text !== undefined) return text;
+      const available = (await listSkills(roots)).map((skill) => skill.name);
+      return `Error: skill "${name}" not found${available.length ? `. Available: ${available.join(', ')}` : ''}`;
     }
 
     default:

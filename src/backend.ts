@@ -47,6 +47,8 @@ export interface ChatChunk {
   responseItems?: Record<string, unknown>[];
   content: string | null;
   thinking?: string;
+  /** Streamed `reasoning_content` that must be echoed back (see AgentModelMessage.reasoning_content). */
+  reasoningContent?: string;
   toolCalls?: OllamaMsg['tool_calls'];
   done: boolean;
   usage?: { inputTokens?: number; outputTokens?: number; reasoningTokens?: number; cachedInputTokens?: number; cacheCreationInputTokens?: number };
@@ -213,10 +215,16 @@ function convertToOpenAIMessages(systemPrompt: string, messages: OllamaMsg[]): A
       });
       continue;
     }
+    // Only providers that returned reasoning_content get it back; the field is
+    // never invented, so strict gateways that don't know it never see it.
+    const reasoning = message.role === 'assistant' && message.reasoning_content
+      ? { reasoning_content: message.reasoning_content }
+      : {};
     if (message.tool_calls?.length) {
       result.push({
         role: 'assistant',
         content: message.content,
+        ...reasoning,
         tool_calls: message.tool_calls.map((toolCall) => ({
           id: toolCall.id ?? toolCallId(),
           type: 'function' as const,
@@ -228,16 +236,16 @@ function convertToOpenAIMessages(systemPrompt: string, messages: OllamaMsg[]): A
       });
       continue;
     }
-    result.push({ role: message.role, content: message.content });
+    result.push({ role: message.role, content: message.content, ...reasoning });
   }
   return result;
 }
 
 function convertToOllamaToolCalls(openaiCalls: OpenAIToolCall[]): OllamaMsg['tool_calls'] {
   return openaiCalls.map((toolCall) => {
-    let args: Record<string, string> = {};
+    let args: Record<string, unknown> = {};
     try {
-      args = JSON.parse(toolCall.function.arguments) as Record<string, string>;
+      args = JSON.parse(toolCall.function.arguments) as Record<string, unknown>;
     } catch {
       // Preserve the raw text so the tool's "requires X" error shows the
       // model what it actually produced instead of a baffling empty call.
@@ -353,7 +361,14 @@ async function* openaiStream(
           if (!choice) continue;
 
           const thinking = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
-          if (thinking) yield { content: null, thinking, done: false };
+          if (thinking) {
+            yield {
+              content: null,
+              thinking,
+              ...(choice.delta?.reasoning_content ? { reasoningContent: choice.delta.reasoning_content } : {}),
+              done: false,
+            };
+          }
           if (choice.delta?.content) {
             yield { content: choice.delta.content, done: false };
           }
