@@ -10,6 +10,7 @@ import { resilientFetch } from '../fetch.js';
 import { snapshotBeforeWrite } from './file-snapshot.js';
 import { atomicWriteFile } from './atomic-write.js';
 import { formatShellResult, runShell } from './shell.js';
+import { appendSyntaxCheck } from './diagnostics.js';
 import {
   authorizeToolCall,
   clonePolicy,
@@ -1224,7 +1225,9 @@ async function executeBuiltinTool(
       const writeDecision = authorizeToolCall(policy, 'edit_file', { path: targetPath });
       if (!writeDecision.ok) return formatPolicyError('edit_file', writeDecision);
 
-      return withWriteLock(ctx, targetPath, async () => {
+      // Syntax diagnostics run after the cross-process lock is released.
+      const saved: { path?: string; content?: string } = {};
+      const result = await withWriteLock(ctx, targetPath, async () => {
         let src: string;
         try {
           src = await readFile(targetPath, 'utf8');
@@ -1379,12 +1382,17 @@ async function executeBuiltinTool(
           ctx?.recordWriteVersion?.(targetPath, contentVersion(content));
           const linesBefore = src.split('\n').length;
           const linesAfter = content.split('\n').length;
+          saved.path = writtenPath;
+          saved.content = content;
           return [`OK: ${log.join('; ')} (${writtenPath}); ${linesBefore} → ${linesAfter} lines; sha256:${sha256}`, diagnostics.join('\n\n'), diff].filter(Boolean).join('\n\n');
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           return `Error writing edited file: ${message} (target left unchanged)`;
         }
       });
+      return saved.path !== undefined && saved.content !== undefined
+        ? appendSyntaxCheck(result, saved.path, saved.content, workspaceRoot(ctx))
+        : result;
     }
 
     case 'repo_map': {
@@ -1417,7 +1425,8 @@ async function executeBuiltinTool(
       if (policyError) return policyError;
       const targetPath = resolveWriteTarget(path, ctx);
 
-      return withWriteLock(ctx, targetPath, async () => {
+      const saved: { path?: string; content?: string } = {};
+      const result = await withWriteLock(ctx, targetPath, async () => {
         try {
           let previous = '';
           let existed = false;
@@ -1447,11 +1456,16 @@ async function executeBuiltinTool(
               ? `overwrote existing file (${lineCount} lines); snapshot saved to ${snapshot.path}`
               : `overwrote existing file (${lineCount} lines); snapshot unavailable (${snapshot.reason ?? 'unknown'})`;
           }
+          saved.path = writtenPath;
+          saved.content = content;
           return [`OK: wrote ${writtenPath} (${content.length} chars); ${note}`, diff].filter(Boolean).join('\n\n');
         } catch (error) {
           return `Error writing file: ${String(error)}`;
         }
       });
+      return saved.path !== undefined && saved.content !== undefined
+        ? appendSyntaxCheck(result, saved.path, saved.content, workspaceRoot(ctx))
+        : result;
     }
 
     case 'list_dir': {
