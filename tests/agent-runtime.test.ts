@@ -429,13 +429,13 @@ describe('AgentRuntime', () => {
       if (!tools.length) {
         yield { content: 'done', done: true };
       } else if (call === 1) {
-        yield { content: null, toolCalls: [{ id: 'read', function: { name: 'read_file', arguments: { path: 'big.txt' } } }], done: false };
+        // bash, not read_file: read_file bounds its own window, so only a shell command can emit an oversized result.
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: 'node -e "process.stdout.write(\'z\'.repeat(60000))"' } } }], done: false };
       } else {
         yield { content: 'read it', done: true };
       }
       yield { content: null, done: true };
-    }, { mainTools: ['read_file'] });
-    await writeFile(join(root, 'big.txt'), 'z'.repeat(60_000), 'utf8');
+    }, { mainTools: ['bash'] });
     try {
       await runtime.submitMessage('bounded', 'read big file');
       await runtime.waitForIdle('bounded');
