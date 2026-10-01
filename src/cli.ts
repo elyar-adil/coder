@@ -3,6 +3,7 @@ import { Command } from 'commander';
 
 import { loadConfigWithPath, saveConfig, saveSelectedModel, scopeConfigToUser, type AgentConfig } from './config.js';
 import { setToolPolicy } from './infra/tools.js';
+import { collectConfigSecrets } from './infra/redact.js';
 import { resolveModelConfig } from './model-config.js';
 import { defaultPolicy } from './policy.js';
 import { AgentRegistry } from './runtime/agent-registry.js';
@@ -55,6 +56,8 @@ async function main(): Promise<void> {
     defaultModel: selectedFromCli() ?? config.model,
     resolveModel: (alias) => resolveModelConfig(config, alias).config,
   });
+  // Every configured key (not only the active one) must stay out of saved sessions.
+  runtime.registerSecrets(collectConfigSecrets(config));
 
   // Announce this instance so concurrent maw processes in the same workspace
   // can surface a warning (and users can see who else is editing).
@@ -79,6 +82,7 @@ async function main(): Promise<void> {
       userScope.user = scoped;
       await saveConfig(scoped, loadedConfig.path);
       config = next;
+      runtime.registerSecrets(collectConfigSecrets(config));
       setToolPolicy(defaultPolicy(config.policyLevel ?? 'moderate', process.cwd()));
     },
   };

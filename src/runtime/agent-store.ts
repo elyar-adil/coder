@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 
 import type { PersistedAgentSession } from '../domain/agent.js';
 import { atomicWriteFile } from '../infra/atomic-write.js';
+import { SecretRedactor } from '../infra/redact.js';
 
 const writes = new Map<string, Promise<void>>();
 
@@ -38,9 +39,12 @@ function relativeTime(iso: string): string {
 
 export class AgentRuntimeStore {
   private readonly dir: string;
+  /** Secrets are removed from everything this store writes; see infra/redact.ts. */
+  readonly redactor = new SecretRedactor();
 
   constructor(baseDir = process.env.CODER_DATA_HOME?.trim() || resolve(homedir(), '.coder')) {
     this.dir = resolve(baseDir, 'runtime');
+    this.redactor.addEnv();
   }
 
   /** Root directory for runtime state (sessions, archives, locks, instances). */
@@ -64,7 +68,7 @@ export class AgentRuntimeStore {
 
   async save(snapshot: PersistedAgentSession): Promise<void> {
     const path = this.path(snapshot.session.sessionId);
-    const payload = `${JSON.stringify(snapshot, null, 2)}\n`;
+    const payload = this.redactor.redactJson(`${JSON.stringify(snapshot, null, 2)}\n`);
     const key = path.toLowerCase();
     const previous = writes.get(key) ?? Promise.resolve();
     const next = previous.catch(() => undefined).then(async () => {
@@ -150,7 +154,7 @@ export class AgentRuntimeStore {
   async saveArchive(sessionId: string, instanceId: string, seq: number, messages: unknown[]): Promise<void> {
     const dir = this.archivesDir(sessionId);
     const path = resolve(dir, `${instanceId}.${String(seq).padStart(4, '0')}.json`);
-    const payload = `${JSON.stringify({ version: 1, instanceId, seq, messages }, null, 2)}\n`;
+    const payload = this.redactor.redactJson(`${JSON.stringify({ version: 1, instanceId, seq, messages }, null, 2)}\n`);
     await atomicWriteFile(path, payload, { mode: 0o600 });
   }
 

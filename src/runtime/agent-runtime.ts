@@ -329,7 +329,12 @@ export class AgentRuntime {
     const lockDir = resolve(this.store.runtimeDir, 'locks');
     this.fileLocks = new FileLockManager(lockDir);
     this.sessionLocks = new CrossProcessLockManager(lockDir);
-    this.resolveModel = options.resolveModel;
+    // Every API key that is actually used must never reach disk in a saved session.
+    this.resolveModel = (alias) => {
+      const resolved = options.resolveModel(alias);
+      this.store.redactor.add(resolved.apiKey);
+      return resolved;
+    };
     this.defaultModel = options.defaultModel;
     this.modelStream = options.modelStream ?? ((config, system, messages, tools, signal) => (
       chatStream(config, system, messages, tools, signal)
@@ -350,6 +355,11 @@ export class AgentRuntime {
 
   whenReady(): Promise<void> {
     return this.ready;
+  }
+
+  /** Register secrets (configured API keys) to be stripped from persisted sessions and archives. */
+  registerSecrets(values: Array<string | undefined>): void {
+    this.store.redactor.add(...values);
   }
 
   subscribe(listener: (event: AgentEvent) => void): () => void {

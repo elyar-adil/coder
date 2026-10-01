@@ -58,7 +58,7 @@
 ## 低优先级（沿用 hardening-backlog，已按代码核对状态）
 
 - 已完成：A1 原子写、A2 会话文件 0600 且损坏会话拒绝覆盖、A3 symlink、A5 锁、B1 SSE 错误透出、B3 的 `Retry-After`。
-- A4 只完成一半：配置文件已 0600，**会话里的密钥脱敏未做**。
+- A4 已完成：配置文件 0600；会话快照与压缩归档在**写盘时**脱敏（`src/infra/redact.ts`）——精确匹配所有已配置的 apiKey 和名字像密钥的环境变量值，另外识别特征明显的格式（`sk-` / `ghp_` / `AKIA` / PEM 私钥等）。内存中的对话和发给模型的内容不变（agent 有时确实要用这些值）。
 - 未做：B2 共享 SSE 读取器、B3 的"POST 默认不重试"、C1 timeline O(1) 追加、C2 TUI 帧内重复计算、C3 持久化 debounce（阶段 1.1 的追加式日志会取代它）、C4 `x-opencode-session` 头仅对 opencode 发送。
 
 ## 待决定

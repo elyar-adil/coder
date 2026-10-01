@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -226,6 +226,34 @@ describe('AgentRuntime', () => {
       await runtime.submitMessage('skills', 'two');
       await runtime.waitForIdle('skills');
       assert.match(seen.at(-1)!, /- release-notes: How this project writes release notes/);
+    } finally {
+      await runtime.shutdown();
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  test('keeps registered API keys out of the persisted session while leaving the live conversation intact', async () => {
+    const secret = 'sk-live-REGISTERED-1234567890abcdef';
+    let call = 0;
+    const { runtime, root, store } = await fixture(async function* (_config, _system, _messages, tools) {
+      call += 1;
+      if (call === 1 && tools.length) {
+        yield { content: null, toolCalls: [{ id: 'run', function: { name: 'bash', arguments: { command: `node -e "process.stdout.write('apiKey=${secret}')"` } } }], done: false };
+      } else {
+        yield { content: `I saw apiKey=${secret} in the output.`, done: false };
+      }
+      yield { content: null, done: true };
+    }, { mainTools: ['bash'] });
+    try {
+      runtime.registerSecrets([secret]);
+      const session = await runtime.openSession('secrets');
+      await runtime.submitMessage('secrets', 'show the config');
+      await runtime.waitForIdle('secrets');
+      const onDisk = await readFile(store.sessionPath('secrets'), 'utf8');
+      assert.doesNotMatch(onDisk, /REGISTERED-1234567890abcdef/, 'the key must not reach the session file');
+      assert.match(onDisk, /\[REDACTED\]/);
+      const live = runtime.getInstance(session.mainInstanceId)!.messages.map((message) => String(message.content ?? '')).join('\n');
+      assert.match(live, /REGISTERED-1234567890abcdef/, 'redaction applies at write time only');
     } finally {
       await runtime.shutdown();
       await rm(root, { recursive: true, force: true });
