@@ -27,6 +27,13 @@ export interface AgentModelMessage {
   content: string | null;
   tool_calls?: AgentToolCall[];
   tool_use_id?: string;
+  /**
+   * Chain-of-thought the provider returned in the `reasoning_content` field of
+   * an OpenAI-compatible stream (DeepSeek thinking mode). Providers that return
+   * it require it to be echoed back on later requests; unlike display-only
+   * `thinking`, it is part of the conversation the model sees.
+   */
+  reasoning_content?: string;
 }
 
 /** Provider reported usage for one model request. Values are optional because

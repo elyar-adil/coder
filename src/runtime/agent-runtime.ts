@@ -144,7 +144,8 @@ const waitMs = (ms: number): Promise<void> => new Promise((resolve) => setTimeou
 function messageSize(message: AgentModelMessage): number {
   return String(message.content ?? '').length
     + JSON.stringify(message.tool_calls ?? []).length
-    + JSON.stringify(message.responseItems ?? []).length;
+    + JSON.stringify(message.responseItems ?? []).length
+    + (message.reasoning_content?.length ?? 0);
 }
 
 function formatMessageForSummary(index: number, message: AgentModelMessage): string {
@@ -1235,6 +1236,7 @@ export class AgentRuntime {
         const messages = this.trimMessages(instance.messages, config);
         let text = '';
         let thinking = '';
+        let reasoningContent = '';
         const responseItems: Record<string, unknown>[] = [];
         const calls: NonNullable<AgentModelMessage['tool_calls']> = [];
         // A stream that dies before emitting anything is safe to retry: the
@@ -1250,6 +1252,7 @@ export class AgentRuntime {
                 thinking += chunk.thinking;
                 this.emit({ type: 'thinking_delta', sessionId: session.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
               }
+              if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent;
               if (chunk.content) {
                 if (firstTokenMs === undefined) firstTokenMs = Date.now() - turnStartedAt;
                 text += chunk.content;
@@ -1271,7 +1274,7 @@ export class AgentRuntime {
             await waitMs(Math.max(500 * (attempt + 1), advertised ?? 0));
           }
         }
-        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}) });
+        instance.messages.push({ role: 'assistant', content: text || null, ...(calls.length ? { tool_calls: calls } : {}), ...(responseItems.length ? { responseItems } : {}), ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
         if (text.trim() && !instance.parentInstanceId) {
           const visible: SessionMessage = { messageId: randomUUID(), role: 'assistant', content: text.trim(), createdAt: now(), turnId, ...(thinking ? { thinking } : {}) };
           session.messages.push(visible);
@@ -1431,6 +1434,7 @@ export class AgentRuntime {
     });
     let text = '';
     let thinking = '';
+    let reasoningContent = '';
     let usage: ModelUsage | undefined;
     try {
       for await (const chunk of this.modelStream(config, this.systemPrompt(instance, spec), this.trimMessages(instance.messages, config), [], signal)) {
@@ -1439,6 +1443,7 @@ export class AgentRuntime {
           thinking += chunk.thinking;
           this.emit({ type: 'thinking_delta', sessionId: instance.sessionId, instanceId: instance.instanceId, turnId, text: chunk.thinking });
         }
+        if (chunk.reasoningContent) reasoningContent += chunk.reasoningContent;
         if (chunk.content) text += chunk.content;
         if (chunk.usage) usage = mergeUsage(usage, chunk.usage);
       }
@@ -1447,7 +1452,7 @@ export class AgentRuntime {
       // still tells the user why the turn stopped.
     }
     text = text.trim() || `Run paused: ${reason}. Send a follow-up to continue.`;
-    instance.messages.push({ role: 'assistant', content: text });
+    instance.messages.push({ role: 'assistant', content: text, ...(reasoningContent ? { reasoning_content: reasoningContent } : {}) });
     return { text, thinking: thinking || undefined, usage };
   }
 
